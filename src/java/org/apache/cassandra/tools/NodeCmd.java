@@ -68,6 +68,7 @@ public class NodeCmd
     private static final Pair<String, String> PORT_OPT = Pair.create("p", "port");
     private static final Pair<String, String> USERNAME_OPT = Pair.create("u", "username");
     private static final Pair<String, String> PASSWORD_OPT = Pair.create("pw", "password");
+    private static final Pair<String, String> PASSWORD_FILE_OPT = Pair.create("pwf", "password-file");
     private static final Pair<String, String> TAG_OPT = Pair.create("t", "tag");
     private static final Pair<String, String> TOKENS_OPT = Pair.create("T", "tokens");
     private static final Pair<String, String> PRIMARY_RANGE_OPT = Pair.create("pr", "partitioner-range");
@@ -99,6 +100,7 @@ public class NodeCmd
         options.addOption(PORT_OPT,     true, "remote jmx agent port number");
         options.addOption(USERNAME_OPT, true, "remote jmx agent username");
         options.addOption(PASSWORD_OPT, true, "remote jmx agent password");
+        options.addOption(PASSWORD_FILE_OPT, true, "path to remote jmx agent password file");
         options.addOption(TAG_OPT,      true, "optional name to give a snapshot");
         options.addOption(TOKENS_OPT,   false, "display all tokens");
         options.addOption(PRIMARY_RANGE_OPT, false, "only repair the first range returned by the partitioner for the node");
@@ -1267,7 +1269,16 @@ public class NodeCmd
         try
         {
             String username = cmd.getOptionValue(USERNAME_OPT.left);
-            String password = cmd.getOptionValue(PASSWORD_OPT.left);
+            String passwordFilePath = cmd.getOptionValue(PASSWORD_FILE_OPT.left);
+            String password;
+            if (passwordFilePath != null && !passwordFilePath.isEmpty())
+            {
+                password = readUserPasswordFromFile(username, passwordFilePath);
+            }
+            else
+            {
+                password = cmd.getOptionValue(PASSWORD_OPT.left);
+            }
 
             try
             {
@@ -1573,6 +1584,35 @@ public class NodeCmd
             }
         }
         System.exit(probe.isFailed() ? 1 : 0);
+    }
+
+    private static String readUserPasswordFromFile(String username, String passwordFilePath)
+    {
+        String password = EMPTY;
+
+        File passwordFile = new File(passwordFilePath);
+        try (Scanner scanner = new Scanner(passwordFile).useDelimiter("\\s+"))
+        {
+            while (scanner.hasNextLine())
+            {
+                if (scanner.hasNext())
+                {
+                    String jmxRole = scanner.next();
+                    if (jmxRole.equals(username) && scanner.hasNext())
+                    {
+                        password = scanner.next();
+                        break;
+                    }
+                }
+                scanner.nextLine();
+            }
+        }
+        catch (FileNotFoundException e)
+        {
+            throw new RuntimeException(e);
+        }
+
+        return password;
     }
 
     private void printIsGossipRunning(PrintStream outs)
