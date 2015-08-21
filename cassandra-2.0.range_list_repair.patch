@@ -1,0 +1,50 @@
+diff --git a/src/java/org/apache/cassandra/tools/NodeCmd.java b/src/java/org/apache/cassandra/tools/NodeCmd.java
+index e1200e4..600fb84 100644
+--- a/src/java/org/apache/cassandra/tools/NodeCmd.java
++++ b/src/java/org/apache/cassandra/tools/NodeCmd.java
+@@ -79,6 +79,7 @@ public class NodeCmd
+     private static final Pair<String, String> DC_REPAIR_OPT = Pair.create("dc", "in-dc");
+     private static final Pair<String, String> START_TOKEN_OPT = Pair.create("st", "start-token");
+     private static final Pair<String, String> END_TOKEN_OPT = Pair.create("et", "end-token");
++    private static final Pair<String, String> TOKEN_RANGE_LIST_OPT = Pair.create("tl", "token-range-list");
+     private static final Pair<String, String> UPGRADE_ALL_SSTABLE_OPT = Pair.create("a", "include-all-sstables");
+     private static final Pair<String, String> NO_SNAPSHOT = Pair.create("ns", "no-snapshot");
+     private static final Pair<String, String> CFSTATS_IGNORE_OPT = Pair.create("i", "ignore");
+@@ -111,6 +112,7 @@ public class NodeCmd
+         options.addOption(HOST_REPAIR_OPT, true, "only repair against specified nodes (comma separated)");
+         options.addOption(START_TOKEN_OPT, true, "token at which repair range starts");
+         options.addOption(END_TOKEN_OPT, true, "token at which repair range ends");
++        options.addOption(TOKEN_RANGE_LIST_OPT, true, "token range list to make repair start1:end1,start2:end2");
+         options.addOption(UPGRADE_ALL_SSTABLE_OPT, false, "includes sstables that are already on the most recent version during upgradesstables");
+         options.addOption(NO_SNAPSHOT, false, "disables snapshot creation for scrub");
+         options.addOption(CFSTATS_IGNORE_OPT, false, "ignore the supplied list of keyspace.columnfamiles in statistics");
+@@ -1807,7 +1809,16 @@ public class NodeCmd
+                         dataCenters = Arrays.asList(probe.getDataCenter());
+                     else if(specificHosts)
+                         hosts  = Arrays.asList(cmd.getOptionValue(HOST_REPAIR_OPT.left).split(","));
+-                    if (cmd.hasOption(START_TOKEN_OPT.left) || cmd.hasOption(END_TOKEN_OPT.left))
++                    if (cmd.hasOption(TOKEN_RANGE_LIST_OPT.left)) { 
++                    	List<String> ranges = Arrays.asList(cmd.getOptionValue(TOKEN_RANGE_LIST_OPT.left).split(","));
++                    	for (String range : ranges) {
++                    		List<String> limits = Arrays.asList(range.split(":"));
++                    		if(limits.size() != 2)
++                    			throw new RuntimeException("Cannot parse token range list! Length is " + limits.size());
++                    		probe.forceRepairRangeAsync(System.out, keyspace, parallelismDegree, dataCenters, hosts, limits.get(0), limits.get(1), columnFamilies);
++                		}
++                    }
++                    else if (cmd.hasOption(START_TOKEN_OPT.left) || cmd.hasOption(END_TOKEN_OPT.left))
+                         probe.forceRepairRangeAsync(System.out, keyspace, parallelismDegree, dataCenters, hosts, cmd.getOptionValue(START_TOKEN_OPT.left), cmd.getOptionValue(END_TOKEN_OPT.left), columnFamilies);
+                     else
+                         probe.forceRepairAsync(System.out, keyspace, parallelismDegree, dataCenters, hosts, primaryRange, columnFamilies);
+diff --git a/src/resources/org/apache/cassandra/tools/NodeToolHelp.yaml b/src/resources/org/apache/cassandra/tools/NodeToolHelp.yaml
+index b254bac..0c4f2d4 100644
+--- a/src/resources/org/apache/cassandra/tools/NodeToolHelp.yaml
++++ b/src/resources/org/apache/cassandra/tools/NodeToolHelp.yaml
+@@ -161,6 +161,7 @@ commands:
+          Use -pr to repair only the first range returned by the partitioner.
+          Use -par to carry out a parallel repair.
+          Use -st to specify a token at which the repair range starts.
++         Use -tl to specify a token ranges list "start1:end1,start2:end2,start3:end3"
+   - name: cleanup [keyspace] [cfnames]
+     help: |
+       Run cleanup on one or more column families

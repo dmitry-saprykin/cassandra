@@ -161,6 +161,7 @@ commands:
          Use -pr to repair only the first range returned by the partitioner.
          Use -par to carry out a parallel repair.
          Use -st to specify a token at which the repair range starts.
+         Use -tl to specify a token ranges list "start1:end1,start2:end2,start3:end3"
   - name: cleanup [keyspace] [cfnames]
     help: |
       Run cleanup on one or more column families
