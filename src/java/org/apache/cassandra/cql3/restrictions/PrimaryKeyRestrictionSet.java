@@ -27,8 +27,8 @@ import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.cql3.statements.Bound;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.RowFilter;
-import org.apache.cassandra.db.index.SecondaryIndexManager;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.index.SecondaryIndexManager;
 import org.apache.cassandra.utils.btree.BTreeSet;
 
 import static org.apache.cassandra.cql3.statements.RequestValidations.checkFalse;
@@ -104,7 +104,7 @@ final class PrimaryKeyRestrictionSet extends AbstractPrimaryKeyRestrictions
             this.slice = true;
         else if (restriction.isContains() || primaryKeyRestrictions.isContains())
             this.contains = true;
-        else if (restriction.isIN())
+        else if (restriction.isIN() || primaryKeyRestrictions.isIN())
             this.in = true;
         else
             this.eq = true;
@@ -138,21 +138,9 @@ final class PrimaryKeyRestrictionSet extends AbstractPrimaryKeyRestrictions
     }
 
     @Override
-    public boolean isOnToken()
-    {
-        return false;
-    }
-
-    @Override
     public boolean isContains()
     {
         return contains;
-    }
-
-    @Override
-    public boolean isMultiColumn()
-    {
-        return false;
     }
 
     @Override
@@ -175,10 +163,24 @@ final class PrimaryKeyRestrictionSet extends AbstractPrimaryKeyRestrictions
         return new PrimaryKeyRestrictionSet(this, restriction);
     }
 
+    // Whether any of the underlying restriction is an IN
+    private boolean hasIN()
+    {
+        if (isIN())
+            return true;
+
+        for (Restriction restriction : restrictions)
+        {
+            if (restriction.isIN())
+                return true;
+        }
+        return false;
+    }
+
     @Override
     public NavigableSet<Clustering> valuesAsClustering(QueryOptions options) throws InvalidRequestException
     {
-        return appendTo(MultiCBuilder.create(comparator), options).build();
+        return appendTo(MultiCBuilder.create(comparator, hasIN()), options).build();
     }
 
     @Override
@@ -202,7 +204,7 @@ final class PrimaryKeyRestrictionSet extends AbstractPrimaryKeyRestrictions
     @Override
     public NavigableSet<Slice.Bound> boundsAsClustering(Bound bound, QueryOptions options) throws InvalidRequestException
     {
-        MultiCBuilder builder = MultiCBuilder.create(comparator);
+        MultiCBuilder builder = MultiCBuilder.create(comparator, hasIN());
         int keyPosition = 0;
         for (Restriction r : restrictions)
         {

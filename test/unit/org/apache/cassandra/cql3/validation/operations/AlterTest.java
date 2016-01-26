@@ -21,6 +21,7 @@ import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.exceptions.SyntaxException;
 import org.apache.cassandra.schema.SchemaKeyspace;
 
@@ -273,6 +274,37 @@ public class AlterTest extends CQLTester
                                            "ALTER TABLE %s WITH compression = { 'class' : 'SnappyCompressor', 'chunk_length_kb' : 32 , 'chunk_length_in_kb' : 32 };");
     }
 
+    @Test
+    public void testAlterType() throws Throwable
+    {
+        createTable("CREATE TABLE %s (id text PRIMARY KEY, content text);");
+        alterTable("ALTER TABLE %s ALTER content TYPE blob");
+
+        createTable("CREATE TABLE %s (pk int, ck text, value blob, PRIMARY KEY (pk, ck)) WITH CLUSTERING ORDER BY (ck DESC)");
+        alterTable("ALTER TABLE %s ALTER ck TYPE blob");
+
+        createTable("CREATE TABLE %s (pk int, ck int, value blob, PRIMARY KEY (pk, ck))");
+        assertThrowsConfigurationException("Cannot change value from type blob to type text: types are incompatible.",
+                                           "ALTER TABLE %s ALTER value TYPE TEXT;");
+    }
+
+    /**
+     * tests CASSANDRA-10027
+     */
+    @Test
+    public void testAlterColumnTypeToDate() throws Throwable
+    {
+        createTable("CREATE TABLE %s (key int PRIMARY KEY, c1 int);");
+        execute("INSERT INTO %s (key, c1) VALUES (1,1);");
+        execute("ALTER TABLE %s ALTER c1 TYPE date;");
+        assertRows(execute("SELECT * FROM %s"), row(1, 1));
+
+        createTable("CREATE TABLE %s (key int PRIMARY KEY, c1 varint);");
+        execute("INSERT INTO %s (key, c1) VALUES (1,1);");
+        assertInvalidMessage("Cannot change c1 from type varint to type date: types are incompatible.",
+                             "ALTER TABLE %s ALTER c1 TYPE date;");
+    }
+
     private void assertThrowsConfigurationException(String errorMsg, String alterStmt) throws Throwable
     {
         try
@@ -284,5 +316,12 @@ public class AlterTest extends CQLTester
         {
             assertEquals(errorMsg, e.getMessage());
         }
+    }
+
+    @Test // tests CASSANDRA-8879
+    public void testAlterClusteringColumnTypeInCompactTable() throws Throwable
+    {
+        createTable("CREATE TABLE %s (key blob, column1 blob, value blob, PRIMARY KEY ((key), column1)) WITH COMPACT STORAGE");
+        assertInvalidThrow(InvalidRequestException.class, "ALTER TABLE %s ALTER column1 TYPE ascii");
     }
 }

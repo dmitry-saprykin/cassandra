@@ -25,8 +25,25 @@ password = !!bang!!$
 color = on
 completekey = tab
 
+; To use another than the system default browser for cqlsh HELP to open
+; the CQL doc HTML, use the 'browser' preference.
+; If the field value is empty or not specified, cqlsh will use the
+; default browser (specifying 'browser = default' does not work).
+;
+; Supported browsers are those supported by the Python webbrowser module.
+; (https://docs.python.org/2/library/webbrowser.html).
+;
+; Hint: to use Google Chome, use
+; 'browser = open -a /Applications/Google\ Chrome.app %s' on Mac OS X and
+; 'browser = /usr/bin/google-chrome-stable %s' on Linux and
+; 'browser = C:/Program Files (x86)/Google/Chrome/Application/chrome.exe %s' on Windows.
+;
+; This setting can be overridden with the --browser command line option.
+;
+;browser =
+
 [cql]
-version = 3.1.5
+version = 3.2.1
 
 [connection]
 hostname = 127.0.0.1
@@ -51,3 +68,18 @@ max_trace_wait = 10.0
 
 
 ; vim: set ft=dosini :
+
+;; optional options for COPY TO and COPY FROM
+;[copy]
+;maxattempts=10
+;numprocesses=4
+
+;; optional options for COPY FROM
+;[copy-from]
+;chunksize=5000
+;ingestrate=50000
+
+;; optional options for COPY TO
+;[copy-to]
+;pagesize=2000
+;pagetimeout=20

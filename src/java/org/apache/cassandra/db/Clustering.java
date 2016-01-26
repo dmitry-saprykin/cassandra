@@ -24,8 +24,7 @@ import java.util.*;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.db.marshal.AbstractType;
-import org.apache.cassandra.io.util.DataInputPlus;
-import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.io.util.*;
 import org.apache.cassandra.utils.memory.AbstractAllocator;
 
 /**
@@ -57,9 +56,15 @@ public class Clustering extends AbstractClusteringPrefix
         }
 
         @Override
-        public String toString(CFMetaData metadata)
+        public String toString()
         {
             return "STATIC";
+        }
+
+        @Override
+        public String toString(CFMetaData metadata)
+        {
+            return toString();
         }
     };
 
@@ -128,7 +133,21 @@ public class Clustering extends AbstractClusteringPrefix
         public void serialize(Clustering clustering, DataOutputPlus out, int version, List<AbstractType<?>> types) throws IOException
         {
             assert clustering != STATIC_CLUSTERING : "We should never serialize a static clustering";
+            assert clustering.size() == types.size() : "Invalid clustering for the table: " + clustering;
             ClusteringPrefix.serializer.serializeValuesWithoutSize(clustering, out, version, types);
+        }
+
+        public ByteBuffer serialize(Clustering clustering, int version, List<AbstractType<?>> types)
+        {
+            try (DataOutputBuffer buffer = new DataOutputBuffer((int)serializedSize(clustering, version, types)))
+            {
+                serialize(clustering, buffer, version, types);
+                return buffer.buffer();
+            }
+            catch (IOException e)
+            {
+                throw new RuntimeException("Writting to an in-memory buffer shouldn't trigger an IOException", e);
+            }
         }
 
         public long serializedSize(Clustering clustering, int version, List<AbstractType<?>> types)
@@ -143,6 +162,18 @@ public class Clustering extends AbstractClusteringPrefix
 
             ByteBuffer[] values = ClusteringPrefix.serializer.deserializeValuesWithoutSize(in, types.size(), version, types);
             return new Clustering(values);
+        }
+
+        public Clustering deserialize(ByteBuffer in, int version, List<AbstractType<?>> types)
+        {
+            try (DataInputBuffer buffer = new DataInputBuffer(in, true))
+            {
+                return deserialize(buffer, version, types);
+            }
+            catch (IOException e)
+            {
+                throw new RuntimeException("Reading from an in-memory buffer shouldn't trigger an IOException", e);
+            }
         }
     }
 }

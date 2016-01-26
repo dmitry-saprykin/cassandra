@@ -107,7 +107,7 @@ public class PermissionsCache implements PermissionsCacheMBean
     private LoadingCache<Pair<AuthenticatedUser, IResource>, Set<Permission>> initCache(
                                                              LoadingCache<Pair<AuthenticatedUser, IResource>, Set<Permission>> existing)
     {
-        if (authorizer instanceof AllowAllAuthorizer)
+        if (!authorizer.requireAuthorization())
             return null;
 
         if (DatabaseDescriptor.getPermissionsValidity() <= 0)
@@ -137,7 +137,7 @@ public class PermissionsCache implements PermissionsCacheMBean
                                            }
                                            catch (Exception e)
                                            {
-                                               logger.debug("Error performing async refresh of user permissions", e);
+                                               logger.trace("Error performing async refresh of user permissions", e);
                                                throw e;
                                            }
                                        }

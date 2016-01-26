@@ -72,29 +72,36 @@ public class RepairMessageVerbHandler implements IVerbHandler<RepairMessage>
                     ActiveRepairService.instance.registerParentRepairSession(prepareMessage.parentRepairSession,
                             columnFamilyStores,
                             prepareMessage.ranges,
-                            prepareMessage.isIncremental);
+                            prepareMessage.isIncremental,
+                            prepareMessage.timestamp,
+                            prepareMessage.isGlobal);
                     MessagingService.instance().sendReply(new MessageOut(MessagingService.Verb.INTERNAL_RESPONSE), id, message.from);
                     break;
 
                 case SNAPSHOT:
                     logger.debug("Snapshotting {}", desc);
                     ColumnFamilyStore cfs = Keyspace.open(desc.keyspace).getColumnFamilyStore(desc.columnFamily);
-                    final Range<Token> repairingRange = desc.range;
+                    final Collection<Range<Token>> repairingRange = desc.ranges;
                     Set<SSTableReader> snapshottedSSSTables = cfs.snapshot(desc.sessionId.toString(), new Predicate<SSTableReader>()
                     {
                         public boolean apply(SSTableReader sstable)
                         {
                             return sstable != null &&
                                    !sstable.metadata.isIndex() && // exclude SSTables from 2i
-                                   new Bounds<>(sstable.first.getToken(), sstable.last.getToken()).intersects(Collections.singleton(repairingRange));
+                                   new Bounds<>(sstable.first.getToken(), sstable.last.getToken()).intersects(repairingRange);
                         }
-                    }, true); //ephemeral snapshot, if repair fails, it will be cleaned next startup
+                    }, true, false); //ephemeral snapshot, if repair fails, it will be cleaned next startup
 
                     Set<SSTableReader> currentlyRepairing = ActiveRepairService.instance.currentlyRepairing(cfs.metadata.cfId, desc.parentSessionId);
                     if (!Sets.intersection(currentlyRepairing, snapshottedSSSTables).isEmpty())
                     {
+                        // clear snapshot that we just created
+                        cfs.clearSnapshot(desc.sessionId.toString());
                         logger.error("Cannot start multiple repair sessions over the same sstables");
-                        throw new RuntimeException("Cannot start multiple repair sessions over the same sstables");
+                        MessageOut reply = new MessageOut(MessagingService.Verb.INTERNAL_RESPONSE)
+                                               .withParameter(MessagingService.FAILURE_RESPONSE_PARAM, MessagingService.ONE_BYTE);
+                        MessagingService.instance().sendReply(reply, id, message.from);
+                        return;
                     }
                     ActiveRepairService.instance.getParentRepairSession(desc.parentSessionId).addSSTables(cfs.metadata.cfId, snapshottedSSSTables);
                     logger.debug("Enqueuing response to snapshot request {} to {}", desc.sessionId, message.from);
@@ -117,7 +124,7 @@ public class RepairMessageVerbHandler implements IVerbHandler<RepairMessage>
                     logger.debug("Syncing {}", request);
                     long repairedAt = ActiveRepairService.UNREPAIRED_SSTABLE;
                     if (desc.parentSessionId != null && ActiveRepairService.instance.getParentRepairSession(desc.parentSessionId) != null)
-                        repairedAt = ActiveRepairService.instance.getParentRepairSession(desc.parentSessionId).repairedAt;
+                        repairedAt = ActiveRepairService.instance.getParentRepairSession(desc.parentSessionId).getRepairedAt();
 
                     StreamingRepairTask task = new StreamingRepairTask(desc, request, repairedAt);
                     task.run();

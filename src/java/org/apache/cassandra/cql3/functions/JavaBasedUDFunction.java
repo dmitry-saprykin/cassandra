@@ -25,39 +25,23 @@ import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
 import java.lang.reflect.InvocationTargetException;
-import java.net.MalformedURLException;
-import java.net.URL;
-import java.net.URLConnection;
-import java.net.URLStreamHandler;
+import java.lang.reflect.Method;
+import java.net.*;
 import java.nio.ByteBuffer;
-import java.security.CodeSource;
-import java.security.PermissionCollection;
-import java.security.ProtectionDomain;
-import java.security.SecureClassLoader;
+import java.security.*;
 import java.security.cert.Certificate;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
-import java.util.Set;
-import java.util.StringTokenizer;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import com.google.common.io.ByteStreams;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.datastax.driver.core.DataType;
-import org.apache.cassandra.concurrent.JMXEnabledScheduledThreadPoolExecutor;
 import org.apache.cassandra.concurrent.NamedThreadFactory;
-import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
@@ -81,14 +65,14 @@ final class JavaBasedUDFunction extends UDFunction
 
     private static final AtomicInteger classSequence = new AtomicInteger();
 
-    private static final JMXEnabledScheduledThreadPoolExecutor executor =
-    new JMXEnabledScheduledThreadPoolExecutor(
-                                             DatabaseDescriptor.getMaxHintsThread(),
-                                             new NamedThreadFactory("UserDefinedFunctions",
-                                                                    Thread.MIN_PRIORITY,
-                                                                    udfClassLoader,
-                                                                    new SecurityThreadGroup("UserDefinedFunctions", null)),
-                                             "userfunction");
+    // use a JVM standard ExecutorService as DebuggableThreadPoolExecutor references internal
+    // classes, which triggers AccessControlException from the UDF sandbox
+    private static final UDFExecutorService executor =
+        new UDFExecutorService(new NamedThreadFactory("UserDefinedFunctions",
+                                                      Thread.MIN_PRIORITY,
+                                                      udfClassLoader,
+                                                      new SecurityThreadGroup("UserDefinedFunctions", null, UDFunction::initializeThread)),
+                               "userfunction");
 
     private static final EcjTargetClassLoader targetClassLoader = new EcjTargetClassLoader();
 
@@ -126,6 +110,21 @@ final class JavaBasedUDFunction extends UDFunction
         udfByteCodeVerifier.addDisallowedMethodCall("java/lang/ClassLoader", "setDefaultAssertionStatus");
         udfByteCodeVerifier.addDisallowedMethodCall("java/lang/ClassLoader", "setPackageAssertionStatus");
         udfByteCodeVerifier.addDisallowedMethodCall("java/nio/ByteBuffer", "allocateDirect");
+        for (String ia : new String[]{"java/net/InetAddress", "java/net/Inet4Address", "java/net/Inet6Address"})
+        {
+            // static method, probably performing DNS lookups (despite SecurityManager)
+            udfByteCodeVerifier.addDisallowedMethodCall(ia, "getByAddress");
+            udfByteCodeVerifier.addDisallowedMethodCall(ia, "getAllByName");
+            udfByteCodeVerifier.addDisallowedMethodCall(ia, "getByName");
+            udfByteCodeVerifier.addDisallowedMethodCall(ia, "getLocalHost");
+            // instance methods, probably performing DNS lookups (despite SecurityManager)
+            udfByteCodeVerifier.addDisallowedMethodCall(ia, "getHostName");
+            udfByteCodeVerifier.addDisallowedMethodCall(ia, "getCanonicalHostName");
+            // ICMP PING
+            udfByteCodeVerifier.addDisallowedMethodCall(ia, "isReachable");
+        }
+        udfByteCodeVerifier.addDisallowedClass("java/net/NetworkInterface");
+        udfByteCodeVerifier.addDisallowedClass("java/net/SocketException");
 
         Map<String, String> settings = new HashMap<>();
         settings.put(CompilerOptions.OPTION_LineNumberAttribute,
@@ -188,7 +187,7 @@ final class JavaBasedUDFunction extends UDFunction
         // javaParamTypes is just the Java representation for argTypes resp. argDataTypes
         Class<?>[] javaParamTypes = UDHelper.javaTypes(argDataTypes, calledOnNullInput);
         // javaReturnType is just the Java representation for returnType resp. returnDataType
-        Class<?> javaReturnType = returnDataType.asJavaClass();
+        Class<?> javaReturnType = UDHelper.asJavaClass(returnDataType);
 
         // put each UDF in a separate package to prevent cross-UDF code access
         String pkgName = BASE_PACKAGE + '.' + generateClassName(name, 'p');
@@ -239,7 +238,7 @@ final class JavaBasedUDFunction extends UDFunction
 
         String javaSource = javaSourceBuilder.toString();
 
-        logger.debug("Compiling Java source UDF '{}' as class '{}' using source:\n{}", name, targetClassName, javaSource);
+        logger.trace("Compiling Java source UDF '{}' as class '{}' using source:\n{}", name, targetClassName, javaSource);
 
         try
         {
@@ -315,7 +314,17 @@ final class JavaBasedUDFunction extends UDFunction
 
                 Class cls = Class.forName(targetClassName, false, targetClassLoader);
 
-                if (cls.getDeclaredMethods().length != 2 || cls.getDeclaredConstructors().length != 1)
+                // Count only non-synthetic methods, so code coverage instrumentation doesn't cause a miscount
+                int nonSyntheticMethodCount = 0;
+                for (Method m : cls.getDeclaredMethods())
+                {
+                    if (!m.isSynthetic())
+                    {
+                        nonSyntheticMethodCount += 1;
+                    }
+                }
+
+                if (nonSyntheticMethodCount != 2 || cls.getDeclaredConstructors().length != 1)
                     throw new InvalidRequestException("Check your source to not define additional Java methods or constructors");
                 MethodType methodType = MethodType.methodType(void.class)
                                                   .appendParameterTypes(DataType.class, DataType[].class);
@@ -412,7 +421,7 @@ final class JavaBasedUDFunction extends UDFunction
             if (i > 0)
                 code.append(",\n");
 
-            if (logger.isDebugEnabled())
+            if (logger.isTraceEnabled())
                 code.append("            /* parameter '").append(argNames.get(i)).append("' */\n");
 
             code

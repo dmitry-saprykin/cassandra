@@ -56,7 +56,12 @@ public class DropTypeStatement extends SchemaAlteringStatement
     {
         KeyspaceMetadata ksm = Schema.instance.getKSMetaData(name.getKeyspace());
         if (ksm == null)
-            throw new InvalidRequestException(String.format("Cannot drop type in unknown keyspace %s", name.getKeyspace()));
+        {
+            if (ifExists)
+                return;
+            else
+                throw new InvalidRequestException(String.format("Cannot drop type in unknown keyspace %s", name.getKeyspace()));
+        }
 
         if (!ksm.types.get(name.getUserTypeName()).isPresent())
         {
@@ -85,9 +90,9 @@ public class DropTypeStatement extends SchemaAlteringStatement
 
         for (UserType ut : ksm.types)
             if (!ut.name.equals(name.getUserTypeName()) && isUsedBy(ut))
-                throw new InvalidRequestException(String.format("Cannot drop user type %s as it is still used by user type %s", name, ut.asCQL3Type()));
+                throw new InvalidRequestException(String.format("Cannot drop user type %s as it is still used by user type %s", name, ut.getNameAsString()));
 
-        for (CFMetaData cfm : ksm.tables)
+        for (CFMetaData cfm : ksm.tablesAndViews())
             for (ColumnDefinition def : cfm.allColumns())
                 if (isUsedBy(def.type))
                     throw new InvalidRequestException(String.format("Cannot drop user type %s as it is still used by table %s.%s", name, cfm.ksName, cfm.cfName));
@@ -124,28 +129,24 @@ public class DropTypeStatement extends SchemaAlteringStatement
         return false;
     }
 
-    public Event.SchemaChange changeEvent()
-    {
-        return new Event.SchemaChange(Event.SchemaChange.Change.DROPPED, Event.SchemaChange.Target.TYPE, keyspace(), name.getStringTypeName());
-    }
-
     @Override
     public String keyspace()
     {
         return name.getKeyspace();
     }
 
-    public boolean announceMigration(boolean isLocalOnly) throws InvalidRequestException, ConfigurationException
+    public Event.SchemaChange announceMigration(boolean isLocalOnly) throws InvalidRequestException, ConfigurationException
     {
         KeyspaceMetadata ksm = Schema.instance.getKSMetaData(name.getKeyspace());
-        assert ksm != null;
+        if (ksm == null)
+            return null; // do not assert (otherwise IF EXISTS case fails)
 
         UserType toDrop = ksm.types.getNullable(name.getUserTypeName());
         // Can be null with ifExists
         if (toDrop == null)
-            return false;
+            return null;
 
         MigrationManager.announceTypeDrop(toDrop, isLocalOnly);
-        return true;
+        return new Event.SchemaChange(Event.SchemaChange.Change.DROPPED, Event.SchemaChange.Target.TYPE, keyspace(), name.getStringTypeName());
     }
 }

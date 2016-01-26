@@ -35,6 +35,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.zip.Checksum;
 
+import javax.net.ssl.SSLHandshakeException;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -293,10 +295,10 @@ public class OutboundTcpConnection extends Thread
         catch (Exception e)
         {
             disconnect();
-            if (e instanceof IOException)
+            if (e instanceof IOException || e.getCause() instanceof IOException)
             {
-                if (logger.isDebugEnabled())
-                    logger.debug("error writing to {}", poolReference.endPoint(), e);
+                if (logger.isTraceEnabled())
+                    logger.trace("error writing to {}", poolReference.endPoint(), e);
 
                 // if the message was important, such as a repair acknowledgement, put it back on the queue
                 // to retry after re-connecting.  See CASSANDRA-5393
@@ -357,6 +359,8 @@ public class OutboundTcpConnection extends Thread
             try
             {
                 socket.close();
+                if (logger.isTraceEnabled())
+                    logger.trace("Socket to {} closed", poolReference.endPoint());
             }
             catch (IOException e)
             {
@@ -371,8 +375,8 @@ public class OutboundTcpConnection extends Thread
     @SuppressWarnings("resource")
     private boolean connect()
     {
-        if (logger.isDebugEnabled())
-            logger.debug("attempting to connect to {}", poolReference.endPoint());
+        if (logger.isTraceEnabled())
+            logger.trace("attempting to connect to {}", poolReference.endPoint());
 
         long start = System.nanoTime();
         long timeout = TimeUnit.MILLISECONDS.toNanos(DatabaseDescriptor.getRpcTimeout());
@@ -418,7 +422,7 @@ public class OutboundTcpConnection extends Thread
                     // no version is returned, so disconnect an try again: we will either get
                     // a different target version (targetVersion < MessagingService.VERSION_12)
                     // or if the same version the handshake will finally succeed
-                    logger.debug("Target max version is {}; no version information yet, will retry", maxTargetVersion);
+                    logger.trace("Target max version is {}; no version information yet, will retry", maxTargetVersion);
                     if (DatabaseDescriptor.getSeeds().contains(poolReference.endPoint()))
                         logger.warn("Seed gossip version is {}; will not connect with that version", maxTargetVersion);
                     disconnect();
@@ -431,7 +435,7 @@ public class OutboundTcpConnection extends Thread
 
                 if (targetVersion > maxTargetVersion)
                 {
-                    logger.debug("Target max version is {}; will reconnect with that version", maxTargetVersion);
+                    logger.trace("Target max version is {}; will reconnect with that version", maxTargetVersion);
                     disconnect();
                     return false;
                 }
@@ -468,6 +472,13 @@ public class OutboundTcpConnection extends Thread
                 }
 
                 return true;
+            }
+            catch (SSLHandshakeException e)
+            {
+                logger.error("SSL handshake error for outbound connection to " + socket, e);
+                socket = null;
+                // SSL errors won't be recoverable within timeout period so we'll just abort
+                return false;
             }
             catch (IOException e)
             {
@@ -527,6 +538,8 @@ public class OutboundTcpConnection extends Thread
         while (iter.hasNext())
         {
             QueuedMessage qm = iter.next();
+            if (!qm.droppable)
+                continue;
             if (qm.timestampNanos >= System.nanoTime() - qm.message.getTimeout())
                 return;
             iter.remove();

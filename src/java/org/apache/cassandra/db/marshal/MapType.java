@@ -67,11 +67,17 @@ public class MapType<K, V> extends CollectionType<Map<K, V>>
 
     private MapType(AbstractType<K> keys, AbstractType<V> values, boolean isMultiCell)
     {
-        super(Kind.MAP);
+        super(ComparisonType.CUSTOM, Kind.MAP);
         this.keys = keys;
         this.values = values;
-        this.serializer = MapSerializer.getInstance(keys.getSerializer(), values.getSerializer());
+        this.serializer = MapSerializer.getInstance(keys.getSerializer(), values.getSerializer(), keys);
         this.isMultiCell = isMultiCell;
+    }
+
+    @Override
+    public boolean references(AbstractType<?> check)
+    {
+        return super.references(check) || keys.references(check) || values.references(check);
     }
 
     public AbstractType<K> getKeysType()
@@ -126,7 +132,7 @@ public class MapType<K, V> extends CollectionType<Map<K, V>>
     }
 
     @Override
-    public int compare(ByteBuffer o1, ByteBuffer o2)
+    public int compareCustom(ByteBuffer o1, ByteBuffer o2)
     {
         return compareMaps(keys, values, o1, o2);
     }
@@ -165,11 +171,6 @@ public class MapType<K, V> extends CollectionType<Map<K, V>>
     public MapSerializer<K, V> getSerializer()
     {
         return serializer;
-    }
-
-    public boolean isByteOrderComparable()
-    {
-        return keys.isByteOrderComparable();
     }
 
     @Override

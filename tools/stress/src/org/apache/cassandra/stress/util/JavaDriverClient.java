@@ -44,6 +44,8 @@ public class JavaDriverClient
     public final String username;
     public final String password;
     public final AuthProvider authProvider;
+    public final int maxPendingPerConnection;
+    public final int connectionsPerHost;
 
     private final EncryptionOptions.ClientEncryptionOptions encryptionOptions;
     private Cluster cluster;
@@ -69,6 +71,19 @@ public class JavaDriverClient
             whitelist = new WhiteListPolicy(new DCAwareRoundRobinPolicy(), settings.node.resolveAll(settings.port.nativePort));
         else
             whitelist = null;
+        connectionsPerHost = settings.mode.connectionsPerHost == null ? 8 : settings.mode.connectionsPerHost;
+
+        int maxThreadCount = 0;
+        if (settings.rate.auto)
+            maxThreadCount = settings.rate.maxThreads;
+        else
+            maxThreadCount = settings.rate.threadCount;
+
+        //Always allow enough pending requests so every thread can have a request pending
+        //See https://issues.apache.org/jira/browse/CASSANDRA-7217
+        int requestsPerConnection = (maxThreadCount / connectionsPerHost) + connectionsPerHost;
+
+        maxPendingPerConnection = settings.mode.maxPendingPerConnection == null ? Math.max(128, requestsPerConnection ) : settings.mode.maxPendingPerConnection;
     }
 
     public PreparedStatement prepare(String query)
@@ -89,13 +104,18 @@ public class JavaDriverClient
 
     public void connect(ProtocolOptions.Compression compression) throws Exception
     {
-        PoolingOptions poolingOpts = new PoolingOptions();
-        poolingOpts.setCoreConnectionsPerHost(HostDistance.LOCAL, 8);
+
+        PoolingOptions poolingOpts = new PoolingOptions()
+                                     .setConnectionsPerHost(HostDistance.LOCAL, connectionsPerHost, connectionsPerHost)
+                                     .setMaxRequestsPerConnection(HostDistance.LOCAL, maxPendingPerConnection)
+                                     .setNewConnectionThreshold(HostDistance.LOCAL, 100);
+
         Cluster.Builder clusterBuilder = Cluster.builder()
                                                 .addContactPoint(host)
                                                 .withPort(port)
                                                 .withPoolingOptions(poolingOpts)
-                                                .withProtocolVersion(ProtocolVersion.V2)
+                                                .withoutJMXReporting()
+                                                .withProtocolVersion(ProtocolVersion.NEWEST_SUPPORTED)
                                                 .withoutMetrics(); // The driver uses metrics 3 with conflict with our version
         if (whitelist != null)
             clusterBuilder.withLoadBalancingPolicy(whitelist);
@@ -119,8 +139,11 @@ public class JavaDriverClient
 
         cluster = clusterBuilder.build();
         Metadata metadata = cluster.getMetadata();
-        System.out.printf("Connected to cluster: %s%n",
-                metadata.getClusterName());
+        System.out.printf(
+                "Connected to cluster: %s, max pending requests per connection %d, max connections per host %d%n",
+                metadata.getClusterName(),
+                maxPendingPerConnection,
+                connectionsPerHost);
         for (Host host : metadata.getAllHosts())
         {
             System.out.printf("Datatacenter: %s; Host: %s; Rack: %s%n",
@@ -142,7 +165,7 @@ public class JavaDriverClient
 
     public ResultSet execute(String query, org.apache.cassandra.db.ConsistencyLevel consistency)
     {
-        SimpleStatement stmt = new SimpleStatement(query);
+        SimpleStatement stmt = getSession().newSimpleStatement(query);
         stmt.setConsistencyLevel(from(consistency));
         return getSession().execute(stmt);
     }

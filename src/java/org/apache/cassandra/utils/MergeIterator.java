@@ -17,10 +17,7 @@
  */
 package org.apache.cassandra.utils;
 
-import java.io.Closeable;
 import java.util.*;
-
-import com.google.common.collect.AbstractIterator;
 
 /** Merges sorted input iterators which individually contain unique items. */
 public abstract class MergeIterator<In,Out> extends AbstractIterator<Out> implements IMergeIterator<In, Out>

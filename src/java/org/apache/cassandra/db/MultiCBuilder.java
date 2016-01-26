@@ -29,98 +29,48 @@ import org.apache.cassandra.utils.btree.BTreeSet;
 public abstract class MultiCBuilder
 {
     /**
-     * Creates a new empty {@code MultiCBuilder}.
+     * The table comparator.
      */
-    public static MultiCBuilder create(ClusteringComparator comparator)
+    protected final ClusteringComparator comparator;
+
+    /**
+     * The number of clustering elements that have been added.
+     */
+    protected int size;
+
+    /**
+     * <code>true</code> if the clusterings have been build, <code>false</code> otherwise.
+     */
+    protected boolean built;
+
+    /**
+     * <code>true</code> if the clusterings contains some <code>null</code> elements.
+     */
+    protected boolean containsNull;
+
+    /**
+     * <code>true</code> if the composites contains some <code>unset</code> elements.
+     */
+    protected boolean containsUnset;
+
+    /**
+     * <code>true</code> if some empty collection have been added.
+     */
+    protected boolean hasMissingElements;
+
+    protected MultiCBuilder(ClusteringComparator comparator)
     {
-        return new ConcreteMultiCBuilder(comparator);
+        this.comparator = comparator;
     }
 
     /**
-     * Wraps an existing {@code CBuilder} to provide him with a MultiCBuilder interface
-     * for the sake of passing it to {@link Restriction.appendTo}. The resulting
-     * {@code MultiCBuilder} will still only be able to create a single clustering/bound
-     * and an {@code IllegalArgumentException} will be thrown if elements that added that
-     * would correspond to building multiple clusterings.
+     * Creates a new empty {@code MultiCBuilder}.
      */
-    public static MultiCBuilder wrap(final CBuilder builder)
+    public static MultiCBuilder create(ClusteringComparator comparator, boolean forMultipleValues)
     {
-        return new MultiCBuilder()
-        {
-            private boolean containsNull;
-            private boolean containsUnset;
-            private boolean hasMissingElements;
-
-            public MultiCBuilder addElementToAll(ByteBuffer value)
-            {
-                builder.add(value);
-
-                if (value == null)
-                    containsNull = true;
-                if (value == ByteBufferUtil.UNSET_BYTE_BUFFER)
-                    containsUnset = true;
-
-                return this;
-            }
-
-            public MultiCBuilder addEachElementToAll(List<ByteBuffer> values)
-            {
-                if (values.isEmpty())
-                {
-                    hasMissingElements = true;
-                    return this;
-                }
-
-                if (values.size() > 1)
-                    throw new IllegalArgumentException();
-
-                return addElementToAll(values.get(0));
-            }
-
-            public MultiCBuilder addAllElementsToAll(List<List<ByteBuffer>> values)
-            {
-                if (values.isEmpty())
-                {
-                    hasMissingElements = true;
-                    return this;
-                }
-
-                if (values.size() > 1)
-                    throw new IllegalArgumentException();
-
-                return addEachElementToAll(values.get(0));
-            }
-
-            public int remainingCount()
-            {
-                return builder.remainingCount();
-            }
-
-            public boolean containsNull()
-            {
-                return containsNull;
-            }
-
-            public boolean containsUnset()
-            {
-                return containsUnset;
-            }
-
-            public boolean hasMissingElements()
-            {
-                return hasMissingElements;
-            }
-
-            public NavigableSet<Clustering> build()
-            {
-                return BTreeSet.of(builder.comparator(), builder.build());
-            }
-
-            public NavigableSet<Slice.Bound> buildBound(boolean isStart, boolean isInclusive)
-            {
-                return BTreeSet.of(builder.comparator(), builder.buildBound(isStart, isInclusive));
-            }
-        };
+        return forMultipleValues
+             ? new MultiClusteringBuilder(comparator)
+             : new OneClusteringBuilder(comparator);
     }
 
     /**
@@ -159,32 +109,50 @@ public abstract class MultiCBuilder
      */
     public abstract MultiCBuilder addAllElementsToAll(List<List<ByteBuffer>> values);
 
+    protected void checkUpdateable()
+    {
+        if (!hasRemaining() || built)
+            throw new IllegalStateException("this builder cannot be updated anymore");
+    }
+
     /**
      * Returns the number of elements that can be added to the clusterings.
      *
      * @return the number of elements that can be added to the clusterings.
      */
-    public abstract int remainingCount();
+    public int remainingCount()
+    {
+        return comparator.size() - size;
+    }
 
     /**
      * Checks if the clusterings contains null elements.
      *
      * @return <code>true</code> if the clusterings contains <code>null</code> elements, <code>false</code> otherwise.
      */
-    public abstract boolean containsNull();
+    public boolean containsNull()
+    {
+        return containsNull;
+    }
 
     /**
      * Checks if the clusterings contains unset elements.
      *
      * @return <code>true</code> if the clusterings contains <code>unset</code> elements, <code>false</code> otherwise.
      */
-    public abstract boolean containsUnset();
+    public boolean containsUnset()
+    {
+        return containsUnset;
+    }
 
     /**
      * Checks if some empty list of values have been added
      * @return <code>true</code> if the clusterings have some missing elements, <code>false</code> otherwise.
      */
-    public abstract boolean hasMissingElements();
+    public boolean hasMissingElements()
+    {
+        return hasMissingElements;
+    }
 
     /**
      * Builds the <code>clusterings</code>.
@@ -210,65 +178,118 @@ public abstract class MultiCBuilder
         return remainingCount() > 0;
     }
 
-
-    private static class ConcreteMultiCBuilder extends MultiCBuilder
+    /**
+     * Specialization of MultiCBuilder when we know only one clustering/bound is created.
+     */
+    private static class OneClusteringBuilder extends MultiCBuilder
     {
-        /**
-         * The table comparator.
-         */
-        private final ClusteringComparator comparator;
-
         /**
          * The elements of the clusterings
          */
-        private final List<List<ByteBuffer>> elementsList = new ArrayList<>();
+        private final ByteBuffer[] elements;
 
-        /**
-         * The number of elements that have been added.
-         */
-        private int size;
-
-        /**
-         * <code>true</code> if the clusterings have been build, <code>false</code> otherwise.
-         */
-        private boolean built;
-
-        /**
-         * <code>true</code> if the clusterings contains some <code>null</code> elements.
-         */
-        private boolean containsNull;
-
-        /**
-         * <code>true</code> if the composites contains some <code>unset</code> elements.
-         */
-        private boolean containsUnset;
-
-        /**
-         * <code>true</code> if some empty collection have been added.
-         */
-        private boolean hasMissingElements;
-
-        public ConcreteMultiCBuilder(ClusteringComparator comparator)
+        public OneClusteringBuilder(ClusteringComparator comparator)
         {
-            this.comparator = comparator;
+            super(comparator);
+            this.elements = new ByteBuffer[comparator.size()];
         }
 
         public MultiCBuilder addElementToAll(ByteBuffer value)
         {
             checkUpdateable();
 
-            if (isEmpty())
+            if (value == null)
+                containsNull = true;
+            if (value == ByteBufferUtil.UNSET_BYTE_BUFFER)
+                containsUnset = true;
+
+            elements[size++] = value;
+            return this;
+        }
+
+        public MultiCBuilder addEachElementToAll(List<ByteBuffer> values)
+        {
+            if (values.isEmpty())
+            {
+                hasMissingElements = true;
+                return this;
+            }
+
+            assert values.size() == 1;
+
+            return addElementToAll(values.get(0));
+        }
+
+        public MultiCBuilder addAllElementsToAll(List<List<ByteBuffer>> values)
+        {
+            if (values.isEmpty())
+            {
+                hasMissingElements = true;
+                return this;
+            }
+
+            assert values.size() == 1;
+            return addEachElementToAll(values.get(0));
+        }
+
+        public NavigableSet<Clustering> build()
+        {
+            built = true;
+
+            if (hasMissingElements)
+                return BTreeSet.empty(comparator);
+
+            return BTreeSet.of(comparator, size == 0 ? Clustering.EMPTY : new Clustering(elements));
+        }
+
+        public NavigableSet<Slice.Bound> buildBound(boolean isStart, boolean isInclusive)
+        {
+            built = true;
+
+            if (hasMissingElements)
+                return BTreeSet.empty(comparator);
+
+            if (size == 0)
+                return BTreeSet.of(comparator, isStart ? Slice.Bound.BOTTOM : Slice.Bound.TOP);
+
+            ByteBuffer[] newValues = size == elements.length
+                                   ? elements
+                                   : Arrays.copyOf(elements, size);
+
+            return BTreeSet.of(comparator, Slice.Bound.create(Slice.Bound.boundKind(isStart, isInclusive), newValues));
+        }
+    }
+
+    /**
+     * MultiCBuilder implementation actually supporting the creation of multiple clustering/bound.
+     */
+    private static class MultiClusteringBuilder extends MultiCBuilder
+    {
+        /**
+         * The elements of the clusterings
+         */
+        private final List<List<ByteBuffer>> elementsList = new ArrayList<>();
+
+        public MultiClusteringBuilder(ClusteringComparator comparator)
+        {
+            super(comparator);
+        }
+
+        public MultiCBuilder addElementToAll(ByteBuffer value)
+        {
+            checkUpdateable();
+
+            if (elementsList.isEmpty())
                 elementsList.add(new ArrayList<ByteBuffer>());
 
-            for (int i = 0, m = elementsList.size(); i < m; i++)
-            {
-                if (value == null)
-                    containsNull = true;
-                if (value == ByteBufferUtil.UNSET_BYTE_BUFFER)
-                    containsUnset = true;
+            if (value == null)
+                containsNull = true;
+            else if (value == ByteBufferUtil.UNSET_BYTE_BUFFER)
+                containsUnset = true;
 
+            for (int i = 0, m = elementsList.size(); i < m; i++)
                 elementsList.get(i).add(value);
-            }
+
             size++;
             return this;
         }
@@ -277,7 +298,7 @@ public abstract class MultiCBuilder
         {
             checkUpdateable();
 
-            if (isEmpty())
+            if (elementsList.isEmpty())
                 elementsList.add(new ArrayList<ByteBuffer>());
 
             if (values.isEmpty())
@@ -314,7 +335,7 @@ public abstract class MultiCBuilder
         {
             checkUpdateable();
 
-            if (isEmpty())
+            if (elementsList.isEmpty())
                 elementsList.add(new ArrayList<ByteBuffer>());
 
             if (values.isEmpty())
@@ -348,36 +369,6 @@ public abstract class MultiCBuilder
                 size += values.get(0).size();
             }
             return this;
-        }
-
-        public int remainingCount()
-        {
-            return comparator.size() - size;
-        }
-
-        /**
-         * Checks if this builder is empty.
-         *
-         * @return <code>true</code> if this builder is empty, <code>false</code> otherwise.
-         */
-        public boolean isEmpty()
-        {
-            return elementsList.isEmpty();
-        }
-
-        public boolean containsNull()
-        {
-            return containsNull;
-        }
-
-        public boolean containsUnset()
-        {
-            return containsUnset;
-        }
-
-        public boolean hasMissingElements()
-        {
-            return hasMissingElements;
         }
 
         public NavigableSet<Clustering> build()
@@ -422,12 +413,6 @@ public abstract class MultiCBuilder
                 set.add(builder.buildBoundWith(elements, isStart, isInclusive));
             }
             return set.build();
-        }
-
-        private void checkUpdateable()
-        {
-            if (!hasRemaining() || built)
-                throw new IllegalStateException("this builder cannot be updated anymore");
         }
     }
 }

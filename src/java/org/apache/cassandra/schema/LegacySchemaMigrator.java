@@ -27,7 +27,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.*;
-import org.apache.cassandra.cql3.*;
+import org.apache.cassandra.cql3.ColumnIdentifier;
+import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.cql3.functions.FunctionName;
 import org.apache.cassandra.cql3.functions.UDAggregate;
 import org.apache.cassandra.cql3.functions.UDFunction;
@@ -120,8 +122,9 @@ public final class LegacySchemaMigrator
 
     private static void storeKeyspaceInNewSchemaTables(Keyspace keyspace)
     {
-        Mutation mutation = SchemaKeyspace.makeCreateKeyspaceMutation(keyspace.name, keyspace.params, keyspace.timestamp);
+        logger.info("Migrating keyspace {}", keyspace);
 
+        Mutation mutation = SchemaKeyspace.makeCreateKeyspaceMutation(keyspace.name, keyspace.params, keyspace.timestamp);
         for (Table table : keyspace.tables)
             SchemaKeyspace.addTableToSchemaMutation(table.metadata, table.timestamp, true, mutation);
 
@@ -160,7 +163,9 @@ public final class LegacySchemaMigrator
         Collection<Table> tables = readTables(keyspaceName);
         Collection<Type> types = readTypes(keyspaceName);
         Collection<Function> functions = readFunctions(keyspaceName);
-        Collection<Aggregate> aggregates = readAggregates(keyspaceName);
+        Functions.Builder functionsBuilder = Functions.builder();
+        functions.forEach(udf -> functionsBuilder.add(udf.metadata));
+        Collection<Aggregate> aggregates = readAggregates(functionsBuilder.build(), keyspaceName);
 
         return new Keyspace(timestamp, keyspaceName, params, tables, types, functions, aggregates);
     }
@@ -293,6 +298,7 @@ public final class LegacySchemaMigrator
                                                                         isStaticCompactTable,
                                                                         needsUpgrade);
 
+
         if (needsUpgrade)
         {
             addDefinitionForUpgrade(columnDefs,
@@ -315,6 +321,18 @@ public final class LegacySchemaMigrator
                                            false, // legacy schema did not contain views
                                            columnDefs,
                                            DatabaseDescriptor.getPartitioner());
+
+        Indexes indexes = createIndexesFromColumnRows(cfm,
+                                                      columnRows,
+                                                      ksName,
+                                                      cfName,
+                                                      rawComparator,
+                                                      subComparator,
+                                                      isSuper,
+                                                      isCQLTable,
+                                                      isStaticCompactTable,
+                                                      needsUpgrade);
+        cfm.indexes(indexes);
 
         if (tableRow.has("dropped_columns"))
             addDroppedColumns(cfm, rawComparator, tableRow.getMap("dropped_columns", UTF8Type.instance, LongType.instance));
@@ -345,7 +363,13 @@ public final class LegacySchemaMigrator
         if (row.has("speculative_retry"))
             params.speculativeRetry(SpeculativeRetryParam.fromString(row.getString("speculative_retry")));
 
-        params.compression(CompressionParams.fromMap(fromJsonMap(row.getString("compression_parameters"))));
+        Map<String, String> compressionParameters = fromJsonMap(row.getString("compression_parameters"));
+        String crcCheckChance = compressionParameters.remove("crc_check_chance");
+        //crc_check_chance was promoted from a compression property to a top-level property
+        if (crcCheckChance != null)
+            params.crcCheckChance(Double.parseDouble(crcCheckChance));
+
+        params.compression(CompressionParams.fromMap(compressionParameters));
 
         params.compaction(compactionFromRow(row));
 
@@ -462,7 +486,7 @@ public final class LegacySchemaMigrator
         }
         else if (isStaticCompactTable)
         {
-            defs.add(ColumnDefinition.clusteringKeyDef(ksName, cfName, names.defaultClusteringName(), rawComparator, null));
+            defs.add(ColumnDefinition.clusteringDef(ksName, cfName, names.defaultClusteringName(), rawComparator, 0));
             defs.add(ColumnDefinition.regularDef(ksName, cfName, names.defaultCompactValueName(), defaultValidator));
         }
         else
@@ -530,42 +554,103 @@ public final class LegacySchemaMigrator
             if (isEmptyCompactValueColumn(row))
                 continue;
 
-            ColumnDefinition.Kind kind = deserializeKind(row.getString("type"));
-            if (needsUpgrade && isStaticCompactTable && kind == ColumnDefinition.Kind.REGULAR)
-                kind = ColumnDefinition.Kind.STATIC;
+            columns.add(createColumnFromColumnRow(row,
+                                                  keyspace,
+                                                  table,
+                                                  rawComparator,
+                                                  rawSubComparator,
+                                                  isSuper,
+                                                  isCQLTable,
+                                                  isStaticCompactTable,
+                                                  needsUpgrade));
+        }
 
-            Integer componentIndex = null;
-            // Note that the component_index is not useful for non-primary key parts (it never really in fact since there is
-            // no particular ordering of non-PK columns, we only used to use it as a simplification but that's not needed
-            // anymore)
-            if (kind.isPrimaryKeyKind() && row.has("component_index"))
-                componentIndex = row.getInt("component_index");
+        return columns;
+    }
 
-            // Note: we save the column name as string, but we should not assume that it is an UTF8 name, we
-            // we need to use the comparator fromString method
-            AbstractType<?> comparator = isCQLTable
-                                       ? UTF8Type.instance
-                                       : CompactTables.columnDefinitionComparator(kind, isSuper, rawComparator, rawSubComparator);
-            ColumnIdentifier name = ColumnIdentifier.getInterned(comparator.fromString(row.getString("column_name")), comparator);
+    private static ColumnDefinition createColumnFromColumnRow(UntypedResultSet.Row row,
+                                                              String keyspace,
+                                                              String table,
+                                                              AbstractType<?> rawComparator,
+                                                              AbstractType<?> rawSubComparator,
+                                                              boolean isSuper,
+                                                              boolean isCQLTable,
+                                                              boolean isStaticCompactTable,
+                                                              boolean needsUpgrade)
+    {
+        ColumnDefinition.Kind kind = deserializeKind(row.getString("type"));
+        if (needsUpgrade && isStaticCompactTable && kind == ColumnDefinition.Kind.REGULAR)
+            kind = ColumnDefinition.Kind.STATIC;
 
-            AbstractType<?> validator = parseType(row.getString("validator"));
+        int componentIndex = ColumnDefinition.NO_POSITION;
+        // Note that the component_index is not useful for non-primary key parts (it never really in fact since there is
+        // no particular ordering of non-PK columns, we only used to use it as a simplification but that's not needed
+        // anymore)
+        if (kind.isPrimaryKeyKind())
+            // We use to not have a component index when there was a single partition key, we don't anymore (#10491)
+            componentIndex = row.has("component_index") ? row.getInt("component_index") : 0;
 
-            IndexType indexType = null;
+        // Note: we save the column name as string, but we should not assume that it is an UTF8 name, we
+        // we need to use the comparator fromString method
+        AbstractType<?> comparator = isCQLTable
+                                     ? UTF8Type.instance
+                                     : CompactTables.columnDefinitionComparator(kind, isSuper, rawComparator, rawSubComparator);
+        ColumnIdentifier name = ColumnIdentifier.getInterned(comparator.fromString(row.getString("column_name")), comparator);
+
+        AbstractType<?> validator = parseType(row.getString("validator"));
+
+        return new ColumnDefinition(keyspace, table, name, validator, componentIndex, kind);
+    }
+
+    private static Indexes createIndexesFromColumnRows(CFMetaData cfm,
+                                                       UntypedResultSet rows,
+                                                       String keyspace,
+                                                       String table,
+                                                       AbstractType<?> rawComparator,
+                                                       AbstractType<?> rawSubComparator,
+                                                       boolean isSuper,
+                                                       boolean isCQLTable,
+                                                       boolean isStaticCompactTable,
+                                                       boolean needsUpgrade)
+    {
+        Indexes.Builder indexes = Indexes.builder();
+
+        for (UntypedResultSet.Row row : rows)
+        {
+            IndexMetadata.Kind kind = null;
             if (row.has("index_type"))
-                indexType = IndexType.valueOf(row.getString("index_type"));
+                kind = IndexMetadata.Kind.valueOf(row.getString("index_type"));
+
+            if (kind == null)
+                continue;
 
             Map<String, String> indexOptions = null;
             if (row.has("index_options"))
                 indexOptions = fromJsonMap(row.getString("index_options"));
 
-            String indexName = null;
-            if (row.has("index_name"))
-                indexName = row.getString("index_name");
+            if (row.has("index_name")) 
+            {
+                String indexName = row.getString("index_name");
 
-            columns.add(new ColumnDefinition(keyspace, table, name, validator, indexType, indexOptions, indexName, componentIndex, kind));
+                ColumnDefinition column = createColumnFromColumnRow(row,
+                                                                    keyspace,
+                                                                    table,
+                                                                    rawComparator,
+                                                                    rawSubComparator,
+                                                                    isSuper,
+                                                                    isCQLTable,
+                                                                    isStaticCompactTable,
+                                                                    needsUpgrade);
+    
+                indexes.add(IndexMetadata.fromLegacyMetadata(cfm, column, indexName, kind, indexOptions));
+            } 
+            else 
+            {
+                logger.error("Failed to find index name for legacy migration of index on {}.{}", keyspace, table);
+            }
         }
 
-        return columns;
+        return indexes.build();
     }
 
     private static ColumnDefinition.Kind deserializeKind(String kind)
@@ -630,7 +715,7 @@ public final class LegacySchemaMigrator
         Slices slices = Slices.with(comparator, Slice.make(comparator, typeName));
         int nowInSec = FBUtilities.nowInSeconds();
         DecoratedKey key = store.metadata.decorateKey(AsciiType.instance.fromString(keyspaceName));
-        SinglePartitionReadCommand command = SinglePartitionSliceCommand.create(store.metadata, nowInSec, key, slices);
+        SinglePartitionReadCommand command = SinglePartitionReadCommand.create(store.metadata, nowInSec, key, slices);
 
         try (OpOrder.Group op = store.readOrdering.start();
              RowIterator partition = UnfilteredRowIterators.filter(command.queryMemtableAndDisk(store, op), nowInSec))
@@ -734,7 +819,7 @@ public final class LegacySchemaMigrator
      * Reading UDAs
      */
 
-    private static Collection<Aggregate> readAggregates(String keyspaceName)
+    private static Collection<Aggregate> readAggregates(Functions functions, String keyspaceName)
     {
         String query = format("SELECT aggregate_name, signature FROM %s.%s WHERE keyspace_name = ?",
                               SystemKeyspace.NAME,
@@ -743,14 +828,14 @@ public final class LegacySchemaMigrator
         query(query, keyspaceName).forEach(row -> aggregateSignatures.put(row.getString("aggregate_name"), row.getList("signature", UTF8Type.instance)));
 
         Collection<Aggregate> aggregates = new ArrayList<>();
-        aggregateSignatures.entries().forEach(pair -> aggregates.add(readAggregate(keyspaceName, pair.getKey(), pair.getValue())));
+        aggregateSignatures.entries().forEach(pair -> aggregates.add(readAggregate(functions, keyspaceName, pair.getKey(), pair.getValue())));
         return aggregates;
     }
 
-    private static Aggregate readAggregate(String keyspaceName, String aggregateName, List<String> signature)
+    private static Aggregate readAggregate(Functions functions, String keyspaceName, String aggregateName, List<String> signature)
     {
         long timestamp = readAggregateTimestamp(keyspaceName, aggregateName, signature);
-        UDAggregate metadata = readAggregateMetadata(keyspaceName, aggregateName, signature);
+        UDAggregate metadata = readAggregateMetadata(functions, keyspaceName, aggregateName, signature);
         return new Aggregate(timestamp, metadata);
     }
 
@@ -764,9 +849,9 @@ public final class LegacySchemaMigrator
         return query(query, keyspaceName, aggregateName, signature).one().getLong("timestamp");
     }
 
-    private static UDAggregate readAggregateMetadata(String keyspaceName, String functionName, List<String> signature)
+    private static UDAggregate readAggregateMetadata(Functions functions, String keyspaceName, String functionName, List<String> signature)
     {
-        String query = format("SELECT * FROM %s.%s WHERE keyspace_name = ? AND function_name = ? AND signature = ?",
+        String query = format("SELECT * FROM %s.%s WHERE keyspace_name = ? AND aggregate_name = ? AND signature = ?",
                               SystemKeyspace.NAME,
                               SystemKeyspace.LEGACY_AGGREGATES);
         UntypedResultSet.Row row = query(query, keyspaceName, functionName, signature).one();
@@ -786,13 +871,13 @@ public final class LegacySchemaMigrator
         AbstractType<?> returnType = parseType(row.getString("return_type"));
 
         FunctionName stateFunc = new FunctionName(keyspaceName, row.getString("state_func"));
+        AbstractType<?> stateType = parseType(row.getString("state_type"));
         FunctionName finalFunc = row.has("final_func") ? new FunctionName(keyspaceName, row.getString("final_func")) : null;
-        AbstractType<?> stateType = row.has("state_type") ? parseType(row.getString("state_type")) : null;
         ByteBuffer initcond = row.has("initcond") ? row.getBytes("initcond") : null;
 
         try
         {
-            return UDAggregate.create(name, argTypes, returnType, stateFunc, finalFunc, stateType, initcond);
+            return UDAggregate.create(functions, name, argTypes, returnType, stateFunc, finalFunc, stateType, initcond);
         }
         catch (InvalidRequestException reason)
         {

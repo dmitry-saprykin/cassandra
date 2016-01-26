@@ -20,28 +20,26 @@ package org.apache.cassandra.db;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.commons.lang3.StringUtils;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.db.rows.SerializationHelper;
-import org.apache.cassandra.db.partitions.*;
 import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.net.MessageOut;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 // TODO convert this to a Builder pattern instead of encouraging M.add directly,
 // which is less-efficient since we have to keep a mutable HashMap around
 public class Mutation implements IMutation
 {
     public static final MutationSerializer serializer = new MutationSerializer();
-    private static final Logger logger = LoggerFactory.getLogger(Mutation.class);
 
     public static final String FORWARD_TO = "FWD_TO";
     public static final String FORWARD_FROM = "FWD_FRM";
@@ -56,9 +54,12 @@ public class Mutation implements IMutation
 
     // Time at which this mutation was instantiated
     public final long createdAt = System.currentTimeMillis();
+    // keep track of when mutation has started waiting for a MV partition lock
+    public final AtomicLong viewLockAcquireStart = new AtomicLong(0);
+
     public Mutation(String keyspaceName, DecoratedKey key)
     {
-        this(keyspaceName, key, new HashMap<UUID, PartitionUpdate>());
+        this(keyspaceName, key, new HashMap<>());
     }
 
     public Mutation(PartitionUpdate update)
@@ -75,8 +76,22 @@ public class Mutation implements IMutation
 
     public Mutation copy()
     {
-        Mutation copy = new Mutation(keyspaceName, key, new HashMap<>(modifications));
+        return new Mutation(keyspaceName, key, new HashMap<>(modifications));
+    }
+
+    public Mutation without(Set<UUID> cfIds)
+    {
+        if (cfIds.isEmpty())
+            return this;
+
+        Mutation copy = copy();
+        copy.modifications.keySet().removeAll(cfIds);
         return copy;
+    }
+
+    public Mutation without(UUID cfId)
+    {
+        return without(Collections.singleton(cfId));
     }
 
     public String getKeyspaceName()
@@ -187,6 +202,11 @@ public class Mutation implements IMutation
         ks.apply(this, ks.getMetadata().params.durableWrites);
     }
 
+    public void apply(boolean durableWrites)
+    {
+        Keyspace.open(keyspaceName).apply(this, durableWrites);
+    }
+
     public void applyUnsafe()
     {
         Keyspace.open(keyspaceName).apply(this, false);
@@ -207,6 +227,14 @@ public class Mutation implements IMutation
         return DatabaseDescriptor.getWriteRpcTimeout();
     }
 
+    public int smallestGCGS()
+    {
+        int gcgs = Integer.MAX_VALUE;
+        for (PartitionUpdate update : getPartitionUpdates())
+            gcgs = Math.min(gcgs, update.metadata().params.gcGraceSeconds);
+        return gcgs;
+    }
+
     public String toString()
     {
         return toString(false);
@@ -220,7 +248,7 @@ public class Mutation implements IMutation
         buff.append(", modifications=[");
         if (shallow)
         {
-            List<String> cfnames = new ArrayList<String>(modifications.size());
+            List<String> cfnames = new ArrayList<>(modifications.size());
             for (UUID cfid : modifications.keySet())
             {
                 CFMetaData cfm = Schema.instance.getCFMetaData(cfid);
@@ -230,18 +258,9 @@ public class Mutation implements IMutation
         }
         else
         {
-            buff.append("\n  ").append(StringUtils.join(modifications.values(), "\n  ")).append("\n");
+            buff.append("\n  ").append(StringUtils.join(modifications.values(), "\n  ")).append('\n');
         }
         return buff.append("])").toString();
-    }
-
-    public Mutation without(UUID cfId)
-    {
-        Mutation mutation = new Mutation(keyspaceName, key);
-        for (Map.Entry<UUID, PartitionUpdate> entry : modifications.entrySet())
-            if (!entry.getKey().equals(cfId))
-                mutation.add(entry.getValue());
-        return mutation;
     }
 
     public static class MutationSerializer implements IVersionedSerializer<Mutation>
@@ -261,7 +280,7 @@ public class Mutation implements IMutation
             }
             else
             {
-                out.writeVInt(size);
+                out.writeUnsignedVInt(size);
             }
 
             assert size > 0;
@@ -283,7 +302,7 @@ public class Mutation implements IMutation
             }
             else
             {
-                size = (int)in.readVInt();
+                size = (int)in.readUnsignedVInt();
             }
 
             assert size > 0;
@@ -325,7 +344,7 @@ public class Mutation implements IMutation
             }
             else
             {
-                size += TypeSizes.sizeofVInt(mutation.modifications.size());
+                size += TypeSizes.sizeofUnsignedVInt(mutation.modifications.size());
             }
 
             for (Map.Entry<UUID, PartitionUpdate> entry : mutation.modifications.entrySet())

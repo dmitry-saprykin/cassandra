@@ -31,6 +31,7 @@ import org.junit.After;
 import org.junit.Test;
 
 import junit.framework.Assert;
+
 import org.apache.cassandra.db.ClusteringComparator;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.BytesType;
@@ -41,6 +42,7 @@ import org.apache.cassandra.io.util.FileMark;
 import org.apache.cassandra.io.util.RandomAccessReader;
 import org.apache.cassandra.io.util.SequentialWriterTest;
 import org.apache.cassandra.schema.CompressionParams;
+import org.apache.cassandra.utils.ChecksumType;
 
 public class CompressedSequentialWriterTest extends SequentialWriterTest
 {
@@ -92,7 +94,7 @@ public class CompressedSequentialWriterTest extends SequentialWriterTest
             byte[] rawPost = new byte[bytesToTest];
             try (CompressedSequentialWriter writer = new CompressedSequentialWriter(f, filename + ".metadata", compressionParameters, sstableMetadataCollector);)
             {
-                Random r = new Random();
+                Random r = new Random(42);
 
                 // Test both write with byte[] and ByteBuffer
                 r.nextBytes(dataPre);
@@ -115,7 +117,7 @@ public class CompressedSequentialWriterTest extends SequentialWriterTest
             }
 
             assert f.exists();
-            RandomAccessReader reader = CompressedRandomAccessReader.open(channel, new CompressionMetadata(filename + ".metadata", f.length()));
+            RandomAccessReader reader = new CompressedRandomAccessReader.Builder(channel, new CompressionMetadata(filename + ".metadata", f.length(), ChecksumType.CRC32)).build();
             assertEquals(dataPre.length + rawPost.length, reader.length());
             byte[] result = new byte[(int)reader.length()];
 
@@ -220,7 +222,6 @@ public class CompressedSequentialWriterTest extends SequentialWriterTest
         protected void assertAborted() throws Exception
         {
             super.assertAborted();
-            Assert.assertFalse(offsetsFile.exists());
         }
 
         void cleanup()

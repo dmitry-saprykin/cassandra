@@ -26,12 +26,15 @@ import com.google.common.collect.ImmutableList;
 import org.junit.Test;
 
 import org.apache.cassandra.SchemaLoader;
-import org.apache.cassandra.config.*;
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.functions.*;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.marshal.*;
+import org.apache.cassandra.index.internal.CassandraIndex;
 import org.apache.cassandra.thrift.ThriftConversion;
 
 import static java.lang.String.format;
@@ -60,8 +63,7 @@ public class LegacySchemaMigratorTest
     {
         CQLTester.cleanupAndLeaveDirs();
 
-        List<KeyspaceMetadata> expected = keyspaceToMigrate();
-        expected.sort((k1, k2) -> k1.name.compareTo(k2.name));
+        Keyspaces expected = keyspacesToMigrate();
 
         // write the keyspaces into the legacy tables
         expected.forEach(LegacySchemaMigratorTest::legacySerializeKeyspace);
@@ -70,8 +72,7 @@ public class LegacySchemaMigratorTest
         LegacySchemaMigrator.migrate();
 
         // read back all the metadata from the new schema tables
-        List<KeyspaceMetadata> actual = SchemaKeyspace.readSchemaFromSystemTables();
-        actual.sort((k1, k2) -> k1.name.compareTo(k2.name));
+        Keyspaces actual = SchemaKeyspace.fetchNonSystemKeyspaces();
 
         // need to load back CFMetaData of those tables (CFS instances will still be loaded)
         loadLegacySchemaTables();
@@ -101,9 +102,9 @@ public class LegacySchemaMigratorTest
         Schema.instance.setKeyspaceMetadata(systemKeyspace.withSwapped(systemTables));
     }
 
-    private static List<KeyspaceMetadata> keyspaceToMigrate()
+    private static Keyspaces keyspacesToMigrate()
     {
-        List<KeyspaceMetadata> keyspaces = new ArrayList<>();
+        Keyspaces.Builder keyspaces = Keyspaces.builder();
 
         // A whole bucket of shorthand
         String ks1 = KEYSPACE_PREFIX + "Keyspace1";
@@ -244,13 +245,18 @@ public class LegacySchemaMigratorTest
                                                                            + "PRIMARY KEY((bar, baz), qux, quz) ) "
                                                                            + "WITH COMPACT STORAGE", ks_cql))));
 
+        // NTS keyspace
+        keyspaces.add(KeyspaceMetadata.create("nts", KeyspaceParams.nts("dc1", 1, "dc2", 2)));
+
         keyspaces.add(keyspaceWithDroppedCollections());
         keyspaces.add(keyspaceWithTriggers());
         keyspaces.add(keyspaceWithUDTs());
         keyspaces.add(keyspaceWithUDFs());
+        keyspaces.add(keyspaceWithUDFsAndUDTs());
         keyspaces.add(keyspaceWithUDAs());
+        keyspaces.add(keyspaceWithUDAsAndUDTs());
 
-        return keyspaces;
+        return keyspaces.build();
     }
 
     private static KeyspaceMetadata keyspaceWithDroppedCollections()
@@ -314,6 +320,7 @@ public class LegacySchemaMigratorTest
         return KeyspaceMetadata.create(keyspace,
                                        KeyspaceParams.simple(1),
                                        Tables.none(),
+                                       Views.none(),
                                        Types.of(udt1, udt2, udt3),
                                        Functions.none());
     }
@@ -321,7 +328,6 @@ public class LegacySchemaMigratorTest
     private static KeyspaceMetadata keyspaceWithUDFs()
     {
         String keyspace = KEYSPACE_PREFIX + "UDFs";
-
 
         UDFunction udf1 = UDFunction.create(new FunctionName(keyspace, "udf"),
                                             ImmutableList.of(new ColumnIdentifier("col1", false), new ColumnIdentifier("col2", false)),
@@ -351,20 +357,182 @@ public class LegacySchemaMigratorTest
         return KeyspaceMetadata.create(keyspace,
                                        KeyspaceParams.simple(1),
                                        Tables.none(),
+                                       Views.none(),
                                        Types.none(),
                                        Functions.of(udf1, udf2, udf3));
     }
 
-    // TODO: add representative UDAs set
     private static KeyspaceMetadata keyspaceWithUDAs()
     {
         String keyspace = KEYSPACE_PREFIX + "UDAs";
 
+        UDFunction udf1 = UDFunction.create(new FunctionName(keyspace, "udf1"),
+                                            ImmutableList.of(new ColumnIdentifier("col1", false), new ColumnIdentifier("col2", false)),
+                                            ImmutableList.of(Int32Type.instance, Int32Type.instance),
+                                            Int32Type.instance,
+                                            false,
+                                            "java",
+                                            "return 42;");
+
+        UDFunction udf2 = UDFunction.create(new FunctionName(keyspace, "udf2"),
+                                            ImmutableList.of(new ColumnIdentifier("col1", false), new ColumnIdentifier("col2", false)),
+                                            ImmutableList.of(LongType.instance, Int32Type.instance),
+                                            LongType.instance,
+                                            false,
+                                            "java",
+                                            "return 42L;");
+
+        UDFunction udf3 = UDFunction.create(new FunctionName(keyspace, "udf3"),
+                                            ImmutableList.of(new ColumnIdentifier("col1", false)),
+                                            ImmutableList.of(LongType.instance),
+                                            DoubleType.instance,
+                                            false,
+                                            "java",
+                                            "return 42d;");
+
+        Functions udfs = Functions.builder().add(udf1).add(udf2).add(udf3).build();
+
+        UDAggregate uda1 = UDAggregate.create(udfs, new FunctionName(keyspace, "uda1"),
+                                              ImmutableList.of(udf1.argTypes().get(1)),
+                                              udf1.returnType(),
+                                              udf1.name(),
+                                              null,
+                                              udf1.argTypes().get(0),
+                                              null
+        );
+
+        UDAggregate uda2 = UDAggregate.create(udfs, new FunctionName(keyspace, "uda2"),
+                                              ImmutableList.of(udf2.argTypes().get(1)),
+                                              udf3.returnType(),
+                                              udf2.name(),
+                                              udf3.name(),
+                                              udf2.argTypes().get(0),
+                                              LongType.instance.decompose(0L)
+        );
+
         return KeyspaceMetadata.create(keyspace,
                                        KeyspaceParams.simple(1),
                                        Tables.none(),
+                                       Views.none(),
                                        Types.none(),
-                                       Functions.of());
+                                       Functions.of(udf1, udf2, udf3, uda1, uda2));
+    }
+
+    private static KeyspaceMetadata keyspaceWithUDFsAndUDTs()
+    {
+        String keyspace = KEYSPACE_PREFIX + "UDFUDTs";
+
+        UserType udt1 = new UserType(keyspace,
+                                     bytes("udt1"),
+                                     new ArrayList<ByteBuffer>() {{ add(bytes("col1")); add(bytes("col2")); }},
+                                     new ArrayList<AbstractType<?>>() {{ add(UTF8Type.instance); add(Int32Type.instance); }});
+
+        UserType udt2 = new UserType(keyspace,
+                                     bytes("udt2"),
+                                     new ArrayList<ByteBuffer>() {{ add(bytes("col1")); add(bytes("col2")); }},
+                                     new ArrayList<AbstractType<?>>() {{ add(ListType.getInstance(udt1, false)); add(Int32Type.instance); }});
+
+        UDFunction udf1 = UDFunction.create(new FunctionName(keyspace, "udf"),
+                                            ImmutableList.of(new ColumnIdentifier("col1", false), new ColumnIdentifier("col2", false)),
+                                            ImmutableList.of(udt1, udt2),
+                                            LongType.instance,
+                                            false,
+                                            "java",
+                                            "return 42L;");
+
+        // an overload with the same name, not a typo
+        UDFunction udf2 = UDFunction.create(new FunctionName(keyspace, "udf"),
+                                            ImmutableList.of(new ColumnIdentifier("col3", false), new ColumnIdentifier("col4", false)),
+                                            ImmutableList.of(AsciiType.instance, LongType.instance),
+                                            Int32Type.instance,
+                                            true,
+                                            "java",
+                                            "return 42;");
+
+        UDFunction udf3 = UDFunction.create(new FunctionName(keyspace, "udf3"),
+                                            ImmutableList.of(new ColumnIdentifier("col4", false)),
+                                            ImmutableList.of(new TupleType(Arrays.asList(udt1, udt2))),
+                                            BooleanType.instance,
+                                            false,
+                                            "java",
+                                            "return true;");
+
+        return KeyspaceMetadata.create(keyspace,
+                                       KeyspaceParams.simple(1),
+                                       Tables.none(),
+                                       Views.none(),
+                                       Types.of(udt1, udt2),
+                                       Functions.of(udf1, udf2, udf3));
+    }
+
+    private static KeyspaceMetadata keyspaceWithUDAsAndUDTs()
+    {
+        String keyspace = KEYSPACE_PREFIX + "UDAUDTs";
+
+        UserType udt1 = new UserType(keyspace,
+                                     bytes("udt1"),
+                                     new ArrayList<ByteBuffer>() {{ add(bytes("col1")); add(bytes("col2")); }},
+                                     new ArrayList<AbstractType<?>>() {{ add(UTF8Type.instance); add(Int32Type.instance); }});
+
+        UserType udt2 = new UserType(keyspace,
+                                     bytes("udt2"),
+                                     new ArrayList<ByteBuffer>() {{ add(bytes("col1")); add(bytes("col2")); }},
+                                     new ArrayList<AbstractType<?>>() {{ add(ListType.getInstance(udt1, false)); add(Int32Type.instance); }});
+
+        UDFunction udf1 = UDFunction.create(new FunctionName(keyspace, "udf1"),
+                                            ImmutableList.of(new ColumnIdentifier("col1", false), new ColumnIdentifier("col2", false)),
+                                            ImmutableList.of(udt1, udt2),
+                                            udt1,
+                                            false,
+                                            "java",
+                                            "return null;");
+
+        UDFunction udf2 = UDFunction.create(new FunctionName(keyspace, "udf2"),
+                                            ImmutableList.of(new ColumnIdentifier("col1", false), new ColumnIdentifier("col2", false)),
+                                            ImmutableList.of(udt2, udt1),
+                                            udt2,
+                                            false,
+                                            "java",
+                                            "return null;");
+
+        UDFunction udf3 = UDFunction.create(new FunctionName(keyspace, "udf3"),
+                                            ImmutableList.of(new ColumnIdentifier("col1", false)),
+                                            ImmutableList.of(udt2),
+                                            DoubleType.instance,
+                                            false,
+                                            "java",
+                                            "return 42d;");
+
+        Functions udfs = Functions.builder().add(udf1).add(udf2).add(udf3).build();
+
+        UDAggregate uda1 = UDAggregate.create(udfs, new FunctionName(keyspace, "uda1"),
+                                              ImmutableList.of(udf1.argTypes().get(1)),
+                                              udf1.returnType(),
+                                              udf1.name(),
+                                              null,
+                                              udf1.argTypes().get(0),
+                                              null
+        );
+
+        ByteBuffer twoNullEntries = ByteBuffer.allocate(8);
+        twoNullEntries.putInt(-1);
+        twoNullEntries.putInt(-1);
+        twoNullEntries.flip();
+        UDAggregate uda2 = UDAggregate.create(udfs, new FunctionName(keyspace, "uda2"),
+                                              ImmutableList.of(udf2.argTypes().get(1)),
+                                              udf3.returnType(),
+                                              udf2.name(),
+                                              udf3.name(),
+                                              udf2.argTypes().get(0),
+                                              twoNullEntries
+        );
+
+        return KeyspaceMetadata.create(keyspace,
+                                       KeyspaceParams.simple(1),
+                                       Tables.none(),
+                                       Views.none(),
+                                       Types.of(udt1, udt2),
+                                       Functions.of(udf1, udf2, udf3, uda1, uda2));
     }
 
     /*
@@ -474,15 +642,42 @@ public class LegacySchemaMigratorTest
                     ? ""
                     : column.name.toString();
 
-        RowUpdateBuilder adder = new RowUpdateBuilder(SystemKeyspace.LegacyColumns, timestamp, mutation).clustering(table.cfName, name);
+        final RowUpdateBuilder adder = new RowUpdateBuilder(SystemKeyspace.LegacyColumns, timestamp, mutation).clustering(table.cfName, name);
 
         adder.add("validator", column.type.toString())
              .add("type", serializeKind(column.kind, table.isDense()))
-             .add("component_index", column.isOnAllComponents() ? null : column.position())
-             .add("index_name", column.getIndexName())
-             .add("index_type", column.getIndexType() == null ? null : column.getIndexType().toString())
-             .add("index_options", json(column.getIndexOptions()))
-             .build();
+             .add("component_index", column.position());
+
+        Optional<IndexMetadata> index = findIndexForColumn(table.getIndexes(), table, column);
+        if (index.isPresent())
+        {
+            IndexMetadata i = index.get();
+            adder.add("index_name", i.name);
+            adder.add("index_type", i.kind.toString());
+            adder.add("index_options", json(i.options));
+        }
+        else
+        {
+            adder.add("index_name", null);
+            adder.add("index_type", null);
+            adder.add("index_options", null);
+        }
+
+        adder.build();
+    }
+
+    private static Optional<IndexMetadata> findIndexForColumn(Indexes indexes,
+                                                              CFMetaData table,
+                                                              ColumnDefinition column)
+    {
+        // makes the assumptions that the string option denoting the
+        // index targets can be parsed by CassandraIndex.parseTarget
+        // which should be true for any pre-3.0 index
+        for (IndexMetadata index : indexes)
+          if (CassandraIndex.parseTarget(table, index).left.equals(column))
+                return Optional.of(index);
+
+        return Optional.empty();
     }
 
     private static String serializeKind(ColumnDefinition.Kind kind, boolean isDense)

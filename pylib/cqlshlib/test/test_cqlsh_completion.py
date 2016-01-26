@@ -22,6 +22,8 @@ from __future__ import with_statement
 import re
 from .basecase import BaseTestCase, cqlsh
 from .cassconnect import testrun_cqlsh
+import unittest
+import sys
 
 BEL = '\x07'  # the terminal-bell character
 CTRL_C = '\x03'
@@ -36,6 +38,7 @@ COMPLETION_RESPONSE_TIME = 0.5
 completion_separation_re = re.compile(r'\s+')
 
 
+@unittest.skipIf(sys.platform == "win32", 'Tab completion tests not supported on Windows')
 class CqlshCompletionCase(BaseTestCase):
 
     def setUp(self):
@@ -145,7 +148,7 @@ class TestCqlshCompletion(CqlshCompletionCase):
                                          'COPY', 'CREATE', 'DEBUG', 'DELETE', 'DESC', 'DESCRIBE',
                                          'DROP', 'GRANT', 'HELP', 'INSERT', 'LIST', 'LOGIN', 'PAGING', 'REVOKE',
                                          'SELECT', 'SHOW', 'SOURCE', 'TRACING', 'EXPAND', 'SERIAL', 'TRUNCATE',
-                                         'UPDATE', 'USE', 'exit', 'quit'))
+                                         'UPDATE', 'USE', 'exit', 'quit', 'CLEAR', 'CLS'))
 
     def test_complete_command_words(self):
         self.trycompletions('alt', '\b\b\bALTER ')
@@ -231,7 +234,8 @@ class TestCqlshCompletion(CqlshCompletionCase):
                      'CREATE', 'DEBUG', 'DELETE', 'DESC', 'DESCRIBE', 'DROP',
                      'EXPAND', 'GRANT', 'HELP', 'INSERT', 'LIST', 'LOGIN', 'PAGING',
                      'REVOKE', 'SELECT', 'SHOW', 'SOURCE', 'SERIAL', 'TRACING',
-                     'TRUNCATE', 'UPDATE', 'USE', 'exit', 'quit'])
+                     'TRUNCATE', 'UPDATE', 'USE', 'exit', 'quit',
+                     'CLEAR', 'CLS'])
 
         self.trycompletions(
             ("INSERT INTO twenty_rows_composite_table (a, b, c) "
@@ -340,18 +344,18 @@ class TestCqlshCompletion(CqlshCompletionCase):
         self.trycompletions("UPDATE empty_table SET lonelycol = 'eggs'",
                             choices=[',', 'WHERE'])
         self.trycompletions("UPDATE empty_table SET lonelycol = 'eggs' WHERE ",
-                            choices=['TOKEN(', '<identifier>', '<quotedName>'])
+                            choices=['TOKEN(', 'lonelykey'])
         self.trycompletions("UPDATE empty_table SET lonelycol = 'eggs' WHERE ",
-                            choices=['TOKEN(', '<identifier>', '<quotedName>'])
+                            choices=['TOKEN(', 'lonelykey'])
 
         self.trycompletions("UPDATE empty_table SET lonelycol = 'eggs' WHERE lonel",
-                            choices=['<quotedName>', '<identifier>'])
+                            immediate='ykey ')
         self.trycompletions("UPDATE empty_table SET lonelycol = 'eggs' WHERE lonelykey ",
                             choices=['=', '<=', '>=', '>', '<', 'CONTAINS', 'IN', '['])
         self.trycompletions("UPDATE empty_table SET lonelycol = 'eggs' WHERE lonelykey = 0.0 ",
                             choices=['AND', 'IF', ';'])
         self.trycompletions("UPDATE empty_table SET lonelycol = 'eggs' WHERE lonelykey = 0.0 AND ",
-                            choices=['TOKEN(', '<identifier>', '<quotedName>'])
+                            choices=['TOKEN(', 'lonelykey'])
 
         self.trycompletions("UPDATE empty_table SET lonelycol = 'eggs' WHERE TOKEN(lonelykey ",
                             choices=[',', ')'])
@@ -401,6 +405,8 @@ class TestCqlshCompletion(CqlshCompletionCase):
                                      'twenty_rows_composite_table',
                                      'utf8_with_special_chars',
                                      'system_traces.', 'songs',
+                                     'system_auth.', 'system_distributed.',
+                                     'system_schema.','system_traces.',
                                      '"' + self.cqlsh.keyspace + '".'],
                             other_choices_ok=True)
         self.trycompletions('DELETE FROM twenty_rows_composite_table ',
@@ -509,9 +515,6 @@ class TestCqlshCompletion(CqlshCompletionCase):
     def test_complete_in_string_literals(self):
         # would be great if we could get a space after this sort of completion,
         # but readline really wants to make things difficult for us
-        self.trycompletions('insert into system."Index', 'Info"')
-        self.trycompletions('USE "', choices=('system', self.cqlsh.keyspace),
-                            other_choices_ok=True)
         self.trycompletions("create keyspace blah with replication = {'class': 'Sim",
                             "pleStrategy'")
 
@@ -520,7 +523,7 @@ class TestCqlshCompletion(CqlshCompletionCase):
         self.trycompletions('DROP ',
                             choices=['AGGREGATE', 'COLUMNFAMILY', 'FUNCTION',
                                      'INDEX', 'KEYSPACE', 'ROLE', 'TABLE',
-                                     'TRIGGER', 'TYPE', 'USER'])
+                                     'TRIGGER', 'TYPE', 'USER', 'MATERIALIZED'])
 
     def test_complete_in_drop_keyspace(self):
         self.trycompletions('DROP K', immediate='EYSPACE ')
@@ -634,7 +637,8 @@ class TestCqlshCompletion(CqlshCompletionCase):
                                      'min_sstable_size', 'min_threshold',
                                      'tombstone_compaction_interval',
                                      'tombstone_threshold',
-                                     'unchecked_tombstone_compaction', ])
+                                     'unchecked_tombstone_compaction',
+                                     'only_purge_repaired_tombstones'])
         self.trycompletions(prefix + " new_table (col_a int PRIMARY KEY) WITH compaction = "
                             + "{'class': 'SizeTieredCompactionStrategy'}",
                             choices=[';', 'AND'])
@@ -654,7 +658,8 @@ class TestCqlshCompletion(CqlshCompletionCase):
                             choices=['base_time_seconds', 'max_sstable_age_days',
                                     'timestamp_resolution', 'min_threshold', 'class', 'max_threshold',
                                     'tombstone_compaction_interval', 'tombstone_threshold',
-                                    'enabled', 'unchecked_tombstone_compaction'])
+                                    'enabled', 'unchecked_tombstone_compaction',
+                                    'max_window_size_seconds', 'only_purge_repaired_tombstones'])
 
     def test_complete_in_create_columnfamily(self):
         self.trycompletions('CREATE C', choices=['COLUMNFAMILY', 'CUSTOM'])

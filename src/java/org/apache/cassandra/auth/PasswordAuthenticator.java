@@ -17,6 +17,7 @@
  */
 package org.apache.cassandra.auth;
 
+import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Map;
@@ -86,7 +87,7 @@ public class PasswordAuthenticator implements IAuthenticator
         }
         catch (RequestExecutionException e)
         {
-            logger.debug("Error performing internal authentication", e);
+            logger.trace("Error performing internal authentication", e);
             throw new AuthenticationException(e.toString());
         }
     }
@@ -132,7 +133,7 @@ public class PasswordAuthenticator implements IAuthenticator
         return authenticate(username, password);
     }
 
-    public SaslNegotiator newSaslNegotiator()
+    public SaslNegotiator newSaslNegotiator(InetAddress clientAddress)
     {
         return new PlainTextSaslAuthenticator();
     }
@@ -196,7 +197,7 @@ public class PasswordAuthenticator implements IAuthenticator
          */
         private void decodeCredentials(byte[] bytes) throws AuthenticationException
         {
-            logger.debug("Decoding credentials from client token");
+            logger.trace("Decoding credentials from client token");
             byte[] user = null;
             byte[] pass = null;
             int end = bytes.length;
@@ -212,10 +213,10 @@ public class PasswordAuthenticator implements IAuthenticator
                 }
             }
 
-            if (user == null)
-                throw new AuthenticationException("Authentication ID must not be null");
             if (pass == null)
                 throw new AuthenticationException("Password must not be null");
+            if (user == null)
+                throw new AuthenticationException("Authentication ID must not be null");
 
             username = new String(user, StandardCharsets.UTF_8);
             password = new String(pass, StandardCharsets.UTF_8);

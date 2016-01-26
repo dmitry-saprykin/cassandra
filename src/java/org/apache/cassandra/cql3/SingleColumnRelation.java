@@ -37,7 +37,7 @@ import static org.apache.cassandra.cql3.statements.RequestValidations.checkTrue;
 
 /**
  * Relations encapsulate the relationship between an entity of some kind, and
- * a value (term). For example, <key> > "start" or "colname1" = "somevalue".
+ * a value (term). For example, {@code <key> > "start" or "colname1" = "somevalue"}.
  *
  */
 public final class SingleColumnRelation extends Relation
@@ -54,6 +54,9 @@ public final class SingleColumnRelation extends Relation
         this.relationType = type;
         this.value = value;
         this.inValues = inValues;
+
+        if (type == Operator.IS_NOT)
+            assert value == Constants.NULL_LITERAL;
     }
 
     /**
@@ -79,6 +82,16 @@ public final class SingleColumnRelation extends Relation
     public SingleColumnRelation(ColumnIdentifier.Raw entity, Operator type, Term.Raw value)
     {
         this(entity, null, type, value);
+    }
+
+    public Term.Raw getValue()
+    {
+        return value;
+    }
+
+    public List<? extends Term.Raw> getInValues()
+    {
+        return inValues;
     }
 
     public static SingleColumnRelation createInRelation(ColumnIdentifier.Raw entity, List<Term.Raw> inValues)
@@ -120,6 +133,13 @@ public final class SingleColumnRelation extends Relation
         }
     }
 
+    public Relation renameIdentifier(ColumnIdentifier.Raw from, ColumnIdentifier.Raw to)
+    {
+        return entity.equals(from)
+               ? new SingleColumnRelation(to, mapKey, operator(), value, inValues)
+               : this;
+    }
+
     @Override
     public String toString()
     {
@@ -153,7 +173,7 @@ public final class SingleColumnRelation extends Relation
     protected Restriction newINRestriction(CFMetaData cfm,
                                            VariableSpecifications boundNames) throws InvalidRequestException
     {
-        ColumnDefinition columnDef = cfm.getColumnDefinition(getEntity().prepare(cfm));
+        ColumnDefinition columnDef = toColumnDefinition(cfm, entity);
         List<? extends ColumnSpecification> receivers = toReceivers(columnDef, cfm.isDense());
         List<Term> terms = toTerms(receivers, inValues, cfm.ksName, boundNames);
         if (terms == null)
@@ -183,6 +203,16 @@ public final class SingleColumnRelation extends Relation
         ColumnDefinition columnDef = toColumnDefinition(cfm, entity);
         Term term = toTerm(toReceivers(columnDef, cfm.isDense()), value, cfm.ksName, boundNames);
         return new SingleColumnRestriction.ContainsRestriction(columnDef, term, isKey);
+    }
+
+    @Override
+    protected Restriction newIsNotRestriction(CFMetaData cfm,
+                                              VariableSpecifications boundNames) throws InvalidRequestException
+    {
+        ColumnDefinition columnDef = toColumnDefinition(cfm, entity);
+        // currently enforced by the grammar
+        assert value == Constants.NULL_LITERAL : "Expected null literal for IS NOT relation: " + this.toString();
+        return new SingleColumnRestriction.IsNotNullRestriction(columnDef);
     }
 
     /**
@@ -223,6 +253,7 @@ public final class SingleColumnRelation extends Relation
         }
 
         checkFalse(isContainsKey() && !(receiver.type instanceof MapType), "Cannot use CONTAINS KEY on non-map column %s", receiver.name);
+        checkFalse(isContains() && !(receiver.type.isCollection()), "Cannot use CONTAINS on non-collection column %s", receiver.name);
 
         if (mapKey != null)
         {

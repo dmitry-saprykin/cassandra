@@ -105,7 +105,7 @@ public class RolesCache implements RolesCacheMBean
 
     private LoadingCache<RoleResource, Set<RoleResource>> initCache(LoadingCache<RoleResource, Set<RoleResource>> existing)
     {
-        if (DatabaseDescriptor.getAuthenticator() instanceof AllowAllAuthenticator)
+        if (!DatabaseDescriptor.getAuthenticator().requireAuthentication())
             return null;
 
         if (DatabaseDescriptor.getRolesValidity() <= 0)
@@ -135,7 +135,7 @@ public class RolesCache implements RolesCacheMBean
                                     return roleManager.getRoles(primaryRole, true);
                                 } catch (Exception e)
                                 {
-                                    logger.debug("Error performing async refresh of user roles", e);
+                                    logger.trace("Error performing async refresh of user roles", e);
                                     throw e;
                                 }
                             }

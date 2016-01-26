@@ -69,6 +69,15 @@ public abstract class AbstractReadExecutor
         this.targetReplicas = targetReplicas;
         this.handler = new ReadCallback(new DigestResolver(keyspace, command, consistencyLevel, targetReplicas.size()), consistencyLevel, command, targetReplicas);
         this.traceState = Tracing.instance.get();
+
+        // Set the digest version (if we request some digests). This is the smallest version amongst all our target replicas since new nodes
+        // knows how to produce older digest but the reverse is not true.
+        // TODO: we need this when talking with pre-3.0 nodes. So if we preserve the digest format moving forward, we can get rid of this once
+        // we stop being compatible with pre-3.0 nodes.
+        int digestVersion = MessagingService.current_version;
+        for (InetAddress replica : targetReplicas)
+            digestVersion = Math.min(digestVersion, MessagingService.instance().getVersion(replica));
+        command.setDigestVersion(digestVersion);
     }
 
     protected void makeDataRequests(Iterable<InetAddress> endpoints)
@@ -84,7 +93,6 @@ public abstract class AbstractReadExecutor
 
     private void makeRequests(ReadCommand readCommand, Iterable<InetAddress> endpoints)
     {
-        MessageOut<ReadCommand> message = null;
         boolean hasLocalEndpoint = false;
 
         for (InetAddress endpoint : endpoints)
@@ -98,8 +106,7 @@ public abstract class AbstractReadExecutor
             if (traceState != null)
                 traceState.trace("reading {} from {}", readCommand.isDigestQuery() ? "digest" : "data", endpoint);
             logger.trace("reading {} from {}", readCommand.isDigestQuery() ? "digest" : "data", endpoint);
-            if (message == null)
-                message = readCommand.createMessage();
+            MessageOut<ReadCommand> message = readCommand.createMessage(MessagingService.instance().getVersion(endpoint));
             MessagingService.instance().sendRRWithFailure(message, endpoint, handler);
         }
 
@@ -277,7 +284,8 @@ public abstract class AbstractReadExecutor
                 if (traceState != null)
                     traceState.trace("speculating read retry on {}", extraReplica);
                 logger.trace("speculating read retry on {}", extraReplica);
-                MessagingService.instance().sendRRWithFailure(retryCommand.createMessage(), extraReplica, handler);
+                int version = MessagingService.instance().getVersion(extraReplica);
+                MessagingService.instance().sendRRWithFailure(retryCommand.createMessage(version), extraReplica, handler);
                 speculated = true;
 
                 cfs.metric.speculativeRetries.inc();

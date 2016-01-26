@@ -25,8 +25,8 @@ import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.cql3.statements.Bound;
 import org.apache.cassandra.db.MultiCBuilder;
 import org.apache.cassandra.db.filter.RowFilter;
-import org.apache.cassandra.db.index.SecondaryIndexManager;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.index.SecondaryIndexManager;
 
 /**
  * A restriction/clause on a column.
@@ -41,6 +41,7 @@ public interface Restriction
     public boolean isEQ();
     public boolean isIN();
     public boolean isContains();
+    public boolean isNotNull();
     public boolean isMultiColumn();
 
     /**

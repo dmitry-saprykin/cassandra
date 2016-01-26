@@ -86,7 +86,7 @@ public class MockSchema
 
     public static SSTableReader sstable(int generation, int size, boolean keepRef, ColumnFamilyStore cfs)
     {
-        Descriptor descriptor = new Descriptor(cfs.directories.getDirectoryForNewSSTables(),
+        Descriptor descriptor = new Descriptor(cfs.getDirectories().getDirectoryForNewSSTables(),
                                                cfs.keyspace.getName(),
                                                cfs.getColumnFamilyName(),
                                                generation);
@@ -142,7 +142,7 @@ public class MockSchema
         return new ColumnFamilyStore(ks, cfname, 0, metadata, new Directories(metadata), false, false);
     }
 
-    private static CFMetaData newCFMetaData(String ksname, String cfname)
+    public static CFMetaData newCFMetaData(String ksname, String cfname)
     {
         CFMetaData metadata = CFMetaData.Builder.create(ksname, cfname)
                                                 .addPartitionKey("key", UTF8Type.instance)

@@ -39,6 +39,7 @@ options {
 
     import org.apache.cassandra.auth.*;
     import org.apache.cassandra.cql3.*;
+    import org.apache.cassandra.cql3.restrictions.CustomIndexExpression;
     import org.apache.cassandra.cql3.statements.*;
     import org.apache.cassandra.cql3.selection.*;
     import org.apache.cassandra.cql3.functions.*;
@@ -298,8 +299,7 @@ selectStatement returns [SelectStatement.RawStatement expr]
     }
     : K_SELECT 
       ( K_JSON { isJson = true; } )?
-      ( ( K_DISTINCT { isDistinct = true; } )? sclause=selectClause
-        | sclause=selectCountClause )
+      ( ( K_DISTINCT { isDistinct = true; } )? sclause=selectClause )
       K_FROM cf=columnFamilyName
       ( K_WHERE wclause=whereClause )?
       ( K_ORDER K_BY orderByClause[orderings] ( ',' orderByClause[orderings] )* )?
@@ -310,7 +310,8 @@ selectStatement returns [SelectStatement.RawStatement expr]
                                                                              isDistinct,
                                                                              allowFiltering,
                                                                              isJson);
-          $expr = new SelectStatement.RawStatement(cf, params, sclause, wclause, limit);
+          WhereClause where = wclause == null ? WhereClause.empty() : wclause.build();
+          $expr = new SelectStatement.RawStatement(cf, params, sclause, where, limit);
       }
     ;
 
@@ -327,8 +328,10 @@ selector returns [RawSelector s]
 unaliasedSelector returns [Selectable.Raw s]
     @init { Selectable.Raw tmp = null; }
     :  ( c=cident                                  { tmp = c; }
+       | K_COUNT '(' countArgument ')'             { tmp = Selectable.WithFunction.Raw.newCountRowsFunction();}
        | K_WRITETIME '(' c=cident ')'              { tmp = new Selectable.WritetimeOrTTL.Raw(c, true); }
        | K_TTL       '(' c=cident ')'              { tmp = new Selectable.WritetimeOrTTL.Raw(c, false); }
+       | K_CAST      '(' sn=unaliasedSelector K_AS t=native_type ')' {tmp = new Selectable.WithCast.Raw(sn, t);}
        | f=functionName args=selectionFunctionArgs { tmp = new Selectable.WithFunction.Raw(f, args); }
        ) ( '.' fi=cident { tmp = new Selectable.WithFieldSelection.Raw(tmp, fi); } )* { $s = tmp; }
     ;
@@ -340,19 +343,24 @@ selectionFunctionArgs returns [List<Selectable.Raw> a]
       ')' { $a = args; }
     ;
 
-selectCountClause returns [List<RawSelector> expr]
-    @init{ ColumnIdentifier alias = new ColumnIdentifier("count", false); }
-    : K_COUNT '(' countArgument ')' (K_AS c=noncol_ident { alias = c; })? { $expr = new ArrayList<RawSelector>(); $expr.add( new RawSelector(new Selectable.WithFunction.Raw(FunctionName.nativeFunction("countRows"), Collections.<Selectable.Raw>emptyList()), alias));}
-    ;
-
 countArgument
     : '\*'
     | i=INTEGER { if (!i.getText().equals("1")) addRecognitionError("Only COUNT(1) is supported, got COUNT(" + i.getText() + ")");}
     ;
 
-whereClause returns [List<Relation> clause]
-    @init{ $clause = new ArrayList<Relation>(); }
-    : relation[$clause] (K_AND relation[$clause])*
+whereClause returns [WhereClause.Builder clause]
+    @init{ $clause = new WhereClause.Builder(); }
+    : relationOrExpression[$clause] (K_AND relationOrExpression[$clause])*
+    ;
+
+relationOrExpression [WhereClause.Builder clause]
+    : relation[$clause]
+    | customIndexExpression[$clause]
+    ;
+
+customIndexExpression [WhereClause.Builder clause]
+    @init{IndexName name = new IndexName();}
+    : 'expr(' idxName[name] ',' t=term ')' { clause.add(new CustomIndexExpression(name, t));}
     ;
 
 orderByClause[Map<ColumnIdentifier.Raw, Boolean> orderings]
@@ -442,7 +450,7 @@ updateStatement returns [UpdateStatement.ParsedUpdate expr]
           return new UpdateStatement.ParsedUpdate(cf,
                                                   attrs,
                                                   operations,
-                                                  wclause,
+                                                  wclause.build(),
                                                   conditions == null ? Collections.<Pair<ColumnIdentifier.Raw, ColumnCondition.Raw>>emptyList() : conditions,
                                                   ifExists);
      }
@@ -476,7 +484,7 @@ deleteStatement returns [DeleteStatement.Parsed expr]
           return new DeleteStatement.Parsed(cf,
                                             attrs,
                                             columnDeletions,
-                                            wclause,
+                                            wclause.build(),
                                             conditions == null ? Collections.<Pair<ColumnIdentifier.Raw, ColumnCondition.Raw>>emptyList() : conditions,
                                             ifExists);
       }
@@ -560,10 +568,10 @@ createAggregateStatement returns [CreateAggregateStatement expr]
           ( ',' v=comparatorType { argsTypes.add(v); } )*
         )?
       ')'
-      K_SFUNC sfunc = functionName
+      K_SFUNC sfunc = allowedFunctionName
       K_STYPE stype = comparatorType
       (
-        K_FINALFUNC ffunc = functionName
+        K_FINALFUNC ffunc = allowedFunctionName
       )?
       (
         K_INITCOND ival = term
@@ -722,19 +730,21 @@ createIndexStatement returns [CreateIndexStatement expr]
         IndexPropDefs props = new IndexPropDefs();
         boolean ifNotExists = false;
         IndexName name = new IndexName();
+        List<IndexTarget.Raw> targets = new ArrayList<>();
     }
     : K_CREATE (K_CUSTOM { props.isCustom = true; })? K_INDEX (K_IF K_NOT K_EXISTS { ifNotExists = true; } )?
-        (idxName[name])? K_ON cf=columnFamilyName '(' id=indexIdent ')'
+        (idxName[name])? K_ON cf=columnFamilyName '(' (indexIdent[targets] (',' indexIdent[targets])*)? ')'
         (K_USING cls=STRING_LITERAL { props.customClass = $cls.text; })?
         (K_WITH properties[props])?
-      { $expr = new CreateIndexStatement(cf, name, id, props, ifNotExists); }
+      { $expr = new CreateIndexStatement(cf, name, targets, props, ifNotExists); }
     ;
 
-indexIdent returns [IndexTarget.Raw id]
-    : c=cident                   { $id = IndexTarget.Raw.valuesOf(c); }
-    | K_KEYS '(' c=cident ')'    { $id = IndexTarget.Raw.keysOf(c); }
-    | K_ENTRIES '(' c=cident ')' { $id = IndexTarget.Raw.keysAndValuesOf(c); }
-    | K_FULL '(' c=cident ')'    { $id = IndexTarget.Raw.fullCollection(c); }
+indexIdent [List<IndexTarget.Raw> targets]
+    : c=cident                   { $targets.add(IndexTarget.Raw.simpleIndexOn(c)); }
+    | K_VALUES '(' c=cident ')'  { $targets.add(IndexTarget.Raw.valuesOf(c)); }
+    | K_KEYS '(' c=cident ')'    { $targets.add(IndexTarget.Raw.keysOf(c)); }
+    | K_ENTRIES '(' c=cident ')' { $targets.add(IndexTarget.Raw.keysAndValuesOf(c)); }
+    | K_FULL '(' c=cident ')'    { $targets.add(IndexTarget.Raw.fullCollection(c)); }
     ;
 
 /**
@@ -745,7 +755,7 @@ indexIdent returns [IndexTarget.Raw id]
  *  PRIMARY KEY (<pkColumns>)
  *  WITH <property> = <value> AND ...;
  */
-createMaterializedViewStatement returns [CreateMaterializedViewStatement expr]
+createMaterializedViewStatement returns [CreateViewStatement expr]
     @init {
         boolean ifNotExists = false;
         List<ColumnIdentifier.Raw> partitionKeys = new ArrayList<>();
@@ -753,17 +763,16 @@ createMaterializedViewStatement returns [CreateMaterializedViewStatement expr]
     }
     : K_CREATE K_MATERIALIZED K_VIEW (K_IF K_NOT K_EXISTS { ifNotExists = true; })? cf=columnFamilyName K_AS
         K_SELECT sclause=selectClause K_FROM basecf=columnFamilyName
-        (K_WHERE wclause=mvWhereClause)?
+        (K_WHERE wclause=whereClause)?
         K_PRIMARY K_KEY (
         '(' '(' k1=cident { partitionKeys.add(k1); } ( ',' kn=cident { partitionKeys.add(kn); } )* ')' ( ',' c1=cident { compositeKeys.add(c1); } )* ')'
     |   '(' k1=cident { partitionKeys.add(k1); } ( ',' cn=cident { compositeKeys.add(cn); } )* ')'
         )
-        { $expr = new CreateMaterializedViewStatement(cf, basecf, sclause, wclause, partitionKeys, compositeKeys, ifNotExists); }
+        {
+             WhereClause where = wclause == null ? WhereClause.empty() : wclause.build();
+             $expr = new CreateViewStatement(cf, basecf, sclause, where, partitionKeys, compositeKeys, ifNotExists);
+        }
         ( K_WITH cfamProperty[expr.properties] ( K_AND cfamProperty[expr.properties] )*)?
-    ;
-
-mvWhereClause returns [List<ColumnIdentifier.Raw> expr]
-    : t1=cident { $expr = new ArrayList<ColumnIdentifier.Raw>(); $expr.add(t1); } K_IS K_NOT K_NULL (K_AND tN=cident { $expr.add(tN); } K_IS K_NOT K_NULL)*
     ;
 
 /**
@@ -825,14 +834,14 @@ alterTableStatement returns [AlterTableStatement expr]
     }
     ;
 
-alterMaterializedViewStatement returns [AlterMaterializedViewStatement expr]
+alterMaterializedViewStatement returns [AlterViewStatement expr]
     @init {
         TableAttributes attrs = new TableAttributes();
     }
     : K_ALTER K_MATERIALIZED K_VIEW name=columnFamilyName
           K_WITH properties[attrs]
     {
-        $expr = new AlterMaterializedViewStatement(name, attrs);
+        $expr = new AlterViewStatement(name, attrs);
     }
     ;
     
@@ -891,17 +900,17 @@ dropIndexStatement returns [DropIndexStatement expr]
 /**
  * DROP MATERIALIZED VIEW [IF EXISTS] <view_name>
  */
-dropMaterializedViewStatement returns [DropMaterializedViewStatement expr]
+dropMaterializedViewStatement returns [DropViewStatement expr]
     @init { boolean ifExists = false; }
     : K_DROP K_MATERIALIZED K_VIEW (K_IF K_EXISTS { ifExists = true; } )? cf=columnFamilyName
-      { $expr = new DropMaterializedViewStatement(cf, ifExists); }
+      { $expr = new DropViewStatement(cf, ifExists); }
     ;
 
 /**
   * TRUNCATE <CF>;
   */
 truncateStatement returns [TruncateStatement stmt]
-    : K_TRUNCATE cf=columnFamilyName { $stmt = new TruncateStatement(cf); }
+    : K_TRUNCATE (K_COLUMNFAMILY)? cf=columnFamilyName { $stmt = new TruncateStatement(cf); }
     ;
 
 /**
@@ -1024,7 +1033,7 @@ createUserStatement returns [CreateRoleStatement stmt]
         boolean ifNotExists = false;
         RoleName name = new RoleName();
     }
-    : K_CREATE K_USER (K_IF K_NOT K_EXISTS { ifNotExists = true; })? u=username { name.setName($u.text, false); }
+    : K_CREATE K_USER (K_IF K_NOT K_EXISTS { ifNotExists = true; })? u=username { name.setName($u.text, true); }
       ( K_WITH userPassword[opts] )?
       ( K_SUPERUSER { superuser = true; } | K_NOSUPERUSER { superuser = false; } )?
       { opts.setOption(IRoleManager.Option.SUPERUSER, superuser);
@@ -1159,9 +1168,9 @@ userPassword[RoleOptions opts]
 // identifiers because the underlying comparator is not necessarily text. See
 // CASSANDRA-8178 for details.
 cident returns [ColumnIdentifier.Raw id]
-    : t=IDENT              { $id = new ColumnIdentifier.Raw($t.text, false); }
-    | t=QUOTED_NAME        { $id = new ColumnIdentifier.Raw($t.text, true); }
-    | k=unreserved_keyword { $id = new ColumnIdentifier.Raw(k, false); }
+    : t=IDENT              { $id = new ColumnIdentifier.Literal($t.text, false); }
+    | t=QUOTED_NAME        { $id = new ColumnIdentifier.Literal($t.text, true); }
+    | k=unreserved_keyword { $id = new ColumnIdentifier.Literal(k, false); }
     ;
 
 // Column identifiers where the comparator is known to be text
@@ -1226,6 +1235,7 @@ idxName[IndexName name]
 
 roleName[RoleName name]
     : t=IDENT              { $name.setName($t.text, false); }
+    | s=STRING_LITERAL     { $name.setName($s.text, true); }
     | t=QUOTED_NAME        { $name.setName($t.text, true); }
     | k=unreserved_keyword { $name.setName(k, false); }
     | QMARK {addRecognitionError("Bind variables cannot be used for role names");}
@@ -1411,8 +1421,9 @@ relationType returns [Operator op]
     | '!=' { $op = Operator.NEQ; }
     ;
 
-relation[List<Relation> clauses]
+relation[WhereClause.Builder clauses]
     : name=cident type=relationType t=term { $clauses.add(new SingleColumnRelation(name, type, t)); }
+    | name=cident K_IS K_NOT K_NULL { $clauses.add(new SingleColumnRelation(name, Operator.IS_NOT, Constants.NULL_LITERAL)); }
     | K_TOKEN l=tupleOfIdentifiers type=relationType t=term
         { $clauses.add(new TokenRelation(l, type, t)); }
     | name=cident K_IN marker=inMarker
@@ -1550,6 +1561,7 @@ tuple_type returns [CQL3Type.Raw t]
 username
     : IDENT
     | STRING_LITERAL
+    | QUOTED_NAME { addRecognitionError("Quoted strings are are not supported for user names and USER is deprecated, please use ROLE");}
     ;
 
 // Basically the same as cident, but we need to exlude existing CQL3 types
@@ -1563,7 +1575,7 @@ non_type_ident returns [ColumnIdentifier id]
 
 unreserved_keyword returns [String str]
     : u=unreserved_function_keyword     { $str = u; }
-    | k=(K_TTL | K_COUNT | K_WRITETIME | K_KEY) { $str = $k.text; }
+    | k=(K_TTL | K_COUNT | K_WRITETIME | K_KEY | K_CAST) { $str = $k.text; }
     ;
 
 unreserved_function_keyword returns [String str]
@@ -1663,6 +1675,7 @@ K_INTO:        I N T O;
 K_VALUES:      V A L U E S;
 K_TIMESTAMP:   T I M E S T A M P;
 K_TTL:         T T L;
+K_CAST:        C A S T;
 K_ALTER:       A L T E R;
 K_RENAME:      R E N A M E;
 K_ADD:         A D D;
