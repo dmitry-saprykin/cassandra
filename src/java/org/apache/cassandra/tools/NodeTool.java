@@ -1881,7 +1881,7 @@ public class NodeTool
         @Option(title = "end_token", name = {"-et", "--end-token"}, description = "Use -et to specify a token at which repair range ends")
         private String endToken = EMPTY;
         
-        @Option(title = "end_token", name = {"-tl", "--token-range-list"}, description = "Use -tl to specify a token ranges list 'start1:end1,start2:end2,start3:end3'")
+        @Option(title = "token_range_list", name = {"-tl", "--token-range-list"}, description = "Use -tl to specify a token ranges list 'start1:end1,start2:end2,start3:end3'")
         private String tokenRangeList = EMPTY;
 
         @Option(title = "primary_range", name = {"-pr", "--partitioner-range"}, description = "Use -pr to repair only the first range returned by the partitioner")
