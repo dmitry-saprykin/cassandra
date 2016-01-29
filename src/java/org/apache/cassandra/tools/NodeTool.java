@@ -1880,6 +1880,9 @@ public class NodeTool
 
         @Option(title = "end_token", name = {"-et", "--end-token"}, description = "Use -et to specify a token at which repair range ends")
         private String endToken = EMPTY;
+        
+        @Option(title = "end_token", name = {"-tl", "--token-range-list"}, description = "Use -tl to specify a token ranges list 'start1:end1,start2:end2,start3:end3'")
+        private String tokenRangeList = EMPTY;
 
         @Option(title = "primary_range", name = {"-pr", "--partitioner-range"}, description = "Use -pr to repair only the first range returned by the partitioner")
         private boolean primaryRange = false;
@@ -1914,7 +1917,16 @@ public class NodeTool
                         dataCenters = newArrayList(probe.getDataCenter());
                     else if(!specificHosts.isEmpty())
                         hosts = newArrayList(specificHosts);
-                    if (!startToken.isEmpty() || !endToken.isEmpty())
+                    if (!tokenRangeList.isEmpty()) { 
+                    	List<String> ranges = Arrays.asList(tokenRangeList.split(","));
+                    	for (String range : ranges) {
+                    	    List<String> limits = Arrays.asList(range.split(":"));
+                    	    if(limits.size() != 2)
+                    	        throw new RuntimeException("Cannot parse token range list! Length is " + limits.size());                    	    
+                    	    probe.forceRepairRangeAsync(System.out, keyspace, parallelismDegree, dataCenters, hosts, limits.get(0), limits.get(1), !incrementalRepair);
+                    	}
+                    }                    
+                    else if (!startToken.isEmpty() || !endToken.isEmpty())
                         probe.forceRepairRangeAsync(System.out, keyspace, parallelismDegree, dataCenters,hosts, startToken, endToken, !incrementalRepair);
                     else
                         probe.forceRepairAsync(System.out, keyspace, parallelismDegree, dataCenters, hosts, primaryRange, !incrementalRepair, cfnames);
