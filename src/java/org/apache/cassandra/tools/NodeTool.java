@@ -1918,12 +1918,12 @@ public class NodeTool
                     else if(!specificHosts.isEmpty())
                         hosts = newArrayList(specificHosts);
                     if (!tokenRangeList.isEmpty()) { 
-                    	List<String> ranges = Arrays.asList(tokenRangeList.split(","));
-                    	for (String range : ranges) {
-                    	    List<String> limits = Arrays.asList(range.split(":"));
-                    	    if(limits.size() != 2)
-                    	        throw new RuntimeException("Cannot parse token range list! Length is " + limits.size());                    	    
-                    	    probe.forceRepairRangeAsync(System.out, keyspace, parallelismDegree, dataCenters, hosts, limits.get(0), limits.get(1), !incrementalRepair);
+                    	String[] ranges = tokenRangeList.split(",");
+                    	for (String range : ranges) {                    		
+                    	   String[] limits = range.split(":");
+                    	    if(limits.length != 2)
+                    	        throw new RuntimeException("Cannot parse token range list! Length is " + limits.length);                    	    
+                    	    probe.forceRepairRangeAsync(System.out, keyspace, parallelismDegree, dataCenters, hosts, limits[0], limits[1], !incrementalRepair);
                     	}
                     }                    
                     else if (!startToken.isEmpty() || !endToken.isEmpty())
