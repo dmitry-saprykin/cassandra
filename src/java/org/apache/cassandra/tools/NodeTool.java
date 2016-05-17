@@ -1935,11 +1935,11 @@ public class NodeTool
                     	   String[] limits = range.split(":");
                     	    if(limits.length != 2)
                     	        throw new RuntimeException("Cannot parse token range list! Length is " + limits.length);                    	    
-                    	    probe.forceRepairRangeAsync(System.out, keyspace, parallelismDegree, dataCenters, hosts, limits[0], limits[1], !incrementalRepair);
+                    	    probe.forceRepairRangeAsync(System.out, keyspace, parallelismDegree, dataCenters, hosts, limits[0], limits[1], !incrementalRepair, cfnames);
                     	}
                     }                    
                     else if (!startToken.isEmpty() || !endToken.isEmpty())
-                        probe.forceRepairRangeAsync(System.out, keyspace, parallelismDegree, dataCenters,hosts, startToken, endToken, !incrementalRepair);
+                        probe.forceRepairRangeAsync(System.out, keyspace, parallelismDegree, dataCenters, hosts, startToken, endToken, !incrementalRepair, cfnames);
                     else
                         probe.forceRepairAsync(System.out, keyspace, parallelismDegree, dataCenters, hosts, primaryRange, !incrementalRepair, cfnames);
                 } catch (Exception e)
