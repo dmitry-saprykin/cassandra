@@ -31,6 +31,7 @@ import org.apache.cassandra.index.sasi.utils.TypeUtil;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
 
 import org.apache.commons.lang3.builder.HashCodeBuilder;
 
@@ -46,7 +47,40 @@ public class Expression
 
     public enum Op
     {
-        EQ, NOT_EQ, RANGE
+        EQ, MATCH, PREFIX, SUFFIX, CONTAINS, NOT_EQ, RANGE;
+
+        public static Op valueOf(Operator operator)
+        {
+            switch (operator)
+            {
+                case EQ:
+                    return EQ;
+
+                case NEQ:
+                    return NOT_EQ;
+
+                case LT:
+                case GT:
+                case LTE:
+                case GTE:
+                    return RANGE;
+
+                case LIKE_PREFIX:
+                    return PREFIX;
+
+                case LIKE_SUFFIX:
+                    return SUFFIX;
+
+                case LIKE_CONTAINS:
+                    return CONTAINS;
+
+                case LIKE_MATCHES:
+                    return MATCH;
+
+                default:
+                    throw new IllegalArgumentException("unknown operator: " + operator);
+            }
+        }
     }
 
     private final QueryController controller;
@@ -107,10 +141,14 @@ public class Expression
         boolean lowerInclusive = false, upperInclusive = false;
         switch (op)
         {
+            case LIKE_PREFIX:
+            case LIKE_SUFFIX:
+            case LIKE_CONTAINS:
+            case LIKE_MATCHES:
             case EQ:
                 lower = new Bound(value, true);
                 upper = lower;
-                operation = Op.EQ;
+                operation = Op.valueOf(op);
                 break;
 
             case NEQ:
@@ -128,17 +166,30 @@ public class Expression
                 break;
 
             case LTE:
-                upperInclusive = true;
+                if (index.getDefinition().isReversedType())
+                    lowerInclusive = true;
+                else
+                    upperInclusive = true;
             case LT:
                 operation = Op.RANGE;
-                upper = new Bound(value, upperInclusive);
+                if (index.getDefinition().isReversedType())
+                    lower = new Bound(value, lowerInclusive);
+                else
+                    upper = new Bound(value, upperInclusive);
                 break;
 
             case GTE:
-                lowerInclusive = true;
+                if (index.getDefinition().isReversedType())
+                    upperInclusive = true;
+                else
+                    lowerInclusive = true;
             case GT:
                 operation = Op.RANGE;
-                lower = new Bound(value, lowerInclusive);
+                if (index.getDefinition().isReversedType())
+                    upper = new Bound(value, upperInclusive);
+                else
+                    lower = new Bound(value, lowerInclusive);
+
                 break;
         }
 
@@ -151,17 +202,17 @@ public class Expression
         return this;
     }
 
-    public boolean contains(ByteBuffer value)
+    public boolean isSatisfiedBy(ByteBuffer value)
     {
         if (!TypeUtil.isValid(value, validator))
         {
             int size = value.remaining();
             if ((value = TypeUtil.tryUpcast(value, validator)) == null)
             {
-                logger.error("Can't cast value for {} to size accepted by {}, value size is {} bytes.",
+                logger.error("Can't cast value for {} to size accepted by {}, value size is {}.",
                              index.getColumnName(),
                              validator,
-                             size);
+                             FBUtilities.prettyPrintMemory(size));
                 return false;
             }
         }
@@ -224,7 +275,32 @@ public class Expression
         while (analyzer.hasNext())
         {
             ByteBuffer term = analyzer.next();
-            if (ByteBufferUtil.contains(term, requestedValue))
+
+            boolean isMatch = false;
+            switch (operation)
+            {
+                case EQ:
+                case MATCH:
+                // Operation.isSatisfiedBy handles conclusion on !=,
+                // here we just need to make sure that term matched it
+                case NOT_EQ:
+                    isMatch = validator.compare(term, requestedValue) == 0;
+                    break;
+
+                case PREFIX:
+                    isMatch = ByteBufferUtil.startsWith(term, requestedValue);
+                    break;
+
+                case SUFFIX:
+                    isMatch = ByteBufferUtil.endsWith(term, requestedValue);
+                    break;
+
+                case CONTAINS:
+                    isMatch = ByteBufferUtil.contains(term, requestedValue);
+                    break;
+            }
+
+            if (isMatch)
                 return true;
         }
 
@@ -315,7 +391,6 @@ public class Expression
                 && Objects.equals(upper, o.upper)
                 && exclusions.equals(o.exclusions);
     }
-
 
     public static class Bound
     {

@@ -65,7 +65,7 @@ Table of Contents
   Each frame contains a fixed size header (9 bytes) followed by a variable size
   body. The header is described in Section 2. The content of the body depends
   on the header opcode value (the body can in particular be empty for some
-  opcode values). The list of allowed opcodes is defined in Section 2.3 and the
+  opcode values). The list of allowed opcodes is defined in Section 2.4 and the
   details of each corresponding message are described Section 4.
 
   The protocol distinguishes two types of frames: requests and responses. Requests
@@ -1154,6 +1154,7 @@ Table of Contents
 
 10. Changes from v3
 
+  * Prepared responses (Section 4.2.5.4) now include partition-key bind indexes
   * The format of "SCHEMA_CHANGE" events (Section 4.2.6) (and implicitly
     "Schema_change" results (Section 4.2.5.5)) has been modified, and now includes
     changes related to user defined functions and user defined aggregates.

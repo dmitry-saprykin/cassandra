@@ -39,7 +39,6 @@ import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.Slice.Bound;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.marshal.AsciiType;
 import org.apache.cassandra.db.partitions.AbstractBTreePartition;
@@ -104,7 +103,7 @@ public class PartitionImplementationTest
         ColumnDefinition defCol = cfm.getColumnDefinition(new ColumnIdentifier("col", true));
         Row.Builder row = BTreeRow.unsortedBuilder(TIMESTAMP);
         row.newRow(clustering);
-        row.addCell(BufferCell.live(cfm, defCol, TIMESTAMP, ByteBufferUtil.bytes(colValue)));
+        row.addCell(BufferCell.live(defCol, TIMESTAMP, ByteBufferUtil.bytes(colValue)));
         return row.build();
     }
 
@@ -113,7 +112,7 @@ public class PartitionImplementationTest
         ColumnDefinition defCol = cfm.getColumnDefinition(new ColumnIdentifier("static_col", true));
         Row.Builder row = BTreeRow.unsortedBuilder(TIMESTAMP);
         row.newRow(Clustering.STATIC_CLUSTERING);
-        row.addCell(BufferCell.live(cfm, defCol, TIMESTAMP, ByteBufferUtil.bytes("static value")));
+        row.addCell(BufferCell.live(defCol, TIMESTAMP, ByteBufferUtil.bytes("static value")));
         return row.build();
     }
 
@@ -355,7 +354,7 @@ public class PartitionImplementationTest
             Clustering start = clustering(pos);
             pos += sz;
             Clustering end = clustering(pos);
-            Slice slice = Slice.make(skip == 0 ? Bound.exclusiveStartOf(start) : Bound.inclusiveStartOf(start), Bound.inclusiveEndOf(end));
+            Slice slice = Slice.make(skip == 0 ? ClusteringBound.exclusiveStartOf(start) : ClusteringBound.inclusiveStartOf(start), ClusteringBound.inclusiveEndOf(end));
             builder.add(slice);
         }
         return builder.build();

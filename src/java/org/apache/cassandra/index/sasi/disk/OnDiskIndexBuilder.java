@@ -23,13 +23,14 @@ import java.nio.ByteBuffer;
 import java.util.*;
 
 import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.index.sasi.plan.Expression.Op;
+import org.apache.cassandra.index.sasi.sa.IndexedTerm;
 import org.apache.cassandra.index.sasi.sa.IntegralSA;
 import org.apache.cassandra.index.sasi.sa.SA;
 import org.apache.cassandra.index.sasi.sa.TermIterator;
 import org.apache.cassandra.index.sasi.sa.SuffixSA;
 import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.io.FSWriteError;
-import org.apache.cassandra.io.compress.BufferType;
 import org.apache.cassandra.io.util.*;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
@@ -49,11 +50,25 @@ public class OnDiskIndexBuilder
 
     public enum Mode
     {
-        PREFIX, CONTAINS, SPARSE;
+        PREFIX(EnumSet.of(Op.EQ, Op.MATCH, Op.PREFIX, Op.NOT_EQ, Op.RANGE)),
+        CONTAINS(EnumSet.of(Op.EQ, Op.MATCH, Op.CONTAINS, Op.PREFIX, Op.SUFFIX, Op.NOT_EQ)),
+        SPARSE(EnumSet.of(Op.EQ, Op.NOT_EQ, Op.RANGE));
+
+        Set<Op> supportedOps;
+
+        Mode(Set<Op> ops)
+        {
+            supportedOps = ops;
+        }
 
         public static Mode mode(String mode)
         {
             return Mode.valueOf(mode.toUpperCase());
+        }
+
+        public boolean supports(Op op)
+        {
+            return supportedOps.contains(op);
         }
     }
 
@@ -113,6 +128,11 @@ public class OnDiskIndexBuilder
     public static final int BLOCK_SIZE = 4096;
     public static final int MAX_TERM_SIZE = 1024;
     public static final int SUPER_BLOCK_SIZE = 64;
+    public static final int IS_PARTIAL_BIT = 15;
+
+    private static final SequentialWriterOption WRITER_OPTION = SequentialWriterOption.newBuilder()
+                                                                                      .bufferSize(BLOCK_SIZE)
+                                                                                      .build();
 
     private final List<MutableLevel<InMemoryPointerTerm>> levels = new ArrayList<>();
     private MutableLevel<InMemoryDataTerm> dataLevel;
@@ -123,31 +143,40 @@ public class OnDiskIndexBuilder
 
     private final Map<ByteBuffer, TokenTreeBuilder> terms;
     private final Mode mode;
+    private final boolean marksPartials;
 
     private ByteBuffer minKey, maxKey;
     private long estimatedBytes;
 
     public OnDiskIndexBuilder(AbstractType<?> keyComparator, AbstractType<?> comparator, Mode mode)
     {
+        this(keyComparator, comparator, mode, true);
+    }
+
+    public OnDiskIndexBuilder(AbstractType<?> keyComparator, AbstractType<?> comparator, Mode mode, boolean marksPartials)
+    {
         this.keyComparator = keyComparator;
         this.termComparator = comparator;
         this.terms = new HashMap<>();
         this.termSize = TermSize.sizeOf(comparator);
         this.mode = mode;
+        this.marksPartials = marksPartials;
     }
 
     public OnDiskIndexBuilder add(ByteBuffer term, DecoratedKey key, long keyPosition)
     {
         if (term.remaining() >= MAX_TERM_SIZE)
         {
-            logger.error("Rejecting value (value size {}, maximum size {} bytes).", term.remaining(), Short.MAX_VALUE);
+            logger.error("Rejecting value (value size {}, maximum size {}).",
+                         FBUtilities.prettyPrintMemory(term.remaining()),
+                         FBUtilities.prettyPrintMemory(Short.MAX_VALUE));
             return this;
         }
 
         TokenTreeBuilder tokens = terms.get(term);
         if (tokens == null)
         {
-            terms.put(term, (tokens = new TokenTreeBuilder()));
+            terms.put(term, (tokens = new DynamicTokenTreeBuilder()));
 
             // on-heap size estimates from jol
             // 64 bytes for TTB + 48 bytes for TreeMap in TTB + size bytes for the term (map key)
@@ -230,13 +259,14 @@ public class OnDiskIndexBuilder
         return true;
     }
 
+    @SuppressWarnings("resource")
     protected void finish(Descriptor descriptor, Pair<ByteBuffer, ByteBuffer> range, File file, TermIterator terms)
     {
         SequentialWriter out = null;
 
         try
         {
-            out = new SequentialWriter(file, BLOCK_SIZE, BufferType.ON_HEAP);
+            out = new SequentialWriter(file, WRITER_OPTION);
 
             out.writeUTF(descriptor.version.toString());
 
@@ -251,14 +281,15 @@ public class OnDiskIndexBuilder
             ByteBufferUtil.writeWithShortLength(range.right, out);
 
             out.writeUTF(mode.toString());
+            out.writeBoolean(marksPartials);
 
             out.skipBytes((int) (BLOCK_SIZE - out.position()));
 
-            dataLevel = mode == Mode.SPARSE ? new DataBuilderLevel(out, new MutableDataBlock(mode))
-                                            : new MutableLevel<>(out, new MutableDataBlock(mode));
+            dataLevel = mode == Mode.SPARSE ? new DataBuilderLevel(out, new MutableDataBlock(termComparator, mode))
+                                            : new MutableLevel<>(out, new MutableDataBlock(termComparator, mode));
             while (terms.hasNext())
             {
-                Pair<ByteBuffer, TokenTreeBuilder> term = terms.next();
+                Pair<IndexedTerm, TokenTreeBuilder> term = terms.next();
                 addTerm(new InMemoryDataTerm(term.left, term.right), out);
             }
 
@@ -315,24 +346,30 @@ public class OnDiskIndexBuilder
 
     private class InMemoryTerm
     {
-        protected final ByteBuffer term;
+        protected final IndexedTerm term;
 
-        public InMemoryTerm(ByteBuffer term)
+        public InMemoryTerm(IndexedTerm term)
         {
             this.term = term;
         }
 
         public int serializedSize()
         {
-            return (termSize.isConstant() ? 0 : 2) + term.remaining();
+            return (termSize.isConstant() ? 0 : 2) + term.getBytes().remaining();
         }
 
         public void serialize(DataOutputPlus out) throws IOException
         {
             if (termSize.isConstant())
-                out.write(term);
+            {
+                out.write(term.getBytes());
+            }
             else
-                ByteBufferUtil.writeWithShortLength(term, out);
+            {
+                out.writeShort(term.getBytes().remaining() | ((marksPartials && term.isPartial() ? 1 : 0) << IS_PARTIAL_BIT));
+                out.write(term.getBytes());
+            }
+
         }
     }
 
@@ -340,7 +377,7 @@ public class OnDiskIndexBuilder
     {
         protected final int blockCnt;
 
-        public InMemoryPointerTerm(ByteBuffer term, int blockCnt)
+        public InMemoryPointerTerm(IndexedTerm term, int blockCnt)
         {
             super(term);
             this.blockCnt = blockCnt;
@@ -362,7 +399,7 @@ public class OnDiskIndexBuilder
     {
         private final TokenTreeBuilder keys;
 
-        public InMemoryDataTerm(ByteBuffer term, TokenTreeBuilder keys)
+        public InMemoryDataTerm(IndexedTerm term, TokenTreeBuilder keys)
         {
             super(term);
             this.keys = keys;
@@ -439,7 +476,7 @@ public class OnDiskIndexBuilder
         public DataBuilderLevel(SequentialWriter out, MutableBlock<InMemoryDataTerm> block)
         {
             super(out, block);
-            superBlockTree = new TokenTreeBuilder();
+            superBlockTree = new DynamicTokenTreeBuilder();
         }
 
         public InMemoryPointerTerm add(InMemoryDataTerm term) throws IOException
@@ -450,20 +487,20 @@ public class OnDiskIndexBuilder
                 dataBlocksCnt++;
                 flushSuperBlock(false);
             }
-            superBlockTree.add(term.keys.getTokens());
+            superBlockTree.add(term.keys);
             return ptr;
         }
 
         public void flushSuperBlock(boolean force) throws IOException
         {
-            if (dataBlocksCnt == SUPER_BLOCK_SIZE || (force && !superBlockTree.getTokens().isEmpty()))
+            if (dataBlocksCnt == SUPER_BLOCK_SIZE || (force && !superBlockTree.isEmpty()))
             {
                 superBlockOffsets.add(out.position());
                 superBlockTree.finish().write(out);
                 alignToBlock(out);
 
                 dataBlocksCnt = 0;
-                superBlockTree = new TokenTreeBuilder();
+                superBlockTree = new DynamicTokenTreeBuilder();
             }
         }
 
@@ -534,28 +571,34 @@ public class OnDiskIndexBuilder
 
     private static class MutableDataBlock extends MutableBlock<InMemoryDataTerm>
     {
+        private static final int MAX_KEYS_SPARSE = 5;
+
+        private final AbstractType<?> comparator;
         private final Mode mode;
 
         private int offset = 0;
-        private int sparseValueTerms = 0;
 
         private final List<TokenTreeBuilder> containers = new ArrayList<>();
         private TokenTreeBuilder combinedIndex;
 
-        public MutableDataBlock(Mode mode)
+        public MutableDataBlock(AbstractType<?> comparator, Mode mode)
         {
+            this.comparator = comparator;
             this.mode = mode;
-            this.combinedIndex = new TokenTreeBuilder();
+            this.combinedIndex = initCombinedIndex();
         }
 
         protected void addInternal(InMemoryDataTerm term) throws IOException
         {
             TokenTreeBuilder keys = term.keys;
 
-            if (mode == Mode.SPARSE && keys.getTokenCount() <= 5)
+            if (mode == Mode.SPARSE)
             {
+                if (keys.getTokenCount() > MAX_KEYS_SPARSE)
+                    throw new IOException(String.format("Term - '%s' belongs to more than %d keys in %s mode, which is not allowed.",
+                                                        comparator.getString(term.term.getBytes()), MAX_KEYS_SPARSE, mode.name()));
+
                 writeTerm(term, keys);
-                sparseValueTerms++;
             }
             else
             {
@@ -566,7 +609,7 @@ public class OnDiskIndexBuilder
             }
 
             if (mode == Mode.SPARSE)
-                combinedIndex.add(keys.getTokens());
+                combinedIndex.add(keys);
         }
 
         protected int sizeAfter(InMemoryDataTerm element)
@@ -578,7 +621,7 @@ public class OnDiskIndexBuilder
         {
             super.flushAndClear(out);
 
-            out.writeInt((sparseValueTerms == 0) ? -1 : offset);
+            out.writeInt(mode == Mode.SPARSE ? offset : -1);
 
             if (containers.size() > 0)
             {
@@ -586,18 +629,15 @@ public class OnDiskIndexBuilder
                     tokens.write(out);
             }
 
-            if (sparseValueTerms > 0)
-            {
+            if (mode == Mode.SPARSE && combinedIndex != null)
                 combinedIndex.finish().write(out);
-            }
 
             alignToBlock(out);
 
             containers.clear();
-            combinedIndex = new TokenTreeBuilder();
+            combinedIndex = initCombinedIndex();
 
             offset = 0;
-            sparseValueTerms = 0;
         }
 
         private int ptrLength(InMemoryDataTerm term)
@@ -611,10 +651,8 @@ public class OnDiskIndexBuilder
         {
             term.serialize(buffer);
             buffer.writeByte((byte) keys.getTokenCount());
-
-            Iterator<Pair<Long, LongSet>> tokens = keys.iterator();
-            while (tokens.hasNext())
-                buffer.writeLong(tokens.next().left);
+            for (Pair<Long, LongSet> key : keys)
+                buffer.writeLong(key.left);
         }
 
         private void writeTerm(InMemoryTerm term, int offset) throws IOException
@@ -622,6 +660,11 @@ public class OnDiskIndexBuilder
             term.serialize(buffer);
             buffer.writeByte(0x0);
             buffer.writeInt(offset);
+        }
+
+        private TokenTreeBuilder initCombinedIndex()
+        {
+            return mode == Mode.SPARSE ? new DynamicTokenTreeBuilder() : null;
         }
     }
 }

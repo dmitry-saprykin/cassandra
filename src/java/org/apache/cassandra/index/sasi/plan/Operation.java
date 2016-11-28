@@ -39,6 +39,7 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.*;
 import org.apache.cassandra.utils.FBUtilities;
 
+@SuppressWarnings("resource")
 public class Operation extends RangeIterator<Long, Token>
 {
     public enum OperationType
@@ -91,7 +92,7 @@ public class Operation extends RangeIterator<Long, Token>
      * and data from the lower level members using depth-first search
      * and bubbling the results back to the top level caller.
      *
-     * Most of the work here is done by {@link #localSatisfiedBy(Unfiltered, boolean)}
+     * Most of the work here is done by {@link #localSatisfiedBy(Unfiltered, Row, boolean)}
      * see it's comment for details, if there are no local expressions
      * assigned to Operation it will call satisfiedBy(Row) on it's children.
      *
@@ -119,18 +120,20 @@ public class Operation extends RangeIterator<Long, Token>
      * Level #2 computes AND between "first_name" and result of level #3, AND (state, country) which is already computed
      * Level #1 does OR between results of AND (first_name) and AND (state, country) and returns final result.
      *
-     * @param row The row to check.
+     * @param currentCluster The row cluster to check.
+     * @param staticRow The static row associated with current cluster.
+     * @param allowMissingColumns allow columns value to be null.
      * @return true if give Row satisfied all of the expressions in the tree,
      *         false otherwise.
      */
-    public boolean satisfiedBy(Unfiltered row, boolean allowMissingColumns)
+    public boolean satisfiedBy(Unfiltered currentCluster, Row staticRow, boolean allowMissingColumns)
     {
         boolean sideL, sideR;
 
         if (expressions == null || expressions.isEmpty())
         {
-            sideL =  left != null &&  left.satisfiedBy(row, allowMissingColumns);
-            sideR = right != null && right.satisfiedBy(row, allowMissingColumns);
+            sideL =  left != null &&  left.satisfiedBy(currentCluster, staticRow, allowMissingColumns);
+            sideR = right != null && right.satisfiedBy(currentCluster, staticRow, allowMissingColumns);
 
             // one of the expressions was skipped
             // because it had no indexes attached
@@ -139,14 +142,14 @@ public class Operation extends RangeIterator<Long, Token>
         }
         else
         {
-            sideL = localSatisfiedBy(row, allowMissingColumns);
+            sideL = localSatisfiedBy(currentCluster, staticRow, allowMissingColumns);
 
             // if there is no right it means that this expression
             // is last in the sequence, we can just return result from local expressions
             if (right == null)
                 return sideL;
 
-            sideR = right.satisfiedBy(row, allowMissingColumns);
+            sideR = right.satisfiedBy(currentCluster, staticRow, allowMissingColumns);
         }
 
 
@@ -160,7 +163,7 @@ public class Operation extends RangeIterator<Long, Token>
      *
      * The algorithm is as follows: for every given expression from analyzed
      * list get corresponding column from the Row:
-     *   - apply {@link Expression#contains(ByteBuffer)}
+     *   - apply {@link Expression#isSatisfiedBy(ByteBuffer)}
      *     method to figure out if it's satisfied;
      *   - apply logical operation between boolean accumulator and current boolean result;
      *   - if result == false and node's operation is AND return right away;
@@ -189,13 +192,15 @@ public class Operation extends RangeIterator<Long, Token>
      *
      * #4 return accumulator => true (row satisfied all of the conditions)
      *
-     * @param row The row to check.
+     * @param currentCluster The row cluster to check.
+     * @param staticRow The static row associated with current cluster.
+     * @param allowMissingColumns allow columns value to be null.
      * @return true if give Row satisfied all of the analyzed expressions,
      *         false otherwise.
      */
-    private boolean localSatisfiedBy(Unfiltered row, boolean allowMissingColumns)
+    private boolean localSatisfiedBy(Unfiltered currentCluster, Row staticRow, boolean allowMissingColumns)
     {
-        if (row == null || !row.isRow())
+        if (currentCluster == null || !currentCluster.isRow())
             return false;
 
         final int now = FBUtilities.nowInSeconds();
@@ -207,7 +212,7 @@ public class Operation extends RangeIterator<Long, Token>
             if (column.kind == Kind.PARTITION_KEY)
                 continue;
 
-            ByteBuffer value = ColumnIndex.getValueOf(column, (Row) row, now);
+            ByteBuffer value = ColumnIndex.getValueOf(column, column.kind == Kind.STATIC ? staticRow : (Row) currentCluster, now);
             boolean isMissingColumn = value == null;
 
             if (!allowMissingColumns && isMissingColumn)
@@ -225,7 +230,7 @@ public class Operation extends RangeIterator<Long, Token>
             for (int i = filters.size() - 1; i >= 0; i--)
             {
                 Expression expression = filters.get(i);
-                isMatch = !isMissingColumn && expression.contains(value);
+                isMatch = !isMissingColumn && expression.isSatisfiedBy(value);
                 if (expression.getOp() == Op.NOT_EQ)
                 {
                     // since this is NOT_EQ operation we have to
@@ -282,16 +287,33 @@ public class Operation extends RangeIterator<Long, Token>
             AbstractAnalyzer analyzer = columnIndex.getAnalyzer();
             analyzer.reset(e.getIndexValue());
 
-            // EQ/NOT_EQ can have multiple expressions e.g. text = "Hello World",
+            // EQ/LIKE_*/NOT_EQ can have multiple expressions e.g. text = "Hello World",
             // becomes text = "Hello" OR text = "World" because "space" is always interpreted as a split point (by analyzer),
             // NOT_EQ is made an independent expression only in case of pre-existing multiple EQ expressions, or
             // if there is no EQ operations and NOT_EQ is met or a single NOT_EQ expression present,
             // in such case we know exactly that there would be no more EQ/RANGE expressions for given column
             // since NOT_EQ has the lowest priority.
-            if (e.operator() == Operator.EQ
-                    || (e.operator() == Operator.NEQ
-                       && (perColumn.size() == 0 || perColumn.size() > 1
-                           || (perColumn.size() == 1 && perColumn.get(0).getOp() == Op.NOT_EQ))))
+            boolean isMultiExpression = false;
+            switch (e.operator())
+            {
+                case EQ:
+                    isMultiExpression = false;
+                    break;
+
+                case LIKE_PREFIX:
+                case LIKE_SUFFIX:
+                case LIKE_CONTAINS:
+                case LIKE_MATCHES:
+                    isMultiExpression = true;
+                    break;
+
+                case NEQ:
+                    isMultiExpression = (perColumn.size() == 0 || perColumn.size() > 1
+                                     || (perColumn.size() == 1 && perColumn.get(0).getOp() == Op.NOT_EQ));
+                    break;
+            }
+
+            if (isMultiExpression)
             {
                 while (analyzer.hasNext())
                 {
@@ -323,6 +345,12 @@ public class Operation extends RangeIterator<Long, Token>
         switch (op)
         {
             case EQ:
+                return 5;
+
+            case LIKE_PREFIX:
+            case LIKE_SUFFIX:
+            case LIKE_CONTAINS:
+            case LIKE_MATCHES:
                 return 4;
 
             case GTE:

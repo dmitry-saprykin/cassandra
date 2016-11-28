@@ -131,6 +131,9 @@ public final class TableAttributes extends PropertyDefinitions
         if (hasOption(Option.CRC_CHECK_CHANCE))
             builder.crcCheckChance(getDouble(Option.CRC_CHECK_CHANCE));
 
+        if (hasOption(Option.CDC))
+            builder.cdc(getBoolean(Option.CDC.toString(), false));
+
         return builder.build();
     }
 
@@ -139,7 +142,7 @@ public final class TableAttributes extends PropertyDefinitions
         String value = compressionOpts.get(Option.CRC_CHECK_CHANCE.toString().toLowerCase());
         try
         {
-            return Double.parseDouble(value);
+            return Double.valueOf(value);
         }
         catch (NumberFormatException e)
         {

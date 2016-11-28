@@ -36,6 +36,7 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.SerializationHeader;
+import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.db.rows.EncodingStats;
 import org.apache.cassandra.exceptions.ConfigurationException;
@@ -53,14 +54,19 @@ public class SSTableWriterTestBase extends SchemaLoader
 
     protected static final String KEYSPACE = "SSTableRewriterTest";
     protected static final String CF = "Standard1";
+    protected static final String CF_SMALL_MAX_VALUE = "Standard_SmallMaxValue";
 
     private static Config.DiskAccessMode standardMode;
     private static Config.DiskAccessMode indexMode;
 
+    private static int maxValueSize;
+
     @BeforeClass
     public static void defineSchema() throws ConfigurationException
     {
-        if (FBUtilities.isWindows())
+        DatabaseDescriptor.daemonInitialization();
+
+        if (FBUtilities.isWindows)
         {
             standardMode = DatabaseDescriptor.getDiskAccessMode();
             indexMode = DatabaseDescriptor.getIndexAccessMode();
@@ -72,12 +78,17 @@ public class SSTableWriterTestBase extends SchemaLoader
         SchemaLoader.prepareServer();
         SchemaLoader.createKeyspace(KEYSPACE,
                                     KeyspaceParams.simple(1),
-                                    SchemaLoader.standardCFMD(KEYSPACE, CF));
+                                    SchemaLoader.standardCFMD(KEYSPACE, CF),
+                                    SchemaLoader.standardCFMD(KEYSPACE, CF_SMALL_MAX_VALUE));
+
+        maxValueSize = DatabaseDescriptor.getMaxValueSize();
+        DatabaseDescriptor.setMaxValueSize(1024 * 1024); // set max value size to 1MB
     }
 
     @AfterClass
-    public static void revertDiskAccess()
+    public static void revertConfiguration()
     {
+        DatabaseDescriptor.setMaxValueSize(maxValueSize);
         DatabaseDescriptor.setDiskAccessMode(standardMode);
         DatabaseDescriptor.setIndexAccessMode(indexMode);
     }
@@ -101,6 +112,25 @@ public class SSTableWriterTestBase extends SchemaLoader
         validateCFS(cfs);
     }
 
+    /**
+     * Validate the column family store by checking that all live
+     * sstables are referenced only once and are not marked as
+     * compacting. It also checks that the generation of the data
+     * files on disk is the same as that of the live sstables,
+     * to ensure that the data files on disk belong to the live
+     * sstables. Finally, it checks that the metrics contain the
+     * correct disk space used, live and total.
+     *
+     * Note that this method will submit a maximal compaction task
+     * if there are live sstables, in order to check that there is at least
+     * a maximal task when there are live sstables.
+     *
+     * This method has therefore side effects and should be called after
+     * performing any other checks on previous operations, especially
+     * checks involving files on disk.
+     *
+     * @param cfs - the column family store to validate
+     */
     public static void validateCFS(ColumnFamilyStore cfs)
     {
         Set<Integer> liveDescriptors = new HashSet<>();
@@ -126,6 +156,9 @@ public class SSTableWriterTestBase extends SchemaLoader
         assertEquals(spaceUsed, cfs.metric.liveDiskSpaceUsed.getCount());
         assertEquals(spaceUsed, cfs.metric.totalDiskSpaceUsed.getCount());
         assertTrue(cfs.getTracker().getCompacting().isEmpty());
+
+        if(cfs.getLiveSSTables().size() > 0)
+            assertFalse(CompactionManager.instance.submitMaximal(cfs, cfs.gcBefore((int) (System.currentTimeMillis() / 1000)), false).isEmpty());
     }
 
     public static SSTableWriter getWriter(ColumnFamilyStore cfs, File directory, LifecycleTransaction txn)

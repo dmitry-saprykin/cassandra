@@ -148,7 +148,8 @@ public class BTreeRemoval
         return result;
     }
 
-    private static Object[] rotateRight(final Object[] node, final int i) {
+    private static Object[] rotateRight(final Object[] node, final int i)
+    {
         final int keyEnd = BTree.getBranchKeyEnd(node);
         final Object[] nextNode = (Object[]) node[keyEnd + i];
         final Object[] rightNeighbour = (Object[]) node[keyEnd + i + 1];
@@ -164,7 +165,8 @@ public class BTreeRemoval
         return newNextNode;
     }
 
-    private static Object[] rotateLeft(final Object[] node, final int i) {
+    private static Object[] rotateLeft(final Object[] node, final int i)
+    {
         final int keyEnd = BTree.getBranchKeyEnd(node);
         final Object[] nextNode = (Object[]) node[keyEnd + i];
         final Object[] leftNeighbour = (Object[]) node[keyEnd + i - 1];
@@ -225,12 +227,16 @@ public class BTreeRemoval
     private static Object[] copyWithKeyAndChildRemoved(final Object[] node, final int keyIndex, final int childIndex, final boolean substractSize)
     {
         final boolean leaf = BTree.isLeaf(node);
-        final int keyEnd = BTree.getKeyEnd(node);
         final Object[] newNode;
         if (leaf)
+        {
+            final int keyEnd = BTree.getKeyEnd(node);
             newNode = new Object[keyEnd - ((keyEnd & 1) == 1 ? 0 : 1)];
+        }
         else
+        {
             newNode = new Object[node.length - 2];
+        }
         int offset = copyKeys(node, newNode, 0, keyIndex);
         if (!leaf)
         {
@@ -248,7 +254,8 @@ public class BTreeRemoval
         return newNode;
     }
 
-    private static <V> Object[] merge(final Object[] left, final Object[] right, final V nodeKey) {
+    private static <V> Object[] merge(final Object[] left, final Object[] right, final V nodeKey)
+    {
         assert BTree.getKeyEnd(left) == BTree.MINIMAL_NODE_SIZE;
         assert BTree.getKeyEnd(right) == BTree.MINIMAL_NODE_SIZE;
         final boolean leaves = BTree.isLeaf(left);

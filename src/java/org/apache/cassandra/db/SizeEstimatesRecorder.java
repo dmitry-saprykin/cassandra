@@ -23,11 +23,13 @@ import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.db.lifecycle.SSTableIntervalTree;
 import org.apache.cassandra.db.lifecycle.SSTableSet;
 import org.apache.cassandra.db.lifecycle.View;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.locator.TokenMetadata;
 import org.apache.cassandra.service.MigrationListener;
 import org.apache.cassandra.service.MigrationManager;
 import org.apache.cassandra.service.StorageService;
@@ -58,7 +60,8 @@ public class SizeEstimatesRecorder extends MigrationListener implements Runnable
 
     public void run()
     {
-        if (!StorageService.instance.getTokenMetadata().isMember(FBUtilities.getBroadcastAddress()))
+        TokenMetadata metadata = StorageService.instance.getTokenMetadata().cloneOnlyTokenMap();
+        if (!metadata.isMember(FBUtilities.getBroadcastAddress()))
         {
             logger.debug("Node is not part of the ring; not recording size estimates");
             return;
@@ -68,9 +71,9 @@ public class SizeEstimatesRecorder extends MigrationListener implements Runnable
 
         // find primary token ranges for the local node.
         Collection<Token> localTokens = StorageService.instance.getLocalTokens();
-        Collection<Range<Token>> localRanges = StorageService.instance.getTokenMetadata().getPrimaryRangesFor(localTokens);
+        Collection<Range<Token>> localRanges = metadata.getPrimaryRangesFor(localTokens);
 
-        for (Keyspace keyspace : Keyspace.nonSystem())
+        for (Keyspace keyspace : Keyspace.nonLocalStrategy())
         {
             for (ColumnFamilyStore table : keyspace.getColumnFamilyStores())
             {
@@ -101,8 +104,11 @@ public class SizeEstimatesRecorder extends MigrationListener implements Runnable
             {
                 while (refs == null)
                 {
-                    ColumnFamilyStore.ViewFragment view = table.select(View.select(SSTableSet.CANONICAL, Range.makeRowRange(range)));
-                    refs = Refs.tryRef(view.sstables);
+                    Iterable<SSTableReader> sstables = table.getTracker().getView().select(SSTableSet.CANONICAL);
+                    SSTableIntervalTree tree = SSTableIntervalTree.build(sstables);
+                    Range<PartitionPosition> r = Range.makeRowRange(range);
+                    Iterable<SSTableReader> canonicalSSTables = View.sstablesInBounds(r.left, r.right, tree);
+                    refs = Refs.tryRef(canonicalSSTables);
                 }
 
                 // calculate the estimates.

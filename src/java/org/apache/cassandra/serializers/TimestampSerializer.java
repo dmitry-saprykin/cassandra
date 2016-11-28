@@ -33,7 +33,8 @@ public class TimestampSerializer implements TypeSerializer<Date>
 
     //NOTE: This list is used below and if you change the order
     //      you need to update the default format and json formats in the code below.
-    private static final String[] dateStringPatterns = new String[] {
+    private static final String[] dateStringPatterns = new String[]
+    {
             "yyyy-MM-dd HH:mm",
             "yyyy-MM-dd HH:mm:ss",
             "yyyy-MM-dd HH:mm z",
@@ -49,11 +50,11 @@ public class TimestampSerializer implements TypeSerializer<Date>
             "yyyy-MM-dd HH:mm:ssX",
             "yyyy-MM-dd HH:mm:ssXX",
             "yyyy-MM-dd HH:mm:ssXXX",
-            "yyyy-MM-dd HH:mm:ss.SSS",   // TO_JSON_FORMAT
+            "yyyy-MM-dd HH:mm:ss.SSS",
             "yyyy-MM-dd HH:mm:ss.SSS z",
             "yyyy-MM-dd HH:mm:ss.SSS zz",
             "yyyy-MM-dd HH:mm:ss.SSS zzz",
-            "yyyy-MM-dd HH:mm:ss.SSSX",
+            "yyyy-MM-dd HH:mm:ss.SSSX", // TO_JSON_FORMAT
             "yyyy-MM-dd HH:mm:ss.SSSXX",
             "yyyy-MM-dd HH:mm:ss.SSSXXX",
             "yyyy-MM-dd'T'HH:mm",
@@ -107,17 +108,20 @@ public class TimestampSerializer implements TypeSerializer<Date>
             return sdf;
         }
     };
-    
+
+    private static final String TO_JSON_FORMAT = dateStringPatterns[19];
     private static final ThreadLocal<SimpleDateFormat> FORMATTER_TO_JSON = new ThreadLocal<SimpleDateFormat>()
     {
         protected SimpleDateFormat initialValue()
         {
-            return new SimpleDateFormat(dateStringPatterns[15]);
+            SimpleDateFormat sdf = new SimpleDateFormat(TO_JSON_FORMAT);
+            sdf.setTimeZone(TimeZone.getTimeZone("UTC"));
+            return sdf;
         }
     };
 
 
-    
+
     public static final TimestampSerializer instance = new TimestampSerializer();
 
     public Date deserialize(ByteBuffer bytes)
@@ -158,8 +162,8 @@ public class TimestampSerializer implements TypeSerializer<Date>
             throw new MarshalException(String.format("Unable to coerce '%s' to a formatted date (long)", source), e1);
         }
     }
-    
-    public static SimpleDateFormat getJsonDateFormatter() 
+
+    public static SimpleDateFormat getJsonDateFormatter()
     {
     	return FORMATTER_TO_JSON.get();
     }
@@ -190,11 +194,10 @@ public class TimestampSerializer implements TypeSerializer<Date>
      * @see #FORMATTER_UTC
      */
     @Override
-    public void toCQLLiteral(ByteBuffer buffer, StringBuilder target)
+    public String toCQLLiteral(ByteBuffer buffer)
     {
-        if (buffer == null || !buffer.hasRemaining())
-            target.append("null");
-        else
-            target.append(FORMATTER_UTC.get().format(deserialize(buffer)));
+        return buffer == null || !buffer.hasRemaining()
+             ? "null"
+             : FORMATTER_UTC.get().format(deserialize(buffer));
     }
 }

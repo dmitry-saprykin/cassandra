@@ -18,7 +18,7 @@
 package org.apache.cassandra.index.sasi.disk;
 
 /**
- * Object descriptor for SSTableAttachedSecondaryIndex files. Similar to, and based upon, the sstable descriptor.
+ * Object descriptor for SASIIndex files. Similar to, and based upon, the sstable descriptor.
  */
 public class Descriptor
 {

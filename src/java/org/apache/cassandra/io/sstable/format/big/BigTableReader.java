@@ -17,7 +17,6 @@
  */
 package org.apache.cassandra.io.sstable.format.big;
 
-import com.google.common.util.concurrent.RateLimiter;
 import org.apache.cassandra.cache.KeyCacheKey;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.db.*;
@@ -27,13 +26,10 @@ import org.apache.cassandra.db.columniterator.SSTableReversedIterator;
 import org.apache.cassandra.db.rows.Rows;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.db.rows.UnfilteredRowIterators;
-import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
-import org.apache.cassandra.io.sstable.Component;
-import org.apache.cassandra.io.sstable.CorruptSSTableException;
-import org.apache.cassandra.io.sstable.Descriptor;
-import org.apache.cassandra.io.sstable.ISSTableScanner;
+import org.apache.cassandra.io.sstable.*;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.metadata.StatsMetadata;
 import org.apache.cassandra.io.util.FileDataInput;
@@ -70,8 +66,8 @@ public class BigTableReader extends SSTableReader
         if (indexEntry == null)
             return UnfilteredRowIterators.noRowsIterator(metadata, key, Rows.EMPTY_STATIC_ROW, DeletionTime.LIVE, reversed);
         return reversed
-             ? new SSTableReversedIterator(this, file, key, indexEntry, slices, selectedColumns, isForThrift)
-             : new SSTableIterator(this, file, key, indexEntry, slices, selectedColumns, isForThrift);
+             ? new SSTableReversedIterator(this, file, key, indexEntry, slices, selectedColumns, isForThrift, ifile)
+             : new SSTableIterator(this, file, key, indexEntry, slices, selectedColumns, isForThrift, ifile);
     }
 
     /**
@@ -79,9 +75,20 @@ public class BigTableReader extends SSTableReader
      * @param dataRange filter to use when reading the columns
      * @return A Scanner for seeking over the rows of the SSTable.
      */
-    public ISSTableScanner getScanner(ColumnFilter columns, DataRange dataRange, RateLimiter limiter, boolean isForThrift)
+    public ISSTableScanner getScanner(ColumnFilter columns, DataRange dataRange, boolean isForThrift)
     {
-        return BigTableScanner.getScanner(this, columns, dataRange, limiter, isForThrift);
+        return BigTableScanner.getScanner(this, columns, dataRange, isForThrift);
+    }
+
+    /**
+     * Direct I/O SSTableScanner over an iterator of bounds.
+     *
+     * @param boundsIterator the keys to cover
+     * @return A Scanner for seeking over the rows of the SSTable.
+     */
+    public ISSTableScanner getScanner(Iterator<AbstractBounds<PartitionPosition>> boundsIterator)
+    {
+        return BigTableScanner.getScanner(this, boundsIterator);
     }
 
     /**
@@ -89,9 +96,9 @@ public class BigTableReader extends SSTableReader
      *
      * @return A Scanner for reading the full SSTable.
      */
-    public ISSTableScanner getScanner(RateLimiter limiter)
+    public ISSTableScanner getScanner()
     {
-        return BigTableScanner.getScanner(this, limiter);
+        return BigTableScanner.getScanner(this);
     }
 
     /**
@@ -100,11 +107,21 @@ public class BigTableReader extends SSTableReader
      * @param ranges the range of keys to cover
      * @return A Scanner for seeking over the rows of the SSTable.
      */
-    public ISSTableScanner getScanner(Collection<Range<Token>> ranges, RateLimiter limiter)
+    public ISSTableScanner getScanner(Collection<Range<Token>> ranges)
     {
-        return BigTableScanner.getScanner(this, ranges, limiter);
+        if (ranges != null)
+            return BigTableScanner.getScanner(this, ranges);
+        else
+            return getScanner();
     }
 
+
+    @SuppressWarnings("resource") // caller to close
+    @Override
+    public UnfilteredRowIterator simpleIterator(FileDataInput dfile, DecoratedKey key, RowIndexEntry position, boolean tombstoneOnly)
+    {
+        return SSTableIdentityIterator.create(this, dfile, position, key, tombstoneOnly);
+    }
 
     /**
      * @param key The key to apply as the rhs to the given Operator. A 'fake' key is allowed to
@@ -216,7 +233,7 @@ public class BigTableReader extends SSTableReader
                 if (opSatisfied)
                 {
                     // read data position from index entry
-                    RowIndexEntry indexEntry = rowIndexEntrySerializer.deserialize(in);
+                    RowIndexEntry indexEntry = rowIndexEntrySerializer.deserialize(in, in.getFilePointer());
                     if (exactMatch && updateCacheAndStats)
                     {
                         assert key instanceof DecoratedKey; // key can be == to the index key only if it's a true row key
@@ -238,7 +255,7 @@ public class BigTableReader extends SSTableReader
                     }
                     if (op == Operator.EQ && updateCacheAndStats)
                         bloomFilterTracker.addTruePositive();
-                    Tracing.trace("Partition index with {} entries found for sstable {}", indexEntry.columnsIndex().size(), descriptor.generation);
+                    Tracing.trace("Partition index with {} entries found for sstable {}", indexEntry.columnsIndexCount(), descriptor.generation);
                     return indexEntry;
                 }
 

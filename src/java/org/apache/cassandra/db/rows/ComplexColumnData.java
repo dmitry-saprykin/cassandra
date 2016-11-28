@@ -19,23 +19,21 @@ package org.apache.cassandra.db.rows;
 
 import java.nio.ByteBuffer;
 import java.security.MessageDigest;
-import java.util.*;
-import java.util.function.BiFunction;
+import java.util.Iterator;
+import java.util.Objects;
 
 import com.google.common.base.Function;
-import com.google.common.collect.Iterables;
 
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
-import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.DeletionPurger;
+import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.LivenessInfo;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.marshal.ByteType;
 import org.apache.cassandra.db.marshal.SetType;
 import org.apache.cassandra.utils.ObjectSizes;
 import org.apache.cassandra.utils.btree.BTree;
-import org.apache.cassandra.utils.btree.UpdateFunction;
 
 /**
  * The data for a complex column, that is it's cells and potential complex
@@ -192,6 +190,14 @@ public class ComplexColumnData extends ColumnData implements Iterable<Cell>
         return transformAndFilter(newDeletion, (cell) -> (Cell) cell.updateAllTimestamp(newTimestamp));
     }
 
+    public long maxTimestamp()
+    {
+        long timestamp = complexDeletion.markedForDeleteAt();
+        for (Cell cell : this)
+            timestamp = Math.max(timestamp, cell.timestamp());
+        return timestamp;
+    }
+
     // This is the partner in crime of ArrayBackedRow.setValue. The exact warning apply. The short
     // version is: "don't use that method".
     void setValue(CellPath path, ByteBuffer value)
@@ -228,10 +234,6 @@ public class ComplexColumnData extends ColumnData implements Iterable<Cell>
 
     public static class Builder
     {
-        private static BiFunction<Cell, Cell, Cell> noResolve = (a, b) -> {
-            throw new IllegalStateException();
-        };
-
         private DeletionTime complexDeletion;
         private ColumnDefinition column;
         private BTree.Builder<Cell> builder;
@@ -240,8 +242,7 @@ public class ComplexColumnData extends ColumnData implements Iterable<Cell>
         {
             this.column = column;
             this.complexDeletion = DeletionTime.LIVE; // default if writeComplexDeletion is not called
-            if (builder == null) builder = BTree.builder(column.cellComparator());
-            else builder.reuse(column.cellComparator());
+            this.builder = BTree.builder(column.cellComparator());
         }
 
         public void addComplexDeletion(DeletionTime complexDeletion)
@@ -251,7 +252,6 @@ public class ComplexColumnData extends ColumnData implements Iterable<Cell>
 
         public void addCell(Cell cell)
         {
-            assert cell.column().equals(column);
             builder.add(cell);
         }
 

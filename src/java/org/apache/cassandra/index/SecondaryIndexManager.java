@@ -65,11 +65,11 @@ import org.apache.cassandra.utils.concurrent.Refs;
  * a table, (re)building during bootstrap or other streaming operations, flushing, reloading metadata
  * and so on.
  *
- * The Index interface defines a number of methods which return Callable<?>. These are primarily the
+ * The Index interface defines a number of methods which return {@code Callable<?>}. These are primarily the
  * management tasks for an index implementation. Most of them are currently executed in a blocking
  * fashion via submission to SIM's blockingExecutor. This provides the desired behaviour in pretty
  * much all cases, as tasks like flushing an index needs to be executed synchronously to avoid potentially
- * deadlocking on the FlushWriter or PostFlusher. Several of these Callable<?> returning methods on Index could
+ * deadlocking on the FlushWriter or PostFlusher. Several of these {@code Callable<?>} returning methods on Index could
  * then be defined with as void and called directly from SIM (rather than being run via the executor service).
  * Separating the task defintion from execution gives us greater flexibility though, so that in future, for example,
  * if the flush process allows it we leave open the possibility of executing more of these tasks asynchronously.
@@ -270,7 +270,7 @@ public class SecondaryIndexManager implements IndexRegistry
     {
         if (index.shouldBuildBlocking())
         {
-            try (ColumnFamilyStore.RefViewFragment viewFragment = baseCfs.selectAndReference(View.select(SSTableSet.CANONICAL));
+            try (ColumnFamilyStore.RefViewFragment viewFragment = baseCfs.selectAndReference(View.selectFunction(SSTableSet.CANONICAL));
                  Refs<SSTableReader> sstables = viewFragment.refs)
             {
                 buildIndexesBlocking(sstables, Collections.singleton(index));
@@ -486,10 +486,21 @@ public class SecondaryIndexManager implements IndexRegistry
      */
     public void flushAllNonCFSBackedIndexesBlocking()
     {
-        Set<Index> customIndexers = indexes.values().stream()
-                                                    .filter(index -> !(index.getBackingTable().isPresent()))
-                                                    .collect(Collectors.toSet());
-        flushIndexesBlocking(customIndexers);
+        executeAllBlocking(indexes.values()
+                                  .stream()
+                                  .filter(index -> !index.getBackingTable().isPresent()),
+                           Index::getBlockingFlushTask);
+    }
+
+    /**
+     * Performs a blocking execution of pre-join tasks of all indexes
+     */
+    public void executePreJoinTasksBlocking(boolean hadBootstrap)
+    {
+        logger.info("Executing pre-join{} tasks for: {}", hadBootstrap ? " post-bootstrap" : "", this.baseCfs);
+        executeAllBlocking(indexes.values().stream(), (index) -> {
+            return index.getPreJoinTask(hadBootstrap);
+        });
     }
 
     /**
@@ -561,7 +572,7 @@ public class SecondaryIndexManager implements IndexRegistry
      * Delete all data from all indexes for this partition.
      * For when cleanup rips a partition out entirely.
      *
-     * TODO : improve cleanup transaction to batch updates & perform them async
+     * TODO : improve cleanup transaction to batch updates and perform them async
      */
     public void deletePartition(UnfilteredRowIterator partition, int nowInSec)
     {
@@ -632,7 +643,7 @@ public class SecondaryIndexManager implements IndexRegistry
                 Tracing.trace("Command contains a custom index expression, using target index {}", customExpression.getTargetIndex().name);
                 return indexes.get(customExpression.getTargetIndex().name);
             }
-            else
+            else if (!expression.isUserDefined())
             {
                 indexes.values().stream()
                        .filter(index -> index.supportsExpression(expression.column(), expression.operator()))
@@ -915,6 +926,8 @@ public class SecondaryIndexManager implements IndexRegistry
             {
                 public void onPrimaryKeyLivenessInfo(int i, Clustering clustering, LivenessInfo merged, LivenessInfo original)
                 {
+                    if (original != null && (merged == null || !merged.isLive(nowInSec)))
+                        getBuilder(i, clustering).addPrimaryKeyLivenessInfo(original);
                 }
 
                 public void onDeletion(int i, Clustering clustering, Row.Deletion merged, Row.Deletion original)
@@ -927,15 +940,18 @@ public class SecondaryIndexManager implements IndexRegistry
 
                 public void onCell(int i, Clustering clustering, Cell merged, Cell original)
                 {
-                    if (original != null && merged == null)
+                    if (original != null && (merged == null || !merged.isLive(nowInSec)))
+                        getBuilder(i, clustering).addCell(original);
+                }
+
+                private Row.Builder getBuilder(int index, Clustering clustering)
+                {
+                    if (builders[index] == null)
                     {
-                        if (builders[i] == null)
-                        {
-                            builders[i] = BTreeRow.sortedBuilder();
-                            builders[i].newRow(clustering);
-                        }
-                        builders[i].addCell(original);
+                        builders[index] = BTreeRow.sortedBuilder();
+                        builders[index].newRow(clustering);
                     }
+                    return builders[index];
                 }
             };
 

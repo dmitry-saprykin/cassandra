@@ -25,28 +25,47 @@ import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.FileDataInput;
+import org.apache.cassandra.io.util.FileHandle;
 
 /**
  *  A Cell Iterator over SSTable
  */
 public class SSTableIterator extends AbstractSSTableIterator
 {
+    /**
+     * The index of the slice being processed.
+     */
+    private int slice;
+
     public SSTableIterator(SSTableReader sstable,
                            FileDataInput file,
                            DecoratedKey key,
                            RowIndexEntry indexEntry,
                            Slices slices,
                            ColumnFilter columns,
-                           boolean isForThrift)
+                           boolean isForThrift,
+                           FileHandle ifile)
     {
-        super(sstable, file, key, indexEntry, slices, columns, isForThrift);
+        super(sstable, file, key, indexEntry, slices, columns, isForThrift, ifile);
     }
 
-    protected Reader createReader(RowIndexEntry indexEntry, FileDataInput file, boolean shouldCloseFile)
+    protected Reader createReaderInternal(RowIndexEntry indexEntry, FileDataInput file, boolean shouldCloseFile)
     {
         return indexEntry.isIndexed()
              ? new ForwardIndexedReader(indexEntry, file, shouldCloseFile)
              : new ForwardReader(file, shouldCloseFile);
+    }
+
+    protected int nextSliceIndex()
+    {
+        int next = slice;
+        slice++;
+        return next;
+    }
+
+    protected boolean hasMoreSlices()
+    {
+        return slice < slices.size();
     }
 
     public boolean isReverseOrder()
@@ -57,9 +76,9 @@ public class SSTableIterator extends AbstractSSTableIterator
     private class ForwardReader extends Reader
     {
         // The start of the current slice. This will be null as soon as we know we've passed that bound.
-        protected Slice.Bound start;
+        protected ClusteringBound start;
         // The end of the current slice. Will never be null.
-        protected Slice.Bound end = Slice.Bound.TOP;
+        protected ClusteringBound end = ClusteringBound.TOP;
 
         protected Unfiltered next; // the next element to return: this is computed by hasNextInternal().
 
@@ -73,7 +92,7 @@ public class SSTableIterator extends AbstractSSTableIterator
 
         public void setForSlice(Slice slice) throws IOException
         {
-            start = slice.start() == Slice.Bound.BOTTOM ? null : slice.start();
+            start = slice.start() == ClusteringBound.BOTTOM ? null : slice.start();
             end = slice.end();
 
             sliceDone = false;
@@ -101,7 +120,7 @@ public class SSTableIterator extends AbstractSSTableIterator
                     updateOpenMarker((RangeTombstoneMarker)deserializer.readNext());
             }
 
-            Slice.Bound sliceStart = start;
+            ClusteringBound sliceStart = start;
             start = null;
 
             // We've reached the beginning of our queried slice. If we have an open marker
@@ -181,8 +200,15 @@ public class SSTableIterator extends AbstractSSTableIterator
         private ForwardIndexedReader(RowIndexEntry indexEntry, FileDataInput file, boolean shouldCloseFile)
         {
             super(file, shouldCloseFile);
-            this.indexState = new IndexState(this, sstable.metadata.comparator, indexEntry, false);
+            this.indexState = new IndexState(this, sstable.metadata.comparator, indexEntry, false, ifile);
             this.lastBlockIdx = indexState.blocksCount(); // if we never call setForSlice, that's where we want to stop
+        }
+
+        @Override
+        public void close() throws IOException
+        {
+            super.close();
+            this.indexState.close();
         }
 
         @Override

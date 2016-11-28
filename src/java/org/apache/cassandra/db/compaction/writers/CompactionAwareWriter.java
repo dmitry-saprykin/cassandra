@@ -35,6 +35,7 @@ import org.apache.cassandra.db.compaction.CompactionTask;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.io.sstable.SSTableRewriter;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.concurrent.Transactional;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.service.StorageService;
@@ -61,11 +62,21 @@ public abstract class CompactionAwareWriter extends Transactional.AbstractTransa
     private final List<PartitionPosition> diskBoundaries;
     private int locationIndex;
 
+    @Deprecated
     public CompactionAwareWriter(ColumnFamilyStore cfs,
                                  Directories directories,
                                  LifecycleTransaction txn,
                                  Set<SSTableReader> nonExpiredSSTables,
                                  boolean offline,
+                                 boolean keepOriginals)
+    {
+        this(cfs, directories, txn, nonExpiredSSTables, keepOriginals);
+    }
+
+    public CompactionAwareWriter(ColumnFamilyStore cfs,
+                                 Directories directories,
+                                 LifecycleTransaction txn,
+                                 Set<SSTableReader> nonExpiredSSTables,
                                  boolean keepOriginals)
     {
         this.cfs = cfs;
@@ -75,7 +86,7 @@ public abstract class CompactionAwareWriter extends Transactional.AbstractTransa
 
         estimatedTotalKeys = SSTableReader.getApproximateKeyCount(nonExpiredSSTables);
         maxAge = CompactionTask.getMaxDataAge(nonExpiredSSTables);
-        sstableWriter = SSTableRewriter.constructKeepingOriginals(txn, keepOriginals, maxAge, offline);
+        sstableWriter = SSTableRewriter.construct(cfs, txn, keepOriginals, maxAge);
         minRepairedAt = CompactionTask.getMinRepairedAt(nonExpiredSSTables);
         locations = cfs.getDirectories().getWriteableLocations();
         diskBoundaries = StorageService.getDiskBoundaries(cfs);
@@ -110,8 +121,6 @@ public abstract class CompactionAwareWriter extends Transactional.AbstractTransa
         super.finish();
         return sstableWriter.finished();
     }
-
-    public abstract List<SSTableReader> finish(long repairedAt);
 
     /**
      * estimated number of keys we should write
@@ -199,19 +208,27 @@ public abstract class CompactionAwareWriter extends Transactional.AbstractTransa
             if (directory == null)
                 directory = sstable.descriptor.directory;
             if (!directory.equals(sstable.descriptor.directory))
+            {
                 logger.trace("All sstables not from the same disk - putting results in {}", directory);
+                break;
+            }
         }
         Directories.DataDirectory d = getDirectories().getDataDirectoryForFile(directory);
         if (d != null)
         {
-            if (d.getAvailableSpace() < estimatedWriteSize)
-                throw new RuntimeException(String.format("Not enough space to write %d bytes to %s (%d bytes available)", estimatedWriteSize, d.location, d.getAvailableSpace()));
+            long availableSpace = d.getAvailableSpace();
+            if (availableSpace < estimatedWriteSize)
+                throw new RuntimeException(String.format("Not enough space to write %s to %s (%s available)",
+                                                         FBUtilities.prettyPrintMemory(estimatedWriteSize),
+                                                         d.location,
+                                                         FBUtilities.prettyPrintMemory(availableSpace)));
             logger.trace("putting compaction results in {}", directory);
             return d;
         }
         d = getDirectories().getWriteableLocation(estimatedWriteSize);
         if (d == null)
-            throw new RuntimeException("Not enough disk space to store "+estimatedWriteSize+" bytes");
+            throw new RuntimeException(String.format("Not enough disk space to store %s",
+                                                     FBUtilities.prettyPrintMemory(estimatedWriteSize)));
         return d;
     }
 

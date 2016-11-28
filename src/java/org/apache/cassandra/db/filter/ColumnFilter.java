@@ -26,7 +26,6 @@ import com.google.common.collect.TreeMultimap;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.CellPath;
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.io.util.DataInputPlus;
@@ -272,12 +271,12 @@ public class ColumnFilter
      * A builder for a {@code ColumnFilter} object.
      *
      * Note that the columns added to this build are the _queried_ column. Whether or not all columns
-     * are _fetched_ depends on which ctor you've used to obtained this builder, allColumnsBuilder (all
+     * are _fetched_ depends on which constructor you've used to obtained this builder, allColumnsBuilder (all
      * columns are fetched) or selectionBuilder (only the queried columns are fetched).
      *
      * Note that for a allColumnsBuilder, if no queried columns are added, this is interpreted as querying
      * all columns, not querying none (but if you know you want to query all columns, prefer
-     * {@link ColumnFilter#all)}. For selectionBuilder, adding no queried columns means no column will be
+     * {@link ColumnFilter#all(CFMetaData)}. For selectionBuilder, adding no queried columns means no column will be
      * fetched (so the builder will return {@code PartitionColumns.NONE}).
      */
     public static class Builder

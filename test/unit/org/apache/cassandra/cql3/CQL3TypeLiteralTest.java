@@ -23,15 +23,7 @@ import java.math.BigInteger;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Date;
-import java.util.EnumMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.UUID;
+import java.util.*;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.regex.Pattern;
 
@@ -39,7 +31,7 @@ import org.junit.Test;
 
 import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.serializers.*;
-import org.apache.cassandra.transport.Server;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.UUIDGen;
 
@@ -215,6 +207,13 @@ public class CQL3TypeLiteralTest
         }
         addNativeValue("null", CQL3Type.Native.TIME, null);
 
+        for (int i = 0; i < 100; i++)
+        {
+            Duration duration = Duration.newInstance(Math.abs(randInt()), Math.abs(randInt()), Math.abs(randLong()));
+            addNativeValue(DurationSerializer.instance.toString(duration), CQL3Type.Native.DURATION, DurationSerializer.instance.serialize(duration));
+        }
+        addNativeValue("null", CQL3Type.Native.DURATION, null);
+
         // (mostly generates timestamp values with surreal values like in year 14273)
         for (int i = 0; i < 20; i++)
         {
@@ -271,7 +270,7 @@ public class CQL3TypeLiteralTest
         // test each native type against each supported protocol version (although it doesn't make sense to
         // iterate through all protocol versions as of C* 3.0).
 
-        for (int version = Server.MIN_SUPPORTED_VERSION; version <= Server.CURRENT_VERSION; version++)
+        for (ProtocolVersion version : ProtocolVersion.SUPPORTED)
         {
             for (Map.Entry<CQL3Type.Native, List<Value>> entry : nativeTypeValues.entrySet())
             {
@@ -289,7 +288,7 @@ public class CQL3TypeLiteralTest
         // test 100 collections with varying element/key/value types against each supported protocol version,
         // type of collection is randomly chosen
 
-        for (int version = Server.MIN_SUPPORTED_VERSION; version <= Server.CURRENT_VERSION; version++)
+        for (ProtocolVersion version : ProtocolVersion.SUPPORTED)
         {
             for (int n = 0; n < 100; n++)
             {
@@ -302,39 +301,30 @@ public class CQL3TypeLiteralTest
     @Test
     public void testCollectionNullAndEmpty()
     {
-        for (int version = Server.MIN_SUPPORTED_VERSION; version <= Server.CURRENT_VERSION; version++)
+        // An empty collection is one with a size of 0 (note that rely on the fact that protocol version < 3 are not
+        // supported anymore and so the size of a collection is always on 4 bytes).
+        ByteBuffer emptyCollection = ByteBufferUtil.bytes(0);
+
+        for (ProtocolVersion version : ProtocolVersion.SUPPORTED)
         {
-            // empty, frozen collections
-            Value value = new Value("[]", ListType.getInstance(UTF8Type.instance, false).asCQL3Type(), ByteBufferUtil.EMPTY_BYTE_BUFFER);
-            compareCqlLiteral(version, value);
-            value = new Value("{}", SetType.getInstance(UTF8Type.instance, false).asCQL3Type(), ByteBufferUtil.EMPTY_BYTE_BUFFER);
-            compareCqlLiteral(version, value);
-            value = new Value("{}", MapType.getInstance(UTF8Type.instance, UTF8Type.instance, false).asCQL3Type(), ByteBufferUtil.EMPTY_BYTE_BUFFER);
-            compareCqlLiteral(version, value);
+            for (boolean frozen : Arrays.asList(true, false))
+            {
+                // empty
+                Value value = new Value("[]", ListType.getInstance(UTF8Type.instance, frozen).asCQL3Type(), emptyCollection);
+                compareCqlLiteral(version, value);
+                value = new Value("{}", SetType.getInstance(UTF8Type.instance, frozen).asCQL3Type(), emptyCollection);
+                compareCqlLiteral(version, value);
+                value = new Value("{}", MapType.getInstance(UTF8Type.instance, UTF8Type.instance, frozen).asCQL3Type(), emptyCollection);
+                compareCqlLiteral(version, value);
 
-            // empty, non-frozen collections
-            value = new Value("[]", ListType.getInstance(UTF8Type.instance, true).asCQL3Type(), ByteBufferUtil.EMPTY_BYTE_BUFFER);
-            compareCqlLiteral(version, value);
-            value = new Value("{}", SetType.getInstance(UTF8Type.instance, true).asCQL3Type(), ByteBufferUtil.EMPTY_BYTE_BUFFER);
-            compareCqlLiteral(version, value);
-            value = new Value("{}", MapType.getInstance(UTF8Type.instance, UTF8Type.instance, true).asCQL3Type(), ByteBufferUtil.EMPTY_BYTE_BUFFER);
-            compareCqlLiteral(version, value);
-
-            // null, frozen collections
-            value = new Value("null", ListType.getInstance(UTF8Type.instance, false).asCQL3Type(), null);
-            compareCqlLiteral(version, value);
-            value = new Value("null", SetType.getInstance(UTF8Type.instance, false).asCQL3Type(), null);
-            compareCqlLiteral(version, value);
-            value = new Value("null", MapType.getInstance(UTF8Type.instance, UTF8Type.instance, false).asCQL3Type(), null);
-            compareCqlLiteral(version, value);
-
-            // null, non-frozen collections
-            value = new Value("[]", ListType.getInstance(UTF8Type.instance, true).asCQL3Type(), null);
-            compareCqlLiteral(version, value);
-            value = new Value("{}", SetType.getInstance(UTF8Type.instance, true).asCQL3Type(), null);
-            compareCqlLiteral(version, value);
-            value = new Value("{}", MapType.getInstance(UTF8Type.instance, UTF8Type.instance, true).asCQL3Type(), null);
-            compareCqlLiteral(version, value);
+                // null
+                value = new Value("null", ListType.getInstance(UTF8Type.instance, frozen).asCQL3Type(), null);
+                compareCqlLiteral(version, value);
+                value = new Value("null", SetType.getInstance(UTF8Type.instance, frozen).asCQL3Type(), null);
+                compareCqlLiteral(version, value);
+                value = new Value("null", MapType.getInstance(UTF8Type.instance, UTF8Type.instance, frozen).asCQL3Type(), null);
+                compareCqlLiteral(version, value);
+            }
         }
     }
 
@@ -343,7 +333,7 @@ public class CQL3TypeLiteralTest
     {
         // test 100 tuples with varying element/key/value types against each supported protocol version
 
-        for (int version = Server.MIN_SUPPORTED_VERSION; version <= Server.CURRENT_VERSION; version++)
+        for (ProtocolVersion version : ProtocolVersion.SUPPORTED)
         {
             for (int n = 0; n < 100; n++)
             {
@@ -358,7 +348,7 @@ public class CQL3TypeLiteralTest
     {
         // test 100 UDTs with varying element/key/value types against each supported protocol version
 
-        for (int version = Server.MIN_SUPPORTED_VERSION; version <= Server.CURRENT_VERSION; version++)
+        for (ProtocolVersion version : ProtocolVersion.SUPPORTED)
         {
             for (int n = 0; n < 100; n++)
             {
@@ -375,7 +365,7 @@ public class CQL3TypeLiteralTest
         // like 'tuple<map, list<user>, tuple, user>' or 'map<tuple<int, text>, set<inet>>' with
         // random types  against each supported protocol version.
 
-        for (int version = Server.MIN_SUPPORTED_VERSION; version <= Server.CURRENT_VERSION; version++)
+        for (ProtocolVersion version : ProtocolVersion.SUPPORTED)
         {
             for (int n = 0; n < 100; n++)
             {
@@ -385,7 +375,7 @@ public class CQL3TypeLiteralTest
         }
     }
 
-    static void compareCqlLiteral(int version, Value value)
+    static void compareCqlLiteral(ProtocolVersion version, Value value)
     {
         ByteBuffer buffer = value.value != null ? value.value.duplicate() : null;
         String msg = "Failed to get expected value for type " + value.cql3Type + " / " + value.cql3Type.getType() + " with protocol-version " + version + " expected:\"" + value.expected + '"';
@@ -393,7 +383,7 @@ public class CQL3TypeLiteralTest
         {
             assertEquals(msg,
                          value.expected,
-                         value.cql3Type.asCQLLiteral(buffer, version));
+                         value.cql3Type.toCQLLiteral(buffer, version));
         }
         catch (RuntimeException e)
         {
@@ -401,7 +391,7 @@ public class CQL3TypeLiteralTest
         }
     }
 
-    static Value randomNested(int version)
+    static Value randomNested(ProtocolVersion version)
     {
         AbstractType type = randomNestedType(2);
 
@@ -429,31 +419,14 @@ public class CQL3TypeLiteralTest
         throw new AssertionError();
     }
 
-    static Value generateCollectionValue(int version, CollectionType collectionType, boolean allowNull)
+    static Value generateCollectionValue(ProtocolVersion version, CollectionType collectionType, boolean allowNull)
     {
         StringBuilder expected = new StringBuilder();
         ByteBuffer buffer;
 
         if (allowNull && randBool(0.05d))
         {
-            // generate 'null' collection
-            if (collectionType.isMultiCell())
-            {
-                switch (collectionType.kind)
-                {
-                    case LIST:
-                        expected.append("[]");
-                        break;
-                    case SET:
-                    case MAP:
-                        expected.append("{}");
-                        break;
-                }
-            }
-            else
-            {
-                expected.append("null");
-            }
+            expected.append("null");
             buffer = null;
         }
         else
@@ -498,7 +471,7 @@ public class CQL3TypeLiteralTest
                 buffers.add(el.value.duplicate());
                 if (expected.length() > 1)
                     expected.append(", ");
-                el.cql3Type.toCQLLiteral(el.value, version, expected);
+                expected.append(el.cql3Type.toCQLLiteral(el.value, version));
 
                 if (collectionType.kind == CollectionType.Kind.MAP)
                 {
@@ -506,7 +479,7 @@ public class CQL3TypeLiteralTest
                     el = generateAnyValue(version, values);
                     buffers.add(el.value.duplicate());
                     expected.append(": ");
-                    el.cql3Type.toCQLLiteral(el.value, version, expected);
+                    expected.append(el.cql3Type.toCQLLiteral(el.value, version));
                 }
             }
             expected.append(bracketClose);
@@ -519,7 +492,7 @@ public class CQL3TypeLiteralTest
     /**
      * Generates a value for any type or type structure.
      */
-    static Value generateAnyValue(int version, CQL3Type type)
+    static Value generateAnyValue(ProtocolVersion version, CQL3Type type)
     {
         if (type instanceof CQL3Type.Native)
             return generateNativeValue(type, false);
@@ -532,7 +505,7 @@ public class CQL3TypeLiteralTest
         throw new AssertionError();
     }
 
-    static Value generateTupleValue(int version, TupleType tupleType, boolean allowNull)
+    static Value generateTupleValue(ProtocolVersion version, TupleType tupleType, boolean allowNull)
     {
         StringBuilder expected = new StringBuilder();
         ByteBuffer buffer;
@@ -577,7 +550,7 @@ public class CQL3TypeLiteralTest
         return new Value(expected.toString(), tupleType.asCQL3Type(), buffer);
     }
 
-    static Value generateUserDefinedValue(int version, UserType userType, boolean allowNull)
+    static Value generateUserDefinedValue(ProtocolVersion version, UserType userType, boolean allowNull)
     {
         StringBuilder expected = new StringBuilder();
         ByteBuffer buffer;
@@ -663,14 +636,14 @@ public class CQL3TypeLiteralTest
     static UserType randomUserType(int level)
     {
         int typeCount = 2 + randInt(5);
-        List<ByteBuffer> names = new ArrayList<>();
+        List<FieldIdentifier> names = new ArrayList<>();
         List<AbstractType<?>> types = new ArrayList<>();
         for (int i = 0; i < typeCount; i++)
         {
-            names.add(UTF8Type.instance.fromString('f' + randLetters(i)));
+            names.add(FieldIdentifier.forQuoted('f' + randLetters(i)));
             types.add(randomNestedType(level));
         }
-        return new UserType("ks", UTF8Type.instance.fromString("u" + randInt(1000000)), names, types);
+        return new UserType("ks", UTF8Type.instance.fromString("u" + randInt(1000000)), names, types, true);
     }
 
     //

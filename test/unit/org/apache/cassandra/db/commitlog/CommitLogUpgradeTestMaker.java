@@ -102,8 +102,8 @@ public class CommitLogUpgradeTestMaker
         CommitLog commitLog = CommitLog.instance;
         System.out.format("\nUsing commit log size: %dmb, compressor: %s, encryption: %s, sync: %s, %s\n",
                           mb(DatabaseDescriptor.getCommitLogSegmentSize()),
-                          commitLog.compressor != null ? commitLog.compressor.getClass().getSimpleName() : "none",
-                          commitLog.encryptionContext.isEnabled() ? "enabled" : "none",
+                          commitLog.configuration.getCompressorName(),
+                          commitLog.configuration.useEncryption(),
                           commitLog.executor.getClass().getSimpleName(),
                           randomSize ? "random size" : "");
         final List<CommitlogExecutor> threads = new ArrayList<>();
@@ -219,7 +219,7 @@ public class CommitLogUpgradeTestMaker
         int dataSize = 0;
         final CommitLog commitLog;
 
-        volatile ReplayPosition rp;
+        volatile CommitLogPosition clsp;
 
         public CommitlogExecutor(CommitLog commitLog)
         {
@@ -248,7 +248,7 @@ public class CommitLogUpgradeTestMaker
                     dataSize += sz;
                 }
 
-                rp = commitLog.add((Mutation)builder.makeMutation());
+                clsp = commitLog.add((Mutation)builder.makeMutation());
                 counter.incrementAndGet();
             }
         }

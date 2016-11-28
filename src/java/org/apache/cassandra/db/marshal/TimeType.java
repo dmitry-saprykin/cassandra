@@ -25,7 +25,7 @@ import org.apache.cassandra.serializers.TimeSerializer;
 import org.apache.cassandra.cql3.CQL3Type;
 import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.MarshalException;
-import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.transport.ProtocolVersion;
 
 /**
  * Nanosecond resolution time values
@@ -38,12 +38,6 @@ public class TimeType extends AbstractType<Long>
     public ByteBuffer fromString(String source) throws MarshalException
     {
         return decompose(TimeSerializer.timeStringToLong(source));
-    }
-
-    @Override
-    public boolean isCompatibleWith(AbstractType<?> previous)
-    {
-        return super.isCompatibleWith(previous);
     }
 
     @Override
@@ -66,7 +60,7 @@ public class TimeType extends AbstractType<Long>
     }
 
     @Override
-    public String toJSONString(ByteBuffer buffer, int protocolVersion)
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
         return '"' + TimeSerializer.instance.toString(TimeSerializer.instance.deserialize(buffer)) + '"';
     }

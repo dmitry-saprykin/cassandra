@@ -28,7 +28,6 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.rows.EncodingStats;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
@@ -44,8 +43,9 @@ abstract class AbstractSSTableSimpleWriter implements Closeable
     protected final File directory;
     protected final CFMetaData metadata;
     protected final PartitionColumns columns;
-    protected SSTableFormat.Type formatType = DatabaseDescriptor.getSSTableFormat();
+    protected SSTableFormat.Type formatType = SSTableFormat.Type.current();
     protected static AtomicInteger generation = new AtomicInteger(0);
+    protected boolean makeRangeAware = false;
 
     protected AbstractSSTableSimpleWriter(File directory, CFMetaData metadata, PartitionColumns columns)
     {
@@ -59,14 +59,25 @@ abstract class AbstractSSTableSimpleWriter implements Closeable
         this.formatType = type;
     }
 
+    protected void setRangeAwareWriting(boolean makeRangeAware)
+    {
+        this.makeRangeAware = makeRangeAware;
+    }
+
+
     protected SSTableTxnWriter createWriter()
     {
+        SerializationHeader header = new SerializationHeader(true, metadata, columns, EncodingStats.NO_STATS);
+
+        if (makeRangeAware)
+            return SSTableTxnWriter.createRangeAware(metadata, 0,  ActiveRepairService.UNREPAIRED_SSTABLE, formatType, 0, header);
+
         return SSTableTxnWriter.create(metadata,
                                        createDescriptor(directory, metadata.ksName, metadata.cfName, formatType),
                                        0,
                                        ActiveRepairService.UNREPAIRED_SSTABLE,
                                        0,
-                                       new SerializationHeader(true, metadata, columns, EncodingStats.NO_STATS),
+                                       header,
                                        Collections.emptySet());
     }
 

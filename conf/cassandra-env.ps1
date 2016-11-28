@@ -133,7 +133,7 @@ Function CalculateHeapSizes
         return
     }
 
-    if (($env:MAX_HEAP_SIZE -and !$env:HEAP_NEWSIZE) -or (!$env:MAX_HEAP_SIZE -and $env:HEAP_NEWSIZE))
+    if ((($env:MAX_HEAP_SIZE -and !$env:HEAP_NEWSIZE) -or (!$env:MAX_HEAP_SIZE -and $env:HEAP_NEWSIZE)) -and ($using_cms -eq $true))
     {
         echo "Please set or unset MAX_HEAP_SIZE and HEAP_NEWSIZE in pairs.  Aborting startup."
         exit 1
@@ -281,7 +281,14 @@ Function ParseJVMInfo
     }
 
     $pa = $sa[1].Split("_")
-    $env:JVM_PATCH_VERSION=$pa[1]
+    $subVersion = $pa[1]
+    # Deal with -b (build) versions
+    if ($subVersion -contains '-')
+    {
+        $patchAndBuild = $subVersion.Split("-")
+        $subVersion = $patchAndBuild[0]
+    }
+    $env:JVM_PATCH_VERSION = $subVersion
 }
 
 #-----------------------------------------------------------------------------
@@ -327,14 +334,8 @@ Function SetCassandraEnvironment
     # times. If in doubt, and if you do not particularly want to tweak, go
     # 100 MB per physical CPU core.
 
-    #$env:MAX_HEAP_SIZE="4096M"
-    #$env:HEAP_NEWSIZE="800M"
-    CalculateHeapSizes
-
-    ParseJVMInfo
-
     #GC log path has to be defined here since it needs to find CASSANDRA_HOME
-    $env:JVM_OPTS="$env:JVM_OPTS -Xloggc:$env:CASSANDRA_HOME/logs/gc.log"
+    $env:JVM_OPTS="$env:JVM_OPTS -Xloggc:""$env:CASSANDRA_HOME/logs/gc.log"""
 
     # Read user-defined JVM options from jvm.options file
     $content = Get-Content "$env:CASSANDRA_CONF\jvm.options"
@@ -351,6 +352,12 @@ Function SetCassandraEnvironment
     $defined_xmx = $env:JVM_OPTS -like '*Xmx*'
     $defined_xms = $env:JVM_OPTS -like '*Xms*'
     $using_cms = $env:JVM_OPTS -like '*UseConcMarkSweepGC*'
+
+    #$env:MAX_HEAP_SIZE="4096M"
+    #$env:HEAP_NEWSIZE="800M"
+    CalculateHeapSizes
+
+    ParseJVMInfo
 
     # We only set -Xms and -Xmx if they were not defined on jvm.options file
     # If defined, both Xmx and Xms should be defined together.
@@ -406,6 +413,9 @@ Function SetCassandraEnvironment
         }
     }
 
+    # provides hints to the JIT compiler
+    $env:JVM_OPTS = "$env:JVM_OPTS -XX:CompileCommandFile=$env:CASSANDRA_CONF\hotspot_compiler"
+
     # add the jamm javaagent
     if (($env:JVM_VENDOR -ne "OpenJDK") -or ($env:JVM_VERSION.CompareTo("1.6.0") -eq 1) -or
         (($env:JVM_VERSION -eq "1.6.0") -and ($env:JVM_PATCH_VERSION.CompareTo("22") -eq 1)))
@@ -413,7 +423,14 @@ Function SetCassandraEnvironment
         $env:JVM_OPTS = "$env:JVM_OPTS -javaagent:""$env:CASSANDRA_HOME\lib\jamm-0.3.0.jar"""
     }
 
-    if ($env:JVM_VERSION.CompareTo("1.8.0_40") -eq -1)
+    # set jvm HeapDumpPath with CASSANDRA_HEAPDUMP_DIR
+    if ($env:CASSANDRA_HEAPDUMP_DIR)
+    {
+        $unixTimestamp = [int64](([datetime]::UtcNow)-(get-date "1/1/1970")).TotalSeconds
+        $env:JVM_OPTS="$env:JVM_OPTS -XX:HeapDumpPath=$env:CASSANDRA_HEAPDUMP_DIR\cassandra-$unixTimestamp-pid$pid.hprof"
+    }
+
+    if ($env:JVM_VERSION.CompareTo("1.8.0") -eq -1 -or [convert]::ToInt32($env:JVM_PATCH_VERSION) -lt 40)
     {
         echo "Cassandra 3.0 and later require Java 8u40 or later."
         exit
@@ -446,10 +463,37 @@ Function SetCassandraEnvironment
     # with authentication and ssl enabled. See https://wiki.apache.org/cassandra/JmxSecurity
     #
     #$env:JVM_OPTS="$env:JVM_OPTS -Dcom.sun.management.jmxremote.port=$JMX_PORT"
-    #$env:JVM_OPTS="$env:JVM_OPTS -Dcom.sun.management.jmxremote.ssl=false"
+    #$env:JVM_OPTS="$env:JVM_OPTS -Dcom.sun.management.jmxremote.rmi.port=$JMX_PORT"
+    #
+    # JMX SSL options
+    #$env:JVM_OPTS="$env:JVM_OPTS -Dcom.sun.management.jmxremote.ssl=true"
+    #$env:JVM_OPTS="$env:JVM_OPTS -Dcom.sun.management.jmxremote.ssl.need.client.auth=true"
+    #$env:JVM_OPTS="$env:JVM_OPTS -Dcom.sun.management.jmxremote.ssl.enabled.protocols=<enabled-protocols>"
+    #$env:JVM_OPTS="$env:JVM_OPTS -Dcom.sun.management.jmxremote.ssl.enabled.cipher.suites=<enabled-cipher-suites>"
+    #$env:JVM_OPTS="$env:JVM_OPTS -Djavax.net.ssl.keyStore=C:/keystore"
+    #$env:JVM_OPTS="$env:JVM_OPTS -Djavax.net.ssl.keyStorePassword=<keystore-password>"
+    #$env:JVM_OPTS="$env:JVM_OPTS -Djavax.net.ssl.trustStore=C:/truststore"
+    #$env:JVM_OPTS="$env:JVM_OPTS -Djavax.net.ssl.trustStorePassword=<truststore-password>"
+    #
+    # JMX auth options
     #$env:JVM_OPTS="$env:JVM_OPTS -Dcom.sun.management.jmxremote.authenticate=true"
+    ## Basic file based authn & authz
     #$env:JVM_OPTS="$env:JVM_OPTS -Dcom.sun.management.jmxremote.password.file=C:/jmxremote.password"
-    $env:JVM_OPTS="$env:JVM_OPTS -Dcassandra.jmx.local.port=$JMX_PORT -XX:+DisableExplicitGC"
+    #$env:JVM_OPTS="$env:JVM_OPTS -Dcom.sun.management.jmxremote.access.file=C:/jmxremote.access"
+
+    ## Custom auth settings which can be used as alternatives to JMX's out of the box auth utilities.
+    ## JAAS login modules can be used for authentication by uncommenting these two properties.
+    ## Cassandra ships with a LoginModule implementation - org.apache.cassandra.auth.CassandraLoginModule -
+    ## which delegates to the IAuthenticator configured in cassandra.yaml
+    #$env:JVM_OPTS="$env:JVM_OPTS -Dcassandra.jmx.remote.login.config=CassandraLogin"
+    #$env:JVM_OPTS="$env:JVM_OPTS -Djava.security.auth.login.config=C:/cassandra-jaas.config"
+
+    ## Cassandra also ships with a helper for delegating JMX authz calls to the configured IAuthorizer,
+    ## uncomment this to use it. Requires one of the two authentication options to be enabled
+    #$env:JVM_OPTS="$env:JVM_OPTS -Dcassandra.jmx.authorizer=org.apache.cassandra.auth.jmx.AuthorizationProxy"
+
+    # Default JMX setup, bound to local loopback address only
+    $env:JVM_OPTS="$env:JVM_OPTS -Dcassandra.jmx.local.port=$JMX_PORT"
 
     $env:JVM_OPTS="$env:JVM_OPTS $env:JVM_EXTRA_OPTS"
 }

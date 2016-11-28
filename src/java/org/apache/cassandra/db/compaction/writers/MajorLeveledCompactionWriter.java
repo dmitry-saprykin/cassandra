@@ -17,7 +17,6 @@
  */
 package org.apache.cassandra.db.compaction.writers;
 
-import java.util.List;
 import java.util.Set;
 
 import org.apache.cassandra.db.ColumnFamilyStore;
@@ -42,6 +41,7 @@ public class MajorLeveledCompactionWriter extends CompactionAwareWriter
     private int sstablesWritten = 0;
     private final long keysPerSSTable;
     private Directories.DataDirectory sstableDirectory;
+    private final int levelFanoutSize;
 
     public MajorLeveledCompactionWriter(ColumnFamilyStore cfs,
                                         Directories directories,
@@ -49,10 +49,10 @@ public class MajorLeveledCompactionWriter extends CompactionAwareWriter
                                         Set<SSTableReader> nonExpiredSSTables,
                                         long maxSSTableSize)
     {
-        this(cfs, directories, txn, nonExpiredSSTables, maxSSTableSize, false, false);
+        this(cfs, directories, txn, nonExpiredSSTables, maxSSTableSize, false);
     }
 
-    @SuppressWarnings("resource")
+    @Deprecated
     public MajorLeveledCompactionWriter(ColumnFamilyStore cfs,
                                         Directories directories,
                                         LifecycleTransaction txn,
@@ -61,8 +61,20 @@ public class MajorLeveledCompactionWriter extends CompactionAwareWriter
                                         boolean offline,
                                         boolean keepOriginals)
     {
-        super(cfs, directories, txn, nonExpiredSSTables, offline, keepOriginals);
+        this(cfs, directories, txn, nonExpiredSSTables, maxSSTableSize, keepOriginals);
+    }
+
+    @SuppressWarnings("resource")
+    public MajorLeveledCompactionWriter(ColumnFamilyStore cfs,
+                                        Directories directories,
+                                        LifecycleTransaction txn,
+                                        Set<SSTableReader> nonExpiredSSTables,
+                                        long maxSSTableSize,
+                                        boolean keepOriginals)
+    {
+        super(cfs, directories, txn, nonExpiredSSTables, keepOriginals);
         this.maxSSTableSize = maxSSTableSize;
+        this.levelFanoutSize = cfs.getLevelFanoutSize();
         long estimatedSSTables = Math.max(1, SSTableReader.getTotalBytes(nonExpiredSSTables) / maxSSTableSize);
         keysPerSSTable = estimatedTotalKeys / estimatedSSTables;
     }
@@ -71,13 +83,13 @@ public class MajorLeveledCompactionWriter extends CompactionAwareWriter
     @SuppressWarnings("resource")
     public boolean realAppend(UnfilteredRowIterator partition)
     {
-        long posBefore = sstableWriter.currentWriter().getOnDiskFilePointer();
         RowIndexEntry rie = sstableWriter.append(partition);
-        totalWrittenInLevel += sstableWriter.currentWriter().getOnDiskFilePointer() - posBefore;
         partitionsWritten++;
-        if (sstableWriter.currentWriter().getOnDiskFilePointer() > maxSSTableSize)
+        long totalWrittenInCurrentWriter = sstableWriter.currentWriter().getEstimatedOnDiskBytesWritten();
+        if (totalWrittenInCurrentWriter > maxSSTableSize)
         {
-            if (totalWrittenInLevel > LeveledManifest.maxBytesForLevel(currentLevel, maxSSTableSize))
+            totalWrittenInLevel += totalWrittenInCurrentWriter;
+            if (totalWrittenInLevel > LeveledManifest.maxBytesForLevel(currentLevel, levelFanoutSize, maxSSTableSize))
             {
                 totalWrittenInLevel = 0;
                 currentLevel++;
@@ -104,11 +116,5 @@ public class MajorLeveledCompactionWriter extends CompactionAwareWriter
         partitionsWritten = 0;
         sstablesWritten = 0;
 
-    }
-
-    @Override
-    public List<SSTableReader> finish(long repairedAt)
-    {
-        return sstableWriter.setRepairedAt(repairedAt).finish();
     }
 }

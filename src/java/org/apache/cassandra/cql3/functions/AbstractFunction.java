@@ -20,7 +20,6 @@ package org.apache.cassandra.cql3.functions;
 import java.util.List;
 
 import com.google.common.base.Objects;
-import com.google.common.collect.ImmutableSet;
 
 import org.apache.cassandra.cql3.AssignmentTestable;
 import org.apache.cassandra.cql3.ColumnSpecification;
@@ -70,9 +69,9 @@ public abstract class AbstractFunction implements Function
             && Objects.equal(this.returnType, that.returnType);
     }
 
-    public Iterable<Function> getFunctions()
+    public void addFunctionsTo(List<Function> functions)
     {
-        return ImmutableSet.<Function>of(this);
+        functions.add(this);
     }
 
     public boolean hasReferenceTo(Function function)
@@ -91,7 +90,7 @@ public abstract class AbstractFunction implements Function
         // We should ignore the fact that the receiver type is frozen in our comparison as functions do not support
         // frozen types for return type
         AbstractType<?> returnType = returnType();
-        if (receiver.type.isFrozenCollection())
+        if (receiver.type.isFreezable() && !receiver.type.isMultiCell())
             returnType = returnType.freeze();
 
         if (receiver.type.equals(returnType))

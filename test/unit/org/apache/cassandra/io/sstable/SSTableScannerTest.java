@@ -24,6 +24,8 @@ import java.util.Collection;
 import java.util.List;
 
 import com.google.common.collect.Iterables;
+import com.google.common.util.concurrent.RateLimiter;
+
 import org.junit.BeforeClass;
 import org.junit.Test;
 
@@ -217,7 +219,7 @@ public class SSTableScannerTest
         SSTableReader sstable = store.getLiveSSTables().iterator().next();
 
         // full range scan
-        ISSTableScanner scanner = sstable.getScanner(null);
+        ISSTableScanner scanner = sstable.getScanner();
         for (int i = 2; i < 10; i++)
             assertEquals(toKey(i), new String(scanner.next().partitionKey().getKey().array()));
 
@@ -323,7 +325,7 @@ public class SSTableScannerTest
         SSTableReader sstable = store.getLiveSSTables().iterator().next();
 
         // full range scan
-        ISSTableScanner fullScanner = sstable.getScanner(null);
+        ISSTableScanner fullScanner = sstable.getScanner();
         assertScanContainsRanges(fullScanner,
                                  2, 9,
                                  102, 109,
@@ -333,8 +335,7 @@ public class SSTableScannerTest
         // scan all three ranges separately
         ISSTableScanner scanner = sstable.getScanner(makeRanges(1, 9,
                                                                    101, 109,
-                                                                   201, 209),
-                                                        null);
+                                                                   201, 209));
         assertScanContainsRanges(scanner,
                                  2, 9,
                                  102, 109,
@@ -342,16 +343,14 @@ public class SSTableScannerTest
 
         // skip the first range
         scanner = sstable.getScanner(makeRanges(101, 109,
-                                                201, 209),
-                                     null);
+                                                201, 209));
         assertScanContainsRanges(scanner,
                                  102, 109,
                                  202, 209);
 
         // skip the second range
         scanner = sstable.getScanner(makeRanges(1, 9,
-                                                201, 209),
-                                     null);
+                                                201, 209));
         assertScanContainsRanges(scanner,
                                  2, 9,
                                  202, 209);
@@ -359,8 +358,7 @@ public class SSTableScannerTest
 
         // skip the last range
         scanner = sstable.getScanner(makeRanges(1, 9,
-                                                101, 109),
-                                     null);
+                                                101, 109));
         assertScanContainsRanges(scanner,
                                  2, 9,
                                  102, 109);
@@ -368,8 +366,7 @@ public class SSTableScannerTest
         // the first scanned range stops short of the actual data in the first range
         scanner = sstable.getScanner(makeRanges(1, 5,
                                                 101, 109,
-                                                201, 209),
-                                     null);
+                                                201, 209));
         assertScanContainsRanges(scanner,
                                  2, 5,
                                  102, 109,
@@ -378,8 +375,7 @@ public class SSTableScannerTest
         // the first scanned range requests data beyond actual data in the first range
         scanner = sstable.getScanner(makeRanges(1, 20,
                                                 101, 109,
-                                                201, 209),
-                                     null);
+                                                201, 209));
         assertScanContainsRanges(scanner,
                                  2, 9,
                                  102, 109,
@@ -389,8 +385,7 @@ public class SSTableScannerTest
         // the middle scan range splits the outside two data ranges
         scanner = sstable.getScanner(makeRanges(1, 5,
                                                 6, 205,
-                                                206, 209),
-                                     null);
+                                                206, 209));
         assertScanContainsRanges(scanner,
                                  2, 5,
                                  7, 9,
@@ -404,8 +399,7 @@ public class SSTableScannerTest
                                                 101, 109,
                                                 150, 159,
                                                 201, 209,
-                                                1000, 1001),
-                                     null);
+                                                1000, 1001));
         assertScanContainsRanges(scanner,
                                  3, 9,
                                  102, 109,
@@ -417,8 +411,7 @@ public class SSTableScannerTest
                                                 201, 209,
                                                 101, 109,
                                                 1000, 1001,
-                                                150, 159),
-                                     null);
+                                                150, 159));
         assertScanContainsRanges(scanner,
                                  2, 9,
                                  102, 109,
@@ -427,12 +420,11 @@ public class SSTableScannerTest
         // only empty ranges
         scanner = sstable.getScanner(makeRanges(0, 1,
                                                 150, 159,
-                                                250, 259),
-                                     null);
+                                                250, 259));
         assertFalse(scanner.hasNext());
 
         // no ranges is equivalent to a full scan
-        scanner = sstable.getScanner(new ArrayList<Range<Token>>(), null);
+        scanner = sstable.getScanner(new ArrayList<Range<Token>>());
         assertFalse(scanner.hasNext());
     }
 
@@ -453,12 +445,12 @@ public class SSTableScannerTest
         SSTableReader sstable = store.getLiveSSTables().iterator().next();
 
         // full range scan
-        ISSTableScanner fullScanner = sstable.getScanner(null);
+        ISSTableScanner fullScanner = sstable.getScanner();
         assertScanContainsRanges(fullScanner, 205, 205);
 
         // scan three ranges separately
         ISSTableScanner scanner = sstable.getScanner(makeRanges(101, 109,
-                                                                   201, 209), null);
+                                                                   201, 209));
 
         // this will currently fail
         assertScanContainsRanges(scanner, 205, 205);

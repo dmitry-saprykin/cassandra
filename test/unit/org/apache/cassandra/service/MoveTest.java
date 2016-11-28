@@ -82,8 +82,9 @@ public class MoveTest
      * So instead of extending SchemaLoader, we call it's method below.
      */
     @BeforeClass
-    public static void setup() throws ConfigurationException
+    public static void setup() throws Exception
     {
+        DatabaseDescriptor.daemonInitialization();
         oldPartitioner = StorageService.instance.setPartitionerUnsafe(partitioner);
         SchemaLoader.loadSchema();
         SchemaLoader.schemaDefinition("MoveTest");
@@ -105,7 +106,7 @@ public class MoveTest
         StorageService.instance.getTokenMetadata().clearUnsafe();
     }
 
-    private static void addNetworkTopologyKeyspace(String keyspaceName, Integer... replicas) throws ConfigurationException
+    private static void addNetworkTopologyKeyspace(String keyspaceName, Integer... replicas) throws Exception
     {
 
         DatabaseDescriptor.setEndpointSnitch(new AbstractNetworkTopologySnitch()
@@ -138,6 +139,11 @@ public class MoveTest
                 return Integer.parseInt(str.substring(index + 1).trim());
             }
         });
+
+        final TokenMetadata tmd = StorageService.instance.getTokenMetadata();
+                tmd.clearUnsafe();
+                tmd.updateHostId(UUID.randomUUID(), InetAddress.getByName("127.0.0.1"));
+                tmd.updateHostId(UUID.randomUUID(), InetAddress.getByName("127.0.0.2"));
 
         KeyspaceMetadata keyspace =  KeyspaceMetadata.create(keyspaceName,
                                                              KeyspaceParams.nts(configOptions(replicas)),
@@ -502,7 +508,7 @@ public class MoveTest
     private void assertPendingRanges(TokenMetadata tmd, Map<Range<Token>,  Collection<InetAddress>> pendingRanges, String keyspaceName) throws ConfigurationException
     {
         boolean keyspaceFound = false;
-        for (String nonSystemKeyspaceName : Schema.instance.getNonSystemKeyspaces())
+        for (String nonSystemKeyspaceName : Schema.instance.getNonLocalStrategyKeyspaces())
         {
             if(!keyspaceName.equals(nonSystemKeyspaceName))
                 continue;
@@ -571,7 +577,7 @@ public class MoveTest
         assertTrue(tmd.isMoving(hosts.get(MOVING_NODE)));
 
         AbstractReplicationStrategy strategy;
-        for (String keyspaceName : Schema.instance.getNonSystemKeyspaces())
+        for (String keyspaceName : Schema.instance.getNonLocalStrategyKeyspaces())
         {
             strategy = getStrategy(keyspaceName, tmd);
             if(strategy instanceof NetworkTopologyStrategy)

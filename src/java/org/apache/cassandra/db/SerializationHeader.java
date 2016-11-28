@@ -21,15 +21,11 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.*;
 
-import com.google.common.collect.ImmutableList;
-import com.google.common.collect.Lists;
-
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.db.marshal.AbstractType;
-import org.apache.cassandra.db.marshal.BytesType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.marshal.TypeParser;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
@@ -70,23 +66,9 @@ public class SerializationHeader
         this.typeMap = typeMap;
     }
 
-    public static SerializationHeader forKeyCache(CFMetaData metadata)
+    public static SerializationHeader makeWithoutStats(CFMetaData metadata)
     {
-        // We don't save type information in the key cache (we could change
-        // that but it's easier right now), so instead we simply use BytesType
-        // for both serialization and deserialization. Note that we also only
-        // serializer clustering prefixes in the key cache, so only the clusteringTypes
-        // really matter.
-        int size = metadata.clusteringColumns().size();
-        List<AbstractType<?>> clusteringTypes = new ArrayList<>(size);
-        for (int i = 0; i < size; i++)
-            clusteringTypes.add(BytesType.instance);
-        return new SerializationHeader(false,
-                                       BytesType.instance,
-                                       clusteringTypes,
-                                       PartitionColumns.NONE,
-                                       EncodingStats.NO_STATS,
-                                       Collections.<ByteBuffer, AbstractType<?>>emptyMap());
+        return new SerializationHeader(true, metadata, metadata.partitionColumns(), EncodingStats.NO_STATS);
     }
 
     public static SerializationHeader make(CFMetaData metadata, Collection<SSTableReader> sstables)
@@ -123,15 +105,10 @@ public class SerializationHeader
     {
         this(isForSSTable,
              metadata.getKeyValidator(),
-             typesOf(metadata.clusteringColumns()),
+             metadata.comparator.subtypes(),
              columns,
              stats,
              null);
-    }
-
-    private static List<AbstractType<?>> typesOf(List<ColumnDefinition> columns)
-    {
-        return ImmutableList.copyOf(Lists.transform(columns, column -> column.type));
     }
 
     public PartitionColumns columns()
@@ -326,7 +303,8 @@ public class SerializationHeader
                     // If we don't find the definition, it could be we have data for a dropped column, and we shouldn't
                     // fail deserialization because of that. So we grab a "fake" ColumnDefinition that ensure proper
                     // deserialization. The column will be ignore later on anyway.
-                    column = metadata.getDroppedColumnDefinition(name);
+                    boolean isStatic = staticColumns.containsKey(name);
+                    column = metadata.getDroppedColumnDefinition(name, isStatic);
                     if (column == null)
                         throw new RuntimeException("Unknown column " + UTF8Type.instance.getString(name) + " during deserialization");
                 }
@@ -362,7 +340,7 @@ public class SerializationHeader
                                  keyType, clusteringTypes, staticColumns, regularColumns, stats);
         }
 
-        public AbstractType<?> getKetType()
+        public AbstractType<?> getKeyType()
         {
             return keyType;
         }
@@ -413,7 +391,7 @@ public class SerializationHeader
             EncodingStats stats = EncodingStats.serializer.deserialize(in);
 
             AbstractType<?> keyType = metadata.getKeyValidator();
-            List<AbstractType<?>> clusteringTypes = typesOf(metadata.clusteringColumns());
+            List<AbstractType<?>> clusteringTypes = metadata.comparator.subtypes();
 
             Columns statics, regulars;
             if (selection == null)

@@ -41,9 +41,9 @@ public class MemoryMappedSegment extends CommitLogSegment
      *
      * @param commitLog the commit log it will be used with.
      */
-    MemoryMappedSegment(CommitLog commitLog)
+    MemoryMappedSegment(CommitLog commitLog, AbstractCommitLogSegmentManager manager)
     {
-        super(commitLog);
+        super(commitLog, manager);
         // mark the initial sync marker as uninitialised
         int firstSync = buffer.position();
         buffer.putInt(firstSync + 0, 0);
@@ -66,7 +66,7 @@ public class MemoryMappedSegment extends CommitLogSegment
             {
                 throw new FSWriteError(e, logFile);
             }
-            commitLog.allocator.addSize(DatabaseDescriptor.getCommitLogSegmentSize());
+            manager.addSize(DatabaseDescriptor.getCommitLogSegmentSize());
 
             return channel.map(FileChannel.MapMode.READ_WRITE, 0, DatabaseDescriptor.getCommitLogSegmentSize());
         }
@@ -91,7 +91,8 @@ public class MemoryMappedSegment extends CommitLogSegment
         // we don't chain the crcs here to ensure this method is idempotent if it fails
         writeSyncMarker(buffer, startMarker, startMarker, nextMarker);
 
-        try {
+        try
+        {
             SyncUtil.force((MappedByteBuffer) buffer);
         }
         catch (Exception e) // MappedByteBuffer.force() does not declare IOException but can actually throw it
@@ -110,7 +111,7 @@ public class MemoryMappedSegment extends CommitLogSegment
     @Override
     protected void internalClose()
     {
-        if (FileUtils.isCleanerAvailable())
+        if (FileUtils.isCleanerAvailable)
             FileUtils.clean(buffer);
         super.internalClose();
     }

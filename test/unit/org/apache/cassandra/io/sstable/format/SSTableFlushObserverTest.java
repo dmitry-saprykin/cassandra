@@ -52,10 +52,18 @@ import com.google.common.collect.ArrayListMultimap;
 import com.google.common.collect.Multimap;
 
 import junit.framework.Assert;
+
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 public class SSTableFlushObserverTest
 {
+    @BeforeClass
+    public static void initDD()
+    {
+        DatabaseDescriptor.daemonInitialization();
+    }
+
     private static final String KS_NAME = "test";
     private static final String CF_NAME = "flush_observer";
 
@@ -79,7 +87,7 @@ public class SSTableFlushObserverTest
         if (!directory.exists() && !directory.mkdirs())
             throw new FSWriteError(new IOException("failed to create tmp directory"), directory.getAbsolutePath());
 
-        SSTableFormat.Type sstableFormat = DatabaseDescriptor.getSSTableFormat();
+        SSTableFormat.Type sstableFormat = SSTableFormat.Type.current();
 
         BigTableWriter writer = new BigTableWriter(new Descriptor(sstableFormat.info.getLatestVersion().version,
                                                                   directory,
@@ -100,23 +108,23 @@ public class SSTableFlushObserverTest
             final long now = System.currentTimeMillis();
 
             ByteBuffer key = UTF8Type.instance.fromString("key1");
-            expected.putAll(key, Arrays.asList(BufferCell.live(cfm, getColumn(cfm, "first_name"), now,UTF8Type.instance.fromString("jack")),
-                                               BufferCell.live(cfm, getColumn(cfm, "age"), now, Int32Type.instance.decompose(27)),
-                                               BufferCell.live(cfm, getColumn(cfm, "height"), now, LongType.instance.decompose(183L))));
+            expected.putAll(key, Arrays.asList(BufferCell.live(getColumn(cfm, "age"), now, Int32Type.instance.decompose(27)),
+                                               BufferCell.live(getColumn(cfm, "first_name"), now,UTF8Type.instance.fromString("jack")),
+                                               BufferCell.live(getColumn(cfm, "height"), now, LongType.instance.decompose(183L))));
 
             writer.append(new RowIterator(cfm, key.duplicate(), Collections.singletonList(buildRow(expected.get(key)))));
 
             key = UTF8Type.instance.fromString("key2");
-            expected.putAll(key, Arrays.asList(BufferCell.live(cfm, getColumn(cfm, "first_name"), now,UTF8Type.instance.fromString("jim")),
-                                               BufferCell.live(cfm, getColumn(cfm, "age"), now, Int32Type.instance.decompose(30)),
-                                               BufferCell.live(cfm, getColumn(cfm, "height"), now, LongType.instance.decompose(180L))));
+            expected.putAll(key, Arrays.asList(BufferCell.live(getColumn(cfm, "age"), now, Int32Type.instance.decompose(30)),
+                                               BufferCell.live(getColumn(cfm, "first_name"), now,UTF8Type.instance.fromString("jim")),
+                                               BufferCell.live(getColumn(cfm, "height"), now, LongType.instance.decompose(180L))));
 
             writer.append(new RowIterator(cfm, key, Collections.singletonList(buildRow(expected.get(key)))));
 
             key = UTF8Type.instance.fromString("key3");
-            expected.putAll(key, Arrays.asList(BufferCell.live(cfm, getColumn(cfm, "first_name"), now,UTF8Type.instance.fromString("ken")),
-                                               BufferCell.live(cfm, getColumn(cfm, "age"), now, Int32Type.instance.decompose(30)),
-                                               BufferCell.live(cfm, getColumn(cfm, "height"), now, LongType.instance.decompose(178L))));
+            expected.putAll(key, Arrays.asList(BufferCell.live(getColumn(cfm, "age"), now, Int32Type.instance.decompose(30)),
+                                               BufferCell.live(getColumn(cfm, "first_name"), now,UTF8Type.instance.fromString("ken")),
+                                               BufferCell.live(getColumn(cfm, "height"), now, LongType.instance.decompose(178L))));
 
             writer.append(new RowIterator(cfm, key, Collections.singletonList(buildRow(expected.get(key)))));
 

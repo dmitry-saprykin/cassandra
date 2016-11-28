@@ -19,7 +19,9 @@ package org.apache.cassandra;
  *
  */
 
+import java.io.Closeable;
 import java.io.EOFException;
+import java.io.IOError;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
@@ -34,17 +36,25 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.Iterators;
 import org.apache.commons.lang3.StringUtils;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.ColumnIdentifier;
+
 import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.Directories.DataDirectory;
 import org.apache.cassandra.db.compaction.AbstractCompactionTask;
 import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.AsciiType;
+import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.partitions.*;
 import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.dht.IPartitioner;
+
 import org.apache.cassandra.dht.RandomPartitioner.BigIntegerToken;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
@@ -54,10 +64,11 @@ import org.apache.cassandra.gms.VersionedValue;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.service.pager.PagingState;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.CounterId;
 import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.utils.concurrent.OpOrder;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
@@ -65,7 +76,9 @@ import static org.junit.Assert.assertTrue;
 
 public class Util
 {
-    private static List<UUID> hostIdPool = new ArrayList<UUID>();
+    private static final Logger logger = LoggerFactory.getLogger(Util.class);
+
+    private static List<UUID> hostIdPool = new ArrayList<>();
 
     public static IPartitioner testPartitioner()
     {
@@ -228,8 +241,9 @@ public class Util
     public static void compact(ColumnFamilyStore cfs, Collection<SSTableReader> sstables)
     {
         int gcBefore = cfs.gcBefore(FBUtilities.nowInSeconds());
-        AbstractCompactionTask task = cfs.getCompactionStrategyManager().getUserDefinedTask(sstables, gcBefore);
-        task.execute(null);
+        List<AbstractCompactionTask> tasks = cfs.getCompactionStrategyManager().getUserDefinedTasks(sstables, gcBefore);
+        for (AbstractCompactionTask task : tasks)
+            task.execute(null);
     }
 
     public static void expectEOF(Callable<?> callable)
@@ -458,19 +472,41 @@ public class Util
     public static boolean equal(UnfilteredRowIterator a, UnfilteredRowIterator b)
     {
         return Objects.equals(a.columns(), b.columns())
-            && Objects.equals(a.metadata(), b.metadata())
+            && Objects.equals(a.stats(), b.stats())
+            && sameContent(a, b);
+    }
+
+    // Test equality of the iterators, but without caring too much about the "metadata" of said iterator. This is often
+    // what we want in tests. In particular, the columns() reported by the iterators will sometimes differ because they
+    // are a superset of what the iterator actually contains, and depending on the method used to get each iterator
+    // tested, one may include a defined column the other don't while there is not actual content for that column.
+    public static boolean sameContent(UnfilteredRowIterator a, UnfilteredRowIterator b)
+    {
+        return Objects.equals(a.metadata(), b.metadata())
             && Objects.equals(a.isReverseOrder(), b.isReverseOrder())
             && Objects.equals(a.partitionKey(), b.partitionKey())
             && Objects.equals(a.partitionLevelDeletion(), b.partitionLevelDeletion())
             && Objects.equals(a.staticRow(), b.staticRow())
-            && Objects.equals(a.stats(), b.stats())
             && Iterators.elementsEqual(a, b);
+    }
+
+    public static boolean sameContent(Mutation a, Mutation b)
+    {
+        if (!a.key().equals(b.key()) || !a.getColumnFamilyIds().equals(b.getColumnFamilyIds()))
+            return false;
+
+        for (UUID cfId : a.getColumnFamilyIds())
+        {
+            if (!sameContent(a.getPartitionUpdate(cfId).unfilteredIterator(), b.getPartitionUpdate(cfId).unfilteredIterator()))
+                return false;
+        }
+        return true;
     }
 
     // moved & refactored from KeyspaceTest in < 3.0
     public static void assertColumns(Row row, String... expectedColumnNames)
     {
-        Iterator<Cell> cells = row == null ? Iterators.<Cell>emptyIterator() : row.cells().iterator();
+        Iterator<Cell> cells = row == null ? Collections.emptyIterator() : row.cells().iterator();
         String[] actual = Iterators.toArray(Iterators.transform(cells, new Function<Cell, String>()
         {
             public String apply(Cell cell)
@@ -529,8 +565,8 @@ public class Util
 
     public static void spinAssertEquals(Object expected, Supplier<Object> s, int timeoutInSeconds)
     {
-        long now = System.currentTimeMillis();
-        while (System.currentTimeMillis() - now < now + (1000 * timeoutInSeconds))
+        long start = System.currentTimeMillis();
+        while (System.currentTimeMillis() < start + (1000 * timeoutInSeconds))
         {
             if (s.get().equals(expected))
                 break;
@@ -542,6 +578,63 @@ public class Util
     public static void joinThread(Thread thread) throws InterruptedException
     {
         thread.join(10000);
+    }
+
+    public static AssertionError runCatchingAssertionError(Runnable test)
+    {
+        try
+        {
+            test.run();
+            return null;
+        }
+        catch (AssertionError e)
+        {
+            return e;
+        }
+    }
+
+    /**
+     * Wrapper function used to run a test that can sometimes flake for uncontrollable reasons.
+     *
+     * If the given test fails on the first run, it is executed the given number of times again, expecting all secondary
+     * runs to succeed. If they do, the failure is understood as a flake and the test is treated as passing.
+     *
+     * Do not use this if the test is deterministic and its success is not influenced by external factors (such as time,
+     * selection of random seed, network failures, etc.). If the test can be made independent of such factors, it is
+     * probably preferable to do so rather than use this method.
+     *
+     * @param test The test to run.
+     * @param rerunsOnFailure How many times to re-run it if it fails. All reruns must pass.
+     * @param message Message to send to System.err on initial failure.
+     */
+    public static void flakyTest(Runnable test, int rerunsOnFailure, String message)
+    {
+        AssertionError e = runCatchingAssertionError(test);
+        if (e == null)
+            return;     // success
+
+        logger.info("Test failed. {}", message, e);
+        logger.info("Re-running {} times to verify it isn't failing more often than it should.", rerunsOnFailure);
+
+        int rerunsFailed = 0;
+        for (int i = 0; i < rerunsOnFailure; ++i)
+        {
+            AssertionError t = runCatchingAssertionError(test);
+            if (t != null)
+            {
+                ++rerunsFailed;
+                e.addSuppressed(t);
+
+                logger.debug("Test failed again, total num failures: {}", rerunsFailed, t);
+            }
+        }
+        if (rerunsFailed > 0)
+        {
+            logger.error("Test failed in {} of the {} reruns.", rerunsFailed, rerunsOnFailure);
+            throw e;
+        }
+
+        logger.info("All reruns succeeded. Failure treated as flake.");
     }
 
     // for use with Optional in tests, can be used as an argument to orElseThrow
@@ -603,4 +696,40 @@ public class Util
             return queryStorage(cfs, controller);
         }
     }
+
+    public static Closeable markDirectoriesUnwriteable(ColumnFamilyStore cfs)
+    {
+        try
+        {
+            for ( ; ; )
+            {
+                DataDirectory dir = cfs.getDirectories().getWriteableLocation(1);
+                BlacklistedDirectories.maybeMarkUnwritable(cfs.getDirectories().getLocationForDisk(dir));
+            }
+        }
+        catch (IOError e)
+        {
+            // Expected -- marked all directories as unwritable
+        }
+        return () -> BlacklistedDirectories.clearUnwritableUnsafe();
+    }
+
+    public static PagingState makeSomePagingState(ProtocolVersion protocolVersion)
+    {
+        CFMetaData metadata = CFMetaData.Builder.create("ks", "tbl")
+                                                .addPartitionKey("k", AsciiType.instance)
+                                                .addClusteringColumn("c1", AsciiType.instance)
+                                                .addClusteringColumn("c1", Int32Type.instance)
+                                                .addRegularColumn("myCol", AsciiType.instance)
+                                                .build();
+
+        ByteBuffer pk = ByteBufferUtil.bytes("someKey");
+
+        ColumnDefinition def = metadata.getColumnDefinition(new ColumnIdentifier("myCol", false));
+        Clustering c = Clustering.make(ByteBufferUtil.bytes("c1"), ByteBufferUtil.bytes(42));
+        Row row = BTreeRow.singleCellRow(c, BufferCell.live(def, 0, ByteBufferUtil.EMPTY_BYTE_BUFFER));
+        PagingState.RowMark mark = PagingState.RowMark.create(metadata, row, protocolVersion);
+        return new PagingState(pk, mark, 10, 0);
+    }
+
 }

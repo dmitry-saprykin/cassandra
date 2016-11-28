@@ -31,6 +31,7 @@ import org.apache.cassandra.cql3.Term;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.AsciiSerializer;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 public class AsciiType extends AbstractType<String>
@@ -79,11 +80,11 @@ public class AsciiType extends AbstractType<String>
     }
 
     @Override
-    public String toJSONString(ByteBuffer buffer, int protocolVersion)
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
         try
         {
-            return '"' + new String(Json.JSON_STRING_ENCODER.quoteAsString(ByteBufferUtil.string(buffer, Charset.forName("US-ASCII")))) + '"';
+            return '"' + Json.quoteAsJsonString(ByteBufferUtil.string(buffer, Charset.forName("US-ASCII"))) + '"';
         }
         catch (CharacterCodingException exc)
         {

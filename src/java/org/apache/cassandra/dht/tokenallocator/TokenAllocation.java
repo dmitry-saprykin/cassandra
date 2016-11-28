@@ -51,19 +51,19 @@ public class TokenAllocation
                                                    final InetAddress endpoint,
                                                    int numTokens)
     {
-        StrategyAdapter strategy = getStrategy(tokenMetadata, rs, endpoint);
+        TokenMetadata tokenMetadataCopy = tokenMetadata.cloneOnlyTokenMap();
+        StrategyAdapter strategy = getStrategy(tokenMetadataCopy, rs, endpoint);
         Collection<Token> tokens = create(tokenMetadata, strategy).addUnit(endpoint, numTokens);
         tokens = adjustForCrossDatacenterClashes(tokenMetadata, strategy, tokens);
 
         if (logger.isWarnEnabled())
         {
             logger.warn("Selected tokens {}", tokens);
-            SummaryStatistics os = replicatedOwnershipStats(tokenMetadata, rs, endpoint);
-            TokenMetadata tokenMetadataCopy = tokenMetadata.cloneOnlyTokenMap();
+            SummaryStatistics os = replicatedOwnershipStats(tokenMetadataCopy, rs, endpoint);
             tokenMetadataCopy.updateNormalTokens(tokens, endpoint);
             SummaryStatistics ns = replicatedOwnershipStats(tokenMetadataCopy, rs, endpoint);
-            logger.warn("Replicated node load in datacentre before allocation " + statToString(os));
-            logger.warn("Replicated node load in datacentre after allocation " + statToString(ns));
+            logger.warn("Replicated node load in datacentre before allocation {}", statToString(os));
+            logger.warn("Replicated node load in datacentre after allocation {}", statToString(ns));
 
             // TODO: Is it worth doing the replicated ownership calculation always to be able to raise this alarm?
             if (ns.getStandardDeviation() > os.getStandardDeviation())
@@ -147,7 +147,7 @@ public class TokenAllocation
             if (strategy.inAllocationRing(en.getValue()))
                 sortedTokens.put(en.getKey(), en.getValue());
         }
-        return new ReplicationAwareTokenAllocator<>(sortedTokens, strategy, tokenMetadata.partitioner);
+        return TokenAllocatorFactory.createTokenAllocator(sortedTokens, strategy, tokenMetadata.partitioner);
     }
 
     interface StrategyAdapter extends ReplicationStrategy<InetAddress>
@@ -199,9 +199,9 @@ public class TokenAllocation
         final int replicas = rs.getReplicationFactor(dc);
 
         Topology topology = tokenMetadata.getTopology();
-        int racks = topology.getDatacenterRacks().get(dc).size();
+        int racks = topology.getDatacenterRacks().get(dc).asMap().size();
 
-        if (replicas >= racks)
+        if (racks >= replicas)
         {
             return new StrategyAdapter()
             {

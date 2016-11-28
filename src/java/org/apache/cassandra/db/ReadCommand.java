@@ -20,6 +20,7 @@ package org.apache.cassandra.db;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.*;
+import java.util.function.Predicate;
 
 import com.google.common.collect.Lists;
 import org.slf4j.Logger;
@@ -36,6 +37,7 @@ import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.IndexNotAvailableException;
+import org.apache.cassandra.io.ForwardingVersionedSerializer;
 import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
@@ -58,12 +60,42 @@ import org.apache.cassandra.utils.Pair;
  */
 public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
 {
-    private static final int TEST_ITERATION_DELAY_MILLIS = Integer.valueOf(System.getProperty("cassandra.test.read_iteration_delay_ms", "0"));
+    private static final int TEST_ITERATION_DELAY_MILLIS = Integer.parseInt(System.getProperty("cassandra.test.read_iteration_delay_ms", "0"));
     protected static final Logger logger = LoggerFactory.getLogger(ReadCommand.class);
     public static final IVersionedSerializer<ReadCommand> serializer = new Serializer();
+
+    // For READ verb: will either dispatch on 'serializer' for 3.0 or 'legacyReadCommandSerializer' for earlier version.
+    // Can be removed (and replaced by 'serializer') once we drop pre-3.0 backward compatibility.
+    public static final IVersionedSerializer<ReadCommand> readSerializer = new ForwardingVersionedSerializer<ReadCommand>()
+    {
+        protected IVersionedSerializer<ReadCommand> delegate(int version)
+        {
+            return version < MessagingService.VERSION_30
+                    ? legacyReadCommandSerializer : serializer;
+        }
+    };
+
     // For RANGE_SLICE verb: will either dispatch on 'serializer' for 3.0 or 'legacyRangeSliceCommandSerializer' for earlier version.
     // Can be removed (and replaced by 'serializer') once we drop pre-3.0 backward compatibility.
-    public static final IVersionedSerializer<ReadCommand> rangeSliceSerializer = new RangeSliceSerializer();
+    public static final IVersionedSerializer<ReadCommand> rangeSliceSerializer = new ForwardingVersionedSerializer<ReadCommand>()
+    {
+        protected IVersionedSerializer<ReadCommand> delegate(int version)
+        {
+            return version < MessagingService.VERSION_30
+                    ? legacyRangeSliceCommandSerializer : serializer;
+        }
+    };
+
+    // For PAGED_RANGE verb: will either dispatch on 'serializer' for 3.0 or 'legacyPagedRangeCommandSerializer' for earlier version.
+    // Can be removed (and replaced by 'serializer') once we drop pre-3.0 backward compatibility.
+    public static final IVersionedSerializer<ReadCommand> pagedRangeSerializer = new ForwardingVersionedSerializer<ReadCommand>()
+    {
+        protected IVersionedSerializer<ReadCommand> delegate(int version)
+        {
+            return version < MessagingService.VERSION_30
+                    ? legacyPagedRangeCommandSerializer : serializer;
+        }
+    };
 
     public static final IVersionedSerializer<ReadCommand> legacyRangeSliceCommandSerializer = new LegacyRangeSliceCommandSerializer();
     public static final IVersionedSerializer<ReadCommand> legacyPagedRangeCommandSerializer = new LegacyPagedRangeCommandSerializer();
@@ -133,6 +165,14 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
 
     protected abstract void serializeSelection(DataOutputPlus out, int version) throws IOException;
     protected abstract long selectionSerializedSize(int version);
+
+    /**
+     * Creates a new <code>ReadCommand</code> instance with new limits.
+     *
+     * @param newLimits the new limits
+     * @return a new <code>ReadCommand</code> with the updated limits
+     */
+    public abstract ReadCommand withUpdatedLimit(DataLimits newLimits);
 
     /**
      * The metadata for the table queried.
@@ -285,11 +325,11 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
 
     protected abstract int oldestUnrepairedTombstone();
 
-    public ReadResponse createResponse(UnfilteredPartitionIterator iterator, ColumnFilter selection)
+    public ReadResponse createResponse(UnfilteredPartitionIterator iterator)
     {
         return isDigestQuery()
-             ? ReadResponse.createDigestResponse(iterator, digestVersion)
-             : ReadResponse.createDataResponse(iterator, selection);
+             ? ReadResponse.createDigestResponse(iterator, this)
+             : ReadResponse.createDataResponse(iterator, this);
     }
 
     public long indexSerializedSize(int version)
@@ -321,6 +361,19 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
 
         index = Optional.of(selected.getIndexMetadata());
         return selected;
+    }
+
+    /**
+     * If the index manager for the CFS determines that there's an applicable
+     * 2i that can be used to execute this command, call its (optional)
+     * validation method to check that nothing in this command's parameters
+     * violates the implementation specific validation rules.
+     */
+    public void maybeValidateIndex()
+    {
+        Index index = getIndex(Keyspace.openAndGetStore(metadata));
+        if (null != index)
+            index.validate(this);
     }
 
     /**
@@ -400,7 +453,7 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
             private final int failureThreshold = DatabaseDescriptor.getTombstoneFailureThreshold();
             private final int warningThreshold = DatabaseDescriptor.getTombstoneWarnThreshold();
 
-            private final boolean respectTombstoneThresholds = !Schema.isSystemKeyspace(ReadCommand.this.metadata().ksName);
+            private final boolean respectTombstoneThresholds = !SchemaConstants.isSystemKeyspace(ReadCommand.this.metadata().ksName);
 
             private int liveRows = 0;
             private int tombstones = 0;
@@ -477,7 +530,7 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
 
     protected class CheckForAbort extends StoppingTransformation<BaseRowIterator<?>>
     {
-        protected BaseRowIterator<?> applyToPartition(BaseRowIterator partition)
+        protected BaseRowIterator<?> applyToPartition(BaseRowIterator<?> partition)
         {
             if (maybeAbort())
             {
@@ -541,12 +594,12 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
         {
             public WithoutPurgeableTombstones()
             {
-                super(isForThrift, cfs.gcBefore(nowInSec()), oldestUnrepairedTombstone(), cfs.getCompactionStrategyManager().onlyPurgeRepairedTombstones());
+                super(isForThrift, nowInSec(), cfs.gcBefore(nowInSec()), oldestUnrepairedTombstone(), cfs.getCompactionStrategyManager().onlyPurgeRepairedTombstones());
             }
 
-            protected long getMaxPurgeableTimestamp()
+            protected Predicate<Long> getPurgeEvaluator()
             {
-                return Long.MAX_VALUE;
+                return time -> true;
             }
         }
         return Transformation.apply(iterator, new WithoutPurgeableTombstones());
@@ -613,7 +666,6 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
 
         public void serialize(ReadCommand command, DataOutputPlus out, int version) throws IOException
         {
-            // for serialization, createLegacyMessage() should cause legacyReadCommandSerializer to be used directly
             assert version >= MessagingService.VERSION_30;
 
             out.writeByte(command.kind.ordinal());
@@ -624,7 +676,7 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
             out.writeInt(command.nowInSec());
             ColumnFilter.serializer.serialize(command.columnFilter(), out, version);
             RowFilter.serializer.serialize(command.rowFilter(), out, version);
-            DataLimits.serializer.serialize(command.limits(), out, version);
+            DataLimits.serializer.serialize(command.limits(), out, version, command.metadata.comparator);
             if (command.index.isPresent())
                 IndexMetadata.serializer.serialize(command.index.get(), out, version);
 
@@ -633,8 +685,7 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
 
         public ReadCommand deserialize(DataInputPlus in, int version) throws IOException
         {
-            if (version < MessagingService.VERSION_30)
-                return legacyReadCommandSerializer.deserialize(in, version);
+            assert version >= MessagingService.VERSION_30;
 
             Kind kind = Kind.values()[in.readByte()];
             int flags = in.readByte();
@@ -646,7 +697,7 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
             int nowInSec = in.readInt();
             ColumnFilter columnFilter = ColumnFilter.serializer.deserialize(in, version, metadata);
             RowFilter rowFilter = RowFilter.serializer.deserialize(in, version, metadata);
-            DataLimits limits = DataLimits.serializer.deserialize(in, version);
+            DataLimits limits = DataLimits.serializer.deserialize(in, version,  metadata.comparator);
             Optional<IndexMetadata> index = hasIndex
                                             ? deserializeIndexMetadata(in, version, metadata)
                                             : Optional.empty();
@@ -662,19 +713,17 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
             }
             catch (UnknownIndexException e)
             {
-                String message = String.format("Couldn't find a defined index on %s.%s with the id %s. " +
-                                               "If an index was just created, this is likely due to the schema not " +
-                                               "being fully propagated. Local read will proceed without using the " +
-                                               "index. Please wait for schema agreement after index creation.",
-                                               cfm.ksName, cfm.cfName, e.indexId.toString());
-                logger.info(message);
+                logger.info("Couldn't find a defined index on {}.{} with the id {}. " +
+                            "If an index was just created, this is likely due to the schema not " +
+                            "being fully propagated. Local read will proceed without using the " +
+                            "index. Please wait for schema agreement after index creation.",
+                            cfm.ksName, cfm.cfName, e.indexId);
                 return Optional.empty();
             }
         }
 
         public long serializedSize(ReadCommand command, int version)
         {
-            // for serialization, createLegacyMessage() should cause legacyReadCommandSerializer to be used directly
             assert version >= MessagingService.VERSION_30;
 
             return 2 // kind + flags
@@ -683,36 +732,9 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
                  + TypeSizes.sizeof(command.nowInSec())
                  + ColumnFilter.serializer.serializedSize(command.columnFilter(), version)
                  + RowFilter.serializer.serializedSize(command.rowFilter(), version)
-                 + DataLimits.serializer.serializedSize(command.limits(), version)
+                 + DataLimits.serializer.serializedSize(command.limits(), version, command.metadata.comparator)
                  + command.selectionSerializedSize(version)
                  + command.indexSerializedSize(version);
-        }
-    }
-
-    // Dispatch to either Serializer or LegacyRangeSliceCommandSerializer. Only useful as long as we maintain pre-3.0
-    // compatibility
-    private static class RangeSliceSerializer implements IVersionedSerializer<ReadCommand>
-    {
-        public void serialize(ReadCommand command, DataOutputPlus out, int version) throws IOException
-        {
-            if (version < MessagingService.VERSION_30)
-                legacyRangeSliceCommandSerializer.serialize(command, out, version);
-            else
-                serializer.serialize(command, out, version);
-        }
-
-        public ReadCommand deserialize(DataInputPlus in, int version) throws IOException
-        {
-            return version < MessagingService.VERSION_30
-                 ? legacyRangeSliceCommandSerializer.deserialize(in, version)
-                 : serializer.deserialize(in, version);
-        }
-
-        public long serializedSize(ReadCommand command, int version)
-        {
-            return version < MessagingService.VERSION_30
-                 ? legacyRangeSliceCommandSerializer.serializedSize(command, version)
-                 : serializer.serializedSize(command, version);
         }
     }
 
@@ -782,18 +804,17 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
                 out.writeBoolean(filter.isReversed());
 
                 // limit
-                DataLimits.Kind kind = rangeCommand.limits().kind();
-                boolean isDistinct = (kind == DataLimits.Kind.CQL_LIMIT || kind == DataLimits.Kind.CQL_PAGING_LIMIT) && rangeCommand.limits().perPartitionCount() == 1;
-                if (isDistinct)
+                DataLimits limits = rangeCommand.limits();
+                if (limits.isDistinct())
                     out.writeInt(1);
                 else
                     out.writeInt(LegacyReadCommandSerializer.updateLimitForQuery(rangeCommand.limits().count(), filter.requestedSlices()));
 
                 int compositesToGroup;
-                boolean selectsStatics = !rangeCommand.columnFilter().fetchedColumns().statics.isEmpty() || filter.requestedSlices().selects(Clustering.STATIC_CLUSTERING);
-                if (kind == DataLimits.Kind.THRIFT_LIMIT)
+                boolean selectsStatics = !rangeCommand.columnFilter().fetchedColumns().statics.isEmpty() && filter.requestedSlices().selects(Clustering.STATIC_CLUSTERING);
+                if (limits.kind() == DataLimits.Kind.THRIFT_LIMIT)
                     compositesToGroup = -1;
-                else if (isDistinct && !selectsStatics)
+                else if (limits.isDistinct() && !selectsStatics)
                     compositesToGroup = -2;  // for DISTINCT queries (CASSANDRA-8490)
                 else
                     compositesToGroup = metadata.isDense() ? -1 : metadata.clusteringColumns().size();
@@ -858,11 +879,15 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
             AbstractBounds<PartitionPosition> keyRange = AbstractBounds.rowPositionSerializer.deserialize(in, metadata.partitioner, version);
             int maxResults = in.readInt();
 
-            in.readBoolean();  // countCQL3Rows (not needed)
+            boolean countCQL3Rows = in.readBoolean();  // countCQL3Rows (not needed)
             in.readBoolean();  // isPaging (not needed)
 
             boolean selectsStatics = (!selection.fetchedColumns().statics.isEmpty() || filter.selects(Clustering.STATIC_CLUSTERING));
-            boolean isDistinct = compositesToGroup == -2 || (perPartitionLimit == 1 && selectsStatics);
+            // We have 2 types of DISTINCT queries: ones on only the partition key, and ones on the partition key and static columns. For the former,
+            // we can easily detect the case because compositeToGroup is -2 and that's the only case it can be that. The latter one is slightly less
+            // direct, but we know that on 2.1/2.2 queries, DISTINCT queries are the only CQL queries that have countCQL3Rows to false so we use
+            // that fact.
+            boolean isDistinct = compositesToGroup == -2 || (compositesToGroup != -1 && !countCQL3Rows);
             DataLimits limits;
             if (isDistinct)
                 limits = DataLimits.distinctLimits(maxResults);
@@ -1058,7 +1083,7 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
             // slice filter's stop.
             DataRange.Paging pagingRange = (DataRange.Paging) rangeCommand.dataRange();
             Clustering lastReturned = pagingRange.getLastReturned();
-            Slice.Bound newStart = Slice.Bound.exclusiveStartOf(lastReturned);
+            ClusteringBound newStart = ClusteringBound.inclusiveStartOf(lastReturned);
             Slice lastSlice = filter.requestedSlices().get(filter.requestedSlices().size() - 1);
             ByteBufferUtil.writeWithShortLength(LegacyLayout.encodeBound(metadata, newStart, true), out);
             ByteBufferUtil.writeWithShortLength(LegacyLayout.encodeClustering(metadata, lastSlice.end().clustering()), out);
@@ -1067,10 +1092,8 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
 
             // command-level limit
             // Pre-3.0 we would always request one more row than we actually needed and the command-level "start" would
-            // be the last-returned cell name, so the response would always include it.  When dealing with compound comparators,
-            // we can pass an exclusive start and use the normal limit.  However, when dealing with non-compound comparators,
-            // pre-3.0 nodes cannot perform exclusive slices, so we need to request one extra row.
-            int maxResults = rangeCommand.limits().count() + (metadata.isCompound() ? 0 : 1);
+            // be the last-returned cell name, so the response would always include it.
+            int maxResults = rangeCommand.limits().count() + 1;
             out.writeInt(maxResults);
 
             // countCQL3Rows
@@ -1113,9 +1136,13 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
 
             RowFilter rowFilter = LegacyRangeSliceCommandSerializer.deserializeRowFilter(in, metadata);
             int maxResults = in.readInt();
-            in.readBoolean(); // countCQL3Rows
+            boolean countCQL3Rows = in.readBoolean();
 
-            boolean isDistinct = compositesToGroup == -2 || (perPartitionLimit == 1 && selectsStatics);
+            // We have 2 types of DISTINCT queries: ones on only the partition key, and ones on the partition key and static columns. For the former,
+            // we can easily detect the case because compositeToGroup is -2 and that's the only case it can be that. The latter one is slightly less
+            // direct, but we know that on 2.1/2.2 queries, DISTINCT queries are the only CQL queries that have countCQL3Rows to false so we use
+            // that fact.
+            boolean isDistinct = compositesToGroup == -2 || (compositesToGroup != -1 && !countCQL3Rows);
             DataLimits limits;
             if (isDistinct)
                 limits = DataLimits.distinctLimits(maxResults);
@@ -1360,8 +1387,23 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
                                     "Fill name in filter (hex): " + ByteBufferUtil.bytesToHex(buffer), metadata.cfId);
                 }
 
-                if (!cellName.clustering.equals(Clustering.STATIC_CLUSTERING))
+                // If we're querying for a static column, we may also need to read it
+                // as if it were a thrift dynamic column (because the column metadata,
+                // which makes it a static column in 3.0+, may have been added *after*
+                // some values were written). Note that all cql queries on non-compact
+                // tables used slice & not name filters prior to 3.0 so this path is
+                // not taken for non-compact tables. It is theoretically possible to
+                // get here via thrift, hence the check on metadata.isStaticCompactTable.
+                // See CASSANDRA-11087.
+                if (metadata.isStaticCompactTable() && cellName.clustering.equals(Clustering.STATIC_CLUSTERING))
+                {
+                    clusterings.add(Clustering.make(cellName.column.name.bytes));
+                    selectionBuilder.add(metadata.compactValueColumn());
+                }
+                else
+                {
                     clusterings.add(cellName.clustering);
+                }
 
                 selectionBuilder.add(cellName.column);
             }
@@ -1399,17 +1441,16 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
             out.writeBoolean(filter.isReversed());
 
             boolean selectsStatics = !command.columnFilter().fetchedColumns().statics.isEmpty() || slices.selects(Clustering.STATIC_CLUSTERING);
-            DataLimits.Kind kind = command.limits().kind();
-            boolean isDistinct = (kind == DataLimits.Kind.CQL_LIMIT || kind == DataLimits.Kind.CQL_PAGING_LIMIT) && command.limits().perPartitionCount() == 1;
-            if (isDistinct)
+            DataLimits limits = command.limits();
+            if (limits.isDistinct())
                 out.writeInt(1);  // the limit is always 1 for DISTINCT queries
             else
                 out.writeInt(updateLimitForQuery(command.limits().count(), filter.requestedSlices()));
 
             int compositesToGroup;
-            if (kind == DataLimits.Kind.THRIFT_LIMIT || metadata.isDense())
+            if (limits.kind() == DataLimits.Kind.THRIFT_LIMIT || metadata.isDense())
                 compositesToGroup = -1;
-            else if (isDistinct && !selectsStatics)
+            else if (limits.isDistinct() && !selectsStatics)
                 compositesToGroup = -2;  // for DISTINCT queries (CASSANDRA-8490)
             else
                 compositesToGroup = metadata.clusteringColumns().size();
@@ -1428,9 +1469,19 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
             // if a slice query from a pre-3.0 node doesn't cover statics, we shouldn't select them at all
             ColumnFilter columnFilter = LegacyRangeSliceCommandSerializer.getColumnSelectionForSlice(selectsStatics, compositesToGroup, metadata);
 
-            boolean isDistinct = compositesToGroup == -2 || (count == 1 && selectsStatics);
+            // We have 2 types of DISTINCT queries: ones on only the partition key, and ones on the partition key and static columns. For the former,
+            // we can easily detect the case because compositeToGroup is -2 and that's the only case it can be that. The latter is probablematic
+            // however as we have no way to distinguish it from a normal select with a limit of 1 (and this, contrarily to the range query case
+            // were the countCQL3Rows boolean allows us to decide).
+            // So we consider this case not distinct here. This is ok because even if it is a distinct (with static), the count will be 1 and
+            // we'll still just query one row (a distinct DataLimits currently behave exactly like a CQL limit with a count of 1). The only
+            // drawback is that we'll send back the first row entirely while a 2.1/2.2 node would return only the first cell in that same
+            // situation. This isn't a problem for 2.1/2.2 code however (it would be for a range query, as it would throw off the count for
+            // reasons similar to CASSANDRA-10762, but it's ok for single partition queries).
+            // We do _not_ want to do the reverse however and consider a 'SELECT * FROM foo LIMIT 1' as a DISTINCT query as that would make
+            // us only return the 1st cell rather then 1st row.
             DataLimits limits;
-            if (compositesToGroup == -2 || isDistinct)
+            if (compositesToGroup == -2)
                 limits = DataLimits.distinctLimits(count);  // See CASSANDRA-8490 for the explanation of this value
             else if (compositesToGroup == -1)
                 limits = DataLimits.thriftLimits(1, count);
@@ -1498,7 +1549,7 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
         static long serializedStaticSliceSize(CFMetaData metadata)
         {
             // unlike serializeStaticSlice(), but we don't care about reversal for size calculations
-            ByteBuffer sliceStart = LegacyLayout.encodeBound(metadata, Slice.Bound.BOTTOM, false);
+            ByteBuffer sliceStart = LegacyLayout.encodeBound(metadata, ClusteringBound.BOTTOM, false);
             long size = ByteBufferUtil.serializedSizeWithShortLength(sliceStart);
 
             size += TypeSizes.sizeof((short) (metadata.comparator.size() * 3 + 2));
@@ -1526,7 +1577,7 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
             // slice finish after we've written the static slice start
             if (!isReversed)
             {
-                ByteBuffer sliceStart = LegacyLayout.encodeBound(metadata, Slice.Bound.BOTTOM, false);
+                ByteBuffer sliceStart = LegacyLayout.encodeBound(metadata, ClusteringBound.BOTTOM, false);
                 ByteBufferUtil.writeWithShortLength(sliceStart, out);
             }
 
@@ -1542,7 +1593,7 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
 
             if (isReversed)
             {
-                ByteBuffer sliceStart = LegacyLayout.encodeBound(metadata, Slice.Bound.BOTTOM, false);
+                ByteBuffer sliceStart = LegacyLayout.encodeBound(metadata, ClusteringBound.BOTTOM, false);
                 ByteBufferUtil.writeWithShortLength(sliceStart, out);
             }
         }
@@ -1664,7 +1715,7 @@ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
             {
                 Slices.Builder slicesBuilder = new Slices.Builder(metadata.comparator);
                 for (Clustering clustering : requestedRows)
-                    slicesBuilder.add(Slice.Bound.inclusiveStartOf(clustering), Slice.Bound.inclusiveEndOf(clustering));
+                    slicesBuilder.add(ClusteringBound.inclusiveStartOf(clustering), ClusteringBound.inclusiveEndOf(clustering));
                 slices = slicesBuilder.build();
             }
 

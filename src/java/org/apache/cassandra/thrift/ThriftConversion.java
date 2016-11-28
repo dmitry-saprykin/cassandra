@@ -18,7 +18,6 @@
 package org.apache.cassandra.thrift;
 
 import java.util.*;
-import java.util.regex.Matcher;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Strings;
@@ -35,7 +34,7 @@ import org.apache.cassandra.db.compaction.AbstractCompactionStrategy;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.exceptions.*;
-import org.apache.cassandra.index.internal.CassandraIndex;
+import org.apache.cassandra.index.TargetParser;
 import org.apache.cassandra.io.compress.ICompressor;
 import org.apache.cassandra.locator.AbstractReplicationStrategy;
 import org.apache.cassandra.locator.LocalStrategy;
@@ -194,7 +193,7 @@ public class ThriftConversion
     private static boolean isSuper(String thriftColumnType)
     throws org.apache.cassandra.exceptions.InvalidRequestException
     {
-        switch (thriftColumnType.toLowerCase())
+        switch (thriftColumnType.toLowerCase(Locale.ENGLISH))
         {
             case "standard": return false;
             case "super": return true;
@@ -591,7 +590,7 @@ public class ThriftConversion
         IndexMetadata matchedIndex = null;
         for (IndexMetadata index : cfMetaData.getIndexes())
         {
-            Pair<ColumnDefinition, IndexTarget.Type> target  = CassandraIndex.parseTarget(cfMetaData, index);
+            Pair<ColumnDefinition, IndexTarget.Type> target  = TargetParser.parse(cfMetaData, index);
             if (target.left.equals(column))
             {
                 // we already found an index for this column, we've no option but to
@@ -676,7 +675,7 @@ public class ThriftConversion
 
     private static CachingParams cachingFromTrhfit(String caching)
     {
-        switch (caching.toUpperCase())
+        switch (caching.toUpperCase(Locale.ENGLISH))
         {
             case "ALL":
                 return CachingParams.CACHE_EVERYTHING;

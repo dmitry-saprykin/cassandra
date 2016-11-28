@@ -1,7 +1,29 @@
+/*
+ *
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ *
+ */
 package org.apache.cassandra.utils.concurrent;
 
 import java.lang.ref.PhantomReference;
+import java.lang.ref.Reference;
 import java.lang.ref.ReferenceQueue;
+import java.lang.ref.WeakReference;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 import java.util.*;
@@ -14,7 +36,6 @@ import org.slf4j.LoggerFactory;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Iterables;
 
 import org.apache.cassandra.concurrent.NamedThreadFactory;
 import org.apache.cassandra.db.ColumnFamilyStore;
@@ -47,13 +68,14 @@ import static org.apache.cassandra.utils.Throwables.merge;
  * This class' functionality is achieved by what may look at first glance like a complex web of references,
  * but boils down to:
  *
+ * {@code
  * Target --> selfRef --> [Ref.State] <--> Ref.GlobalState --> Tidy
  *                                             ^
  *                                             |
  * Ref ----------------------------------------
  *                                             |
  * Global -------------------------------------
- *
+ * }
  * So that, if Target is collected, Impl is collected and, hence, so is selfRef.
  *
  * Once ref or selfRef are collected, the paired Ref.State's release method is called, which if it had
@@ -319,7 +341,8 @@ public final class Ref<T> implements RefCounted<T>
         }
     }
 
-    private static final Class<?>[] concurrentIterableClasses = new Class<?>[] {
+    private static final Class<?>[] concurrentIterableClasses = new Class<?>[]
+    {
         ConcurrentLinkedQueue.class,
         ConcurrentLinkedDeque.class,
         ConcurrentSkipListSet.class,
@@ -466,7 +489,7 @@ public final class Ref<T> implements RefCounted<T>
                 while (collectionIterator.hasNext() && (nextItem = collectionIterator.next()) == null){}
                 if (nextItem != null)
                 {
-                    if (isMapIterator && nextItem instanceof Map.Entry)
+                    if (isMapIterator & nextItem instanceof Map.Entry)
                     {
                         Map.Entry entry = (Map.Entry)nextItem;
                         mapEntryValue = entry.getValue();
@@ -487,6 +510,13 @@ public final class Ref<T> implements RefCounted<T>
                 Field nextField = nextField();
                 if (nextField == null)
                     return null;
+
+                //A weak reference isn't strongly reachable
+                //subclasses of WeakReference contain strong references in their fields, so those need to be traversed
+                //The weak reference fields are in the common Reference class base so filter those out
+                if (o instanceof WeakReference & nextField.getDeclaringClass() == Reference.class)
+                    continue;
+
                 Object nextObject = nextField.get(o);
                 if (nextObject != null)
                     return Pair.create(nextField.get(o), nextField);
@@ -509,6 +539,7 @@ public final class Ref<T> implements RefCounted<T>
         @VisibleForTesting
         long iterations = 0;
         GlobalState visiting;
+        Set<GlobalState> haveLoops;
 
         public void run()
         {
@@ -576,6 +607,8 @@ public final class Ref<T> implements RefCounted<T>
                     }
                     else if (visiting == child)
                     {
+                        if (haveLoops != null)
+                            haveLoops.add(visiting);
                         NoSpamLogger.log(logger,
                                 NoSpamLogger.Level.ERROR,
                                 rootObject.getClass().getName(),

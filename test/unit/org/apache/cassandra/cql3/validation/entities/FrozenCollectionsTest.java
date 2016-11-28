@@ -27,6 +27,7 @@ import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.cql3.CQLTester;
+import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
 import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.dht.ByteOrderedPartitioner;
 import org.apache.cassandra.exceptions.ConfigurationException;
@@ -40,10 +41,12 @@ import static org.junit.Assert.assertEquals;
 public class FrozenCollectionsTest extends CQLTester
 {
     @BeforeClass
-    public static void setUpClass()
+    public static void setUpClass()     // overrides CQLTester.setUpClass()
     {
         // Selecting partitioner for a table is not exposed on CREATE TABLE.
         StorageService.instance.setPartitionerUnsafe(ByteOrderedPartitioner.instance);
+
+        prepareServer();
     }
 
     @Test
@@ -629,17 +632,18 @@ public class FrozenCollectionsTest extends CQLTester
                              "SELECT * FROM %s WHERE c CONTAINS KEY ?", 1);
 
         // normal indexes on frozen collections don't support CONTAINS or CONTAINS KEY
-        assertInvalidMessage("Cannot restrict clustering columns by a CONTAINS relation without a secondary index",
+        assertInvalidMessage("Clustering columns can only be restricted with CONTAINS with a secondary index or filtering",
                              "SELECT * FROM %s WHERE b CONTAINS ?", 1);
 
-        assertInvalidMessage("Cannot restrict clustering columns by a CONTAINS relation without a secondary index",
-                             "SELECT * FROM %s WHERE b CONTAINS ? ALLOW FILTERING", 1);
+        assertRows(execute("SELECT * FROM %s WHERE b CONTAINS ? ALLOW FILTERING", 1),
+                   row(0, list(1, 2, 3), set(1, 2, 3), map(1, "a")),
+                   row(1, list(1, 2, 3), set(4, 5, 6), map(2, "b")));
 
-        assertInvalidMessage("No supported secondary index found for the non primary key columns restrictions",
+        assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE,
                              "SELECT * FROM %s WHERE d CONTAINS KEY ?", 1);
 
-        assertInvalidMessage("Cannot restrict clustering columns by a CONTAINS relation without a secondary index",
-                             "SELECT * FROM %s WHERE b CONTAINS ? AND d CONTAINS KEY ? ALLOW FILTERING", 1, 1);
+        assertRows(execute("SELECT * FROM %s WHERE b CONTAINS ? AND d CONTAINS KEY ? ALLOW FILTERING", 1, 1),
+                   row(0, list(1, 2, 3), set(1, 2, 3), map(1, "a")));
 
         // index lookup on b
         assertRows(execute("SELECT * FROM %s WHERE b=?", list(1, 2, 3)),

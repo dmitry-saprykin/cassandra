@@ -20,13 +20,14 @@ package org.apache.cassandra.index.sasi.sa;
 import java.nio.ByteBuffer;
 import java.nio.CharBuffer;
 
+import org.apache.cassandra.index.sasi.disk.DynamicTokenTreeBuilder;
 import org.apache.cassandra.index.sasi.disk.OnDiskIndexBuilder;
 import org.apache.cassandra.index.sasi.disk.TokenTreeBuilder;
 import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.utils.LongTimSort;
 import org.apache.cassandra.utils.Pair;
 
 import com.google.common.base.Charsets;
-import net.mintern.primitive.Primitive;
 
 public class SuffixSA extends SA<CharBuffer>
 {
@@ -47,10 +48,13 @@ public class SuffixSA extends SA<CharBuffer>
 
     private class SASuffixIterator extends TermIterator
     {
+
+        private static final int COMPLETE_BIT = 31;
+
         private final long[] suffixes;
 
         private int current = 0;
-        private ByteBuffer lastProcessedSuffix;
+        private IndexedTerm lastProcessedSuffix;
         private TokenTreeBuilder container;
 
         public SASuffixIterator()
@@ -60,43 +64,55 @@ public class SuffixSA extends SA<CharBuffer>
             suffixes = new long[charCount];
 
             long termIndex = -1, currentTermLength = -1;
+            boolean isComplete = false;
             for (int i = 0; i < charCount; i++)
             {
                 if (i >= currentTermLength || currentTermLength == -1)
                 {
                     Term currentTerm = terms.get((int) ++termIndex);
                     currentTermLength = currentTerm.getPosition() + currentTerm.length();
+                    isComplete = true;
                 }
 
                 suffixes[i] = (termIndex << 32) | i;
+                if (isComplete)
+                    suffixes[i] |= (1L << COMPLETE_BIT);
+
+                isComplete = false;
             }
 
-            Primitive.sort(suffixes, (a, b) -> {
+            LongTimSort.sort(suffixes, (a, b) -> {
                 Term aTerm = terms.get((int) (a >>> 32));
                 Term bTerm = terms.get((int) (b >>> 32));
-                return comparator.compare(aTerm.getSuffix(((int) a) - aTerm.getPosition()),
-                                          bTerm.getSuffix(((int) b) - bTerm.getPosition()));
+                return comparator.compare(aTerm.getSuffix(clearCompleteBit(a) - aTerm.getPosition()),
+                                          bTerm.getSuffix(clearCompleteBit(b) - bTerm.getPosition()));
             });
         }
 
-        private Pair<ByteBuffer, TokenTreeBuilder> suffixAt(int position)
+        private int clearCompleteBit(long value)
+        {
+            return (int) (value & ~(1L << COMPLETE_BIT));
+        }
+
+        private Pair<IndexedTerm, TokenTreeBuilder> suffixAt(int position)
         {
             long index = suffixes[position];
             Term term = terms.get((int) (index >>> 32));
-            return Pair.create(term.getSuffix(((int) index) - term.getPosition()), term.getTokens());
+            boolean isPartitial = (index & ((long) 1 << 31)) == 0;
+            return Pair.create(new IndexedTerm(term.getSuffix(clearCompleteBit(index) - term.getPosition()), isPartitial), term.getTokens());
         }
 
         public ByteBuffer minTerm()
         {
-            return suffixAt(0).left;
+            return suffixAt(0).left.getBytes();
         }
 
         public ByteBuffer maxTerm()
         {
-            return suffixAt(suffixes.length - 1).left;
+            return suffixAt(suffixes.length - 1).left.getBytes();
         }
 
-        protected Pair<ByteBuffer, TokenTreeBuilder> computeNext()
+        protected Pair<IndexedTerm, TokenTreeBuilder> computeNext()
         {
             while (true)
             {
@@ -105,37 +121,37 @@ public class SuffixSA extends SA<CharBuffer>
                     if (lastProcessedSuffix == null)
                         return endOfData();
 
-                    Pair<ByteBuffer, TokenTreeBuilder> result = finishSuffix();
+                    Pair<IndexedTerm, TokenTreeBuilder> result = finishSuffix();
 
                     lastProcessedSuffix = null;
                     return result;
                 }
 
-                Pair<ByteBuffer, TokenTreeBuilder> suffix = suffixAt(current++);
+                Pair<IndexedTerm, TokenTreeBuilder> suffix = suffixAt(current++);
 
                 if (lastProcessedSuffix == null)
                 {
                     lastProcessedSuffix = suffix.left;
-                    container = new TokenTreeBuilder(suffix.right.getTokens());
+                    container = new DynamicTokenTreeBuilder(suffix.right);
                 }
-                else if (comparator.compare(lastProcessedSuffix, suffix.left) == 0)
+                else if (comparator.compare(lastProcessedSuffix.getBytes(), suffix.left.getBytes()) == 0)
                 {
                     lastProcessedSuffix = suffix.left;
-                    container.add(suffix.right.getTokens());
+                    container.add(suffix.right);
                 }
                 else
                 {
-                    Pair<ByteBuffer, TokenTreeBuilder> result = finishSuffix();
+                    Pair<IndexedTerm, TokenTreeBuilder> result = finishSuffix();
 
                     lastProcessedSuffix = suffix.left;
-                    container = new TokenTreeBuilder(suffix.right.getTokens());
+                    container = new DynamicTokenTreeBuilder(suffix.right);
 
                     return result;
                 }
             }
         }
 
-        private Pair<ByteBuffer, TokenTreeBuilder> finishSuffix()
+        private Pair<IndexedTerm, TokenTreeBuilder> finishSuffix()
         {
             return Pair.create(lastProcessedSuffix, container.finish());
         }

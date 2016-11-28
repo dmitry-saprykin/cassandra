@@ -32,15 +32,13 @@ import org.junit.Test;
 import com.datastax.driver.core.Row;
 import com.datastax.driver.core.exceptions.NoHostAvailableException;
 import com.datastax.driver.core.exceptions.WriteTimeoutException;
-import org.apache.cassandra.concurrent.SEPExecutor;
-import org.apache.cassandra.concurrent.Stage;
-import org.apache.cassandra.concurrent.StageManager;
 import org.apache.cassandra.batchlog.BatchlogManager;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.WrappedRunnable;
 
 public class ViewLongTest extends CQLTester
 {
-    int protocolVersion = 4;
+    ProtocolVersion protocolVersion = ProtocolVersion.V4;
     private final List<String> views = new ArrayList<>();
 
     @BeforeClass

@@ -194,26 +194,26 @@ public interface StorageServiceMBean extends NotificationEmitter
     public List<InetAddress> getNaturalEndpoints(String keyspaceName, ByteBuffer key);
 
     /**
-     * @deprecated use {@link #takeSnapshot(String tag, Map options, boolean keyspaces, String... entities)} instead.
+     * @deprecated use {@link #takeSnapshot(String tag, Map options, String... entities)} instead.
      */
     @Deprecated
     public void takeSnapshot(String tag, String... keyspaceNames) throws IOException;
 
     /**
-     * @deprecated use {@link #takeSnapshot(String tag, Map options, boolean keyspaces, String... entities)} instead.
+     * @deprecated use {@link #takeSnapshot(String tag, Map options, String... entities)} instead.
      */
     @Deprecated
     public void takeTableSnapshot(String keyspaceName, String tableName, String tag) throws IOException;
 
     /**
-     * @deprecated use {@link #takeSnapshot(String tag, Map options, boolean keyspaces, String... entities)} instead.
+     * @deprecated use {@link #takeSnapshot(String tag, Map options, String... entities)} instead.
      */
     @Deprecated
     public void takeMultipleTableSnapshot(String tag, String... tableList) throws IOException;
 
     /**
      * Takes the snapshot of a multiple column family from different keyspaces. A snapshot name must be specified.
-     * 
+     *
      * @param tag
      *            the tag given to the snapshot; may not be null or empty
      * @param options
@@ -251,11 +251,20 @@ public interface StorageServiceMBean extends NotificationEmitter
      */
     public void forceKeyspaceCompaction(boolean splitOutput, String keyspaceName, String... tableNames) throws IOException, ExecutionException, InterruptedException;
 
+    @Deprecated
     public int relocateSSTables(String keyspace, String ... cfnames) throws IOException, ExecutionException, InterruptedException;
+    public int relocateSSTables(int jobs, String keyspace, String ... cfnames) throws IOException, ExecutionException, InterruptedException;
+    /**
+     * Forces major compaction of specified token range in a single keyspace
+     */
+    public void forceKeyspaceCompactionForTokenRange(String keyspaceName, String startToken, String endToken, String... tableNames) throws IOException, ExecutionException, InterruptedException;
+
     /**
      * Trigger a cleanup of keys on a single keyspace
      */
+    @Deprecated
     public int forceKeyspaceCleanup(String keyspaceName, String... tables) throws IOException, ExecutionException, InterruptedException;
+    public int forceKeyspaceCleanup(int jobs, String keyspaceName, String... tables) throws IOException, ExecutionException, InterruptedException;
 
     /**
      * Scrub (deserialize + reserialize at the latest version, skipping bad rows if any) the given keyspace.
@@ -265,7 +274,9 @@ public interface StorageServiceMBean extends NotificationEmitter
      */
     @Deprecated
     public int scrub(boolean disableSnapshot, boolean skipCorrupted, String keyspaceName, String... tableNames) throws IOException, ExecutionException, InterruptedException;
+    @Deprecated
     public int scrub(boolean disableSnapshot, boolean skipCorrupted, boolean checkData, String keyspaceName, String... tableNames) throws IOException, ExecutionException, InterruptedException;
+    public int scrub(boolean disableSnapshot, boolean skipCorrupted, boolean checkData, int jobs, String keyspaceName, String... columnFamilies) throws IOException, ExecutionException, InterruptedException;
 
     /**
      * Verify (checksums of) the given keyspace.
@@ -279,7 +290,15 @@ public interface StorageServiceMBean extends NotificationEmitter
      * Rewrite all sstables to the latest version.
      * Unlike scrub, it doesn't skip bad rows and do not snapshot sstables first.
      */
+    @Deprecated
     public int upgradeSSTables(String keyspaceName, boolean excludeCurrentVersion, String... tableNames) throws IOException, ExecutionException, InterruptedException;
+    public int upgradeSSTables(String keyspaceName, boolean excludeCurrentVersion, int jobs, String... tableNames) throws IOException, ExecutionException, InterruptedException;
+
+    /**
+     * Rewrites all sstables from the given tables to remove deleted data.
+     * The tombstone option defines the granularity of the procedure: ROW removes deleted partitions and rows, CELL also removes overwritten or deleted cells.
+     */
+    public int garbageCollect(String tombstoneOption, int jobs, String keyspaceName, String... tableNames) throws IOException, ExecutionException, InterruptedException;
 
     /**
      * Flush all memtables for the given column families, or all columnfamilies for the given keyspace
@@ -389,11 +408,11 @@ public interface StorageServiceMBean extends NotificationEmitter
      * If level cannot be parsed, then the level will be defaulted to DEBUG<br>
      * <br>
      * The logback configuration should have {@code < jmxConfigurator />} set
-     * 
+     *
      * @param classQualifier The logger's classQualifer
      * @param level The log level
-     * @throws Exception 
-     * 
+     * @throws Exception
+     *
      *  @see ch.qos.logback.classic.Level#toLevel(String)
      */
     public void setLoggingLevel(String classQualifier, String level) throws Exception;
@@ -444,15 +463,37 @@ public interface StorageServiceMBean extends NotificationEmitter
 
     public List<String> getNonSystemKeyspaces();
 
+    public List<String> getNonLocalStrategyKeyspaces();
+
+    public Map<String, String> getViewBuildStatuses(String keyspace, String view);
+
     /**
-     * Change endpointsnitch class and dynamic-ness (and dynamic attributes) at runtime
+     * Change endpointsnitch class and dynamic-ness (and dynamic attributes) at runtime.
+     *
+     * This method is used to change the snitch implementation and/or dynamic snitch parameters.
+     * If {@code epSnitchClassName} is specified, it will configure a new snitch instance and make it a
+     * 'dynamic snitch' if {@code dynamic} is specified and {@code true}.
+     *
+     * The parameters {@code dynamicUpdateInterval}, {@code dynamicResetInterval} and {@code dynamicBadnessThreshold}
+     * can be specified individually to update the parameters of the dynamic snitch during runtime.
+     *
      * @param epSnitchClassName        the canonical path name for a class implementing IEndpointSnitch
-     * @param dynamic                  boolean that decides whether dynamicsnitch is used or not
-     * @param dynamicUpdateInterval    integer, in ms (default 100)
-     * @param dynamicResetInterval     integer, in ms (default 600,000)
-     * @param dynamicBadnessThreshold  double, (default 0.0)
+     * @param dynamic                  boolean that decides whether dynamicsnitch is used or not - only valid, if {@code epSnitchClassName} is specified
+     * @param dynamicUpdateInterval    integer, in ms (defaults to the value configured in cassandra.yaml, which defaults to 100)
+     * @param dynamicResetInterval     integer, in ms (defaults to the value configured in cassandra.yaml, which defaults to 600,000)
+     * @param dynamicBadnessThreshold  double, (defaults to the value configured in cassandra.yaml, which defaults to 0.0)
      */
     public void updateSnitch(String epSnitchClassName, Boolean dynamic, Integer dynamicUpdateInterval, Integer dynamicResetInterval, Double dynamicBadnessThreshold) throws ClassNotFoundException;
+
+    /*
+      Update dynamic_snitch_update_interval_in_ms
+     */
+    public void setDynamicUpdateInterval(int dynamicUpdateInterval);
+
+    /*
+      Get dynamic_snitch_update_interval_in_ms
+     */
+    public int getDynamicUpdateInterval();
 
     // allows a user to forcibly 'kill' a sick node
     public void stopGossiping();
@@ -466,7 +507,7 @@ public interface StorageServiceMBean extends NotificationEmitter
     // allows a user to forcibly completely stop cassandra
     public void stopDaemon();
 
-    // to determine if gossip is disabled
+    // to determine if initialization has completed
     public boolean isInitialized();
 
     // allows a user to disable thrift
@@ -485,6 +526,8 @@ public interface StorageServiceMBean extends NotificationEmitter
     // allows a node that have been started without joining the ring to join it
     public void joinRing() throws IOException;
     public boolean isJoined();
+    public boolean isDrained();
+    public boolean isDraining();
 
     public void setRpcTimeout(long value);
     public long getRpcTimeout();
@@ -519,6 +562,9 @@ public interface StorageServiceMBean extends NotificationEmitter
     public int getCompactionThroughputMbPerSec();
     public void setCompactionThroughputMbPerSec(int value);
 
+    public int getConcurrentCompactors();
+    public void setConcurrentCompactors(int value);
+
     public boolean isIncrementalBackupsEnabled();
     public void setIncrementalBackupsEnabled(boolean value);
 
@@ -530,6 +576,16 @@ public interface StorageServiceMBean extends NotificationEmitter
      * @param sourceDc Name of DC from which to select sources for streaming or null to pick any node
      */
     public void rebuild(String sourceDc);
+
+    /**
+     * Same as {@link #rebuild(String)}, but only for specified keyspace and ranges.
+     *
+     * @param sourceDc Name of DC from which to select sources for streaming or null to pick any node
+     * @param keyspace Name of the keyspace which to rebuild or null to rebuild all keyspaces.
+     * @param tokens Range of tokens to rebuild or null to rebuild all token ranges. In the format of:
+     *               "(start_token_1,end_token_1],(start_token_2,end_token_2],...(start_token_n,end_token_n]"
+     */
+    public void rebuild(String sourceDc, String keyspace, String tokens, String specificSources);
 
     /** Starts a bulk load and blocks until it completes. */
     public void bulkLoad(String directory);

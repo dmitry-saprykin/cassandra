@@ -77,7 +77,8 @@ public class CompactionMetrics implements CompactionManager.CompactionExecutorSt
             new Gauge<Map<String, Map<String, Integer>>>()
         {
             @Override
-            public Map<String, Map<String, Integer>> getValue() {
+            public Map<String, Map<String, Integer>> getValue() 
+            {
                 Map<String, Map<String, Integer>> resultMap = new HashMap<>();
                 // estimation of compactions need to be done
                 for (String keyspaceName : Schema.instance.getKeyspaces())
@@ -100,6 +101,10 @@ public class CompactionMetrics implements CompactionManager.CompactionExecutorSt
                 for (CompactionInfo.Holder compaction : compactions)
                 {
                     CFMetaData metaData = compaction.getCompactionInfo().getCFMetaData();
+                    if (metaData == null)
+                    {
+                        continue;
+                    }
                     if (!resultMap.containsKey(metaData.ksName))
                     {
                         resultMap.put(metaData.ksName, new HashMap<>());
@@ -136,15 +141,11 @@ public class CompactionMetrics implements CompactionManager.CompactionExecutorSt
 
     public void beginCompaction(CompactionInfo.Holder ci)
     {
-        // notify
-        ci.started();
         compactions.add(ci);
     }
 
     public void finishCompaction(CompactionInfo.Holder ci)
     {
-        // notify
-        ci.finished();
         compactions.remove(ci);
         bytesCompacted.inc(ci.getCompactionInfo().getTotal());
         totalCompactionsCompleted.mark();

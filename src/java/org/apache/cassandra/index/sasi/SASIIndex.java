@@ -22,24 +22,29 @@ import java.util.concurrent.Callable;
 import java.util.function.BiFunction;
 
 import com.googlecode.concurrenttrees.common.Iterables;
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.ColumnDefinition;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.config.Schema;
+
+import org.apache.cassandra.config.*;
 import org.apache.cassandra.cql3.Operator;
+import org.apache.cassandra.cql3.statements.IndexTarget;
 import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.filter.RowFilter;
+import org.apache.cassandra.db.lifecycle.Tracker;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.partitions.PartitionIterator;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.dht.Murmur3Partitioner;
+import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.IndexRegistry;
 import org.apache.cassandra.index.SecondaryIndexBuilder;
-import org.apache.cassandra.index.internal.CassandraIndex;
+import org.apache.cassandra.index.TargetParser;
 import org.apache.cassandra.index.sasi.conf.ColumnIndex;
+import org.apache.cassandra.index.sasi.conf.IndexMode;
+import org.apache.cassandra.index.sasi.disk.OnDiskIndexBuilder.Mode;
 import org.apache.cassandra.index.sasi.disk.PerSSTableIndexWriter;
 import org.apache.cassandra.index.sasi.plan.QueryPlan;
 import org.apache.cassandra.index.transactions.IndexTransaction;
@@ -49,6 +54,7 @@ import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.notifications.*;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 
 public class SASIIndex implements Index, INotificationConsumer
@@ -67,6 +73,7 @@ public class SASIIndex implements Index, INotificationConsumer
                    .filter((i) -> i instanceof SASIIndex)
                    .forEach((i) -> {
                        SASIIndex sasi = (SASIIndex) i;
+                       sasi.index.dropData(sstablesToRebuild);
                        sstablesToRebuild.stream()
                                         .filter((sstable) -> !sasi.index.hasSSTable(sstable))
                                         .forEach((sstable) -> {
@@ -93,14 +100,55 @@ public class SASIIndex implements Index, INotificationConsumer
         this.baseCfs = baseCfs;
         this.config = config;
 
-        ColumnDefinition column = CassandraIndex.parseTarget(baseCfs.metadata, config).left;
+        ColumnDefinition column = TargetParser.parse(baseCfs.metadata, config).left;
         this.index = new ColumnIndex(baseCfs.metadata.getKeyValidator(), column, config);
 
-        baseCfs.getTracker().subscribe(this);
+        Tracker tracker = baseCfs.getTracker();
+        tracker.subscribe(this);
+
+        SortedMap<SSTableReader, Map<ColumnDefinition, ColumnIndex>> toRebuild = new TreeMap<>((a, b)
+                                                -> Integer.compare(a.descriptor.generation, b.descriptor.generation));
+
+        for (SSTableReader sstable : index.init(tracker.getView().liveSSTables()))
+        {
+            Map<ColumnDefinition, ColumnIndex> perSSTable = toRebuild.get(sstable);
+            if (perSSTable == null)
+                toRebuild.put(sstable, (perSSTable = new HashMap<>()));
+
+            perSSTable.put(index.getDefinition(), index);
+        }
+
+        CompactionManager.instance.submitIndexBuild(new SASIIndexBuilder(baseCfs, toRebuild));
     }
 
-    public static Map<String, String> validateOptions(Map<String, String> options)
+    public static Map<String, String> validateOptions(Map<String, String> options, CFMetaData cfm)
     {
+        if (!(cfm.partitioner instanceof Murmur3Partitioner))
+            throw new ConfigurationException("SASI only supports Murmur3Partitioner.");
+
+        String targetColumn = options.get("target");
+        if (targetColumn == null)
+            throw new ConfigurationException("unknown target column");
+
+        Pair<ColumnDefinition, IndexTarget.Type> target = TargetParser.parse(cfm, targetColumn);
+        if (target == null)
+            throw new ConfigurationException("failed to retrieve target column for: " + targetColumn);
+
+        if (target.left.isComplex())
+            throw new ConfigurationException("complex columns are not yet supported by SASI");
+
+        IndexMode.validateAnalyzer(options);
+
+        IndexMode mode = IndexMode.getMode(target.left, options);
+        if (mode.mode == Mode.SPARSE)
+        {
+            if (mode.isLiteral)
+                throw new ConfigurationException("SPARSE mode is only supported on non-literal columns.");
+
+            if (mode.isAnalyzed)
+                throw new ConfigurationException("SPARSE mode doesn't support analyzers.");
+        }
+
         return Collections.emptyMap();
     }
 
@@ -164,7 +212,7 @@ public class SASIIndex implements Index, INotificationConsumer
 
     public boolean supportsExpression(ColumnDefinition column, Operator operator)
     {
-        return dependsOn(column);
+        return dependsOn(column) && index.supports(operator);
     }
 
     public AbstractType<?> customExpressionValueType()
@@ -270,6 +318,14 @@ public class SASIIndex implements Index, INotificationConsumer
         else if (notification instanceof MemtableRenewedNotification)
         {
             index.switchMemtable();
+        }
+        else if (notification instanceof MemtableSwitchedNotification)
+        {
+            index.switchMemtable(((MemtableSwitchedNotification) notification).memtable);
+        }
+        else if (notification instanceof MemtableDiscardedNotification)
+        {
+            index.discardMemtable(((MemtableDiscardedNotification) notification).memtable);
         }
     }
 

@@ -18,21 +18,26 @@
 package org.apache.cassandra.db.compaction;
 
 import java.util.*;
+import java.util.function.Predicate;
 
 import org.apache.cassandra.db.Memtable;
-import org.apache.cassandra.db.lifecycle.SSTableSet;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+
+import com.google.common.base.Predicates;
 import com.google.common.collect.Iterables;
+import com.google.common.util.concurrent.RateLimiter;
 
 import org.apache.cassandra.db.partitions.Partition;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.util.FileDataInput;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.schema.CompactionParams.TombstoneOption;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.db.ColumnFamilyStore;
-import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.db.PartitionPosition;
+import org.apache.cassandra.db.*;
 import org.apache.cassandra.utils.AlwaysPresentFilter;
-
 import org.apache.cassandra.utils.OverlapIterator;
 import org.apache.cassandra.utils.concurrent.Refs;
 
@@ -44,12 +49,20 @@ import static org.apache.cassandra.db.lifecycle.SSTableIntervalTree.buildInterva
 public class CompactionController implements AutoCloseable
 {
     private static final Logger logger = LoggerFactory.getLogger(CompactionController.class);
+    static final boolean NEVER_PURGE_TOMBSTONES = Boolean.getBoolean("cassandra.never_purge_tombstones");
 
     public final ColumnFamilyStore cfs;
     private final boolean compactingRepaired;
+    // note that overlapIterator and overlappingSSTables will be null if NEVER_PURGE_TOMBSTONES is set - this is a
+    // good thing so that noone starts using them and thinks that if overlappingSSTables is empty, there
+    // is no overlap.
     private Refs<SSTableReader> overlappingSSTables;
     private OverlapIterator<PartitionPosition, SSTableReader> overlapIterator;
     private final Iterable<SSTableReader> compacting;
+    private final RateLimiter limiter;
+    private final long minTimestamp;
+    final TombstoneOption tombstoneOption;
+    final Map<SSTableReader, FileDataInput> openDataFiles = new HashMap<>();
 
     public final int gcBefore;
 
@@ -60,16 +73,35 @@ public class CompactionController implements AutoCloseable
 
     public CompactionController(ColumnFamilyStore cfs, Set<SSTableReader> compacting, int gcBefore)
     {
+        this(cfs, compacting, gcBefore, null,
+             cfs.getCompactionStrategyManager().getCompactionParams().tombstoneOption());
+    }
+
+    public CompactionController(ColumnFamilyStore cfs, Set<SSTableReader> compacting, int gcBefore, RateLimiter limiter, TombstoneOption tombstoneOption)
+    {
         assert cfs != null;
         this.cfs = cfs;
         this.gcBefore = gcBefore;
         this.compacting = compacting;
+        this.limiter = limiter;
         compactingRepaired = compacting != null && compacting.stream().allMatch(SSTableReader::isRepaired);
+        this.tombstoneOption = tombstoneOption;
+        this.minTimestamp = compacting != null && !compacting.isEmpty()       // check needed for test
+                          ? compacting.stream().mapToLong(SSTableReader::getMinTimestamp).min().getAsLong()
+                          : 0;
         refreshOverlaps();
+        if (NEVER_PURGE_TOMBSTONES)
+            logger.warn("You are running with -Dcassandra.never_purge_tombstones=true, this is dangerous!");
     }
 
     public void maybeRefreshOverlaps()
     {
+        if (NEVER_PURGE_TOMBSTONES)
+        {
+            logger.debug("not refreshing overlaps - running with -Dcassandra.never_purge_tombstones=true");
+            return;
+        }
+
         for (SSTableReader reader : overlappingSSTables)
         {
             if (reader.isMarkedCompacted())
@@ -82,13 +114,16 @@ public class CompactionController implements AutoCloseable
 
     private void refreshOverlaps()
     {
+        if (NEVER_PURGE_TOMBSTONES)
+            return;
+
         if (this.overlappingSSTables != null)
-            overlappingSSTables.release();
+            close();
 
         if (compacting == null)
             overlappingSSTables = Refs.tryRef(Collections.<SSTableReader>emptyList());
         else
-            overlappingSSTables = cfs.getAndReferenceOverlappingSSTables(SSTableSet.LIVE, compacting);
+            overlappingSSTables = cfs.getAndReferenceOverlappingLiveSSTables(compacting);
         this.overlapIterator = new OverlapIterator<>(buildIntervals(overlappingSSTables));
     }
 
@@ -103,7 +138,7 @@ public class CompactionController implements AutoCloseable
      * works something like this;
      * 1. find "global" minTimestamp of overlapping sstables, compacting sstables and memtables containing any non-expired data
      * 2. build a list of fully expired candidates
-     * 3. check if the candidates to be dropped actually can be dropped (maxTimestamp < global minTimestamp)
+     * 3. check if the candidates to be dropped actually can be dropped {@code (maxTimestamp < global minTimestamp)}
      *    - if not droppable, remove from candidates
      * 4. return candidates.
      *
@@ -117,7 +152,7 @@ public class CompactionController implements AutoCloseable
     {
         logger.trace("Checking droppable sstables in {}", cfStore);
 
-        if (compacting == null)
+        if (NEVER_PURGE_TOMBSTONES || compacting == null)
             return Collections.<SSTableReader>emptySet();
 
         if (cfStore.getCompactionStrategyManager().onlyPurgeRepairedTombstones() && !Iterables.all(compacting, SSTableReader::isRepaired))
@@ -179,40 +214,61 @@ public class CompactionController implements AutoCloseable
     }
 
     /**
-     * @return the largest timestamp before which it's okay to drop tombstones for the given partition;
-     * i.e., after the maxPurgeableTimestamp there may exist newer data that still needs to be suppressed
-     * in other sstables.  This returns the minimum timestamp for any SSTable that contains this partition and is not
-     * participating in this compaction, or memtable that contains this partition,
-     * or LONG.MAX_VALUE if no SSTable or memtable exist.
+     * @param key
+     * @return a predicate for whether tombstones marked for deletion at the given time for the given partition are
+     * purgeable; we calculate this by checking whether the deletion time is less than the min timestamp of all SSTables
+     * containing his partition and not participating in the compaction. This means there isn't any data in those
+     * sstables that might still need to be suppressed by a tombstone at this timestamp.
      */
-    public long maxPurgeableTimestamp(DecoratedKey key)
+    public Predicate<Long> getPurgeEvaluator(DecoratedKey key)
     {
-        if (!compactingRepaired())
-            return Long.MIN_VALUE;
+        if (NEVER_PURGE_TOMBSTONES || !compactingRepaired())
+            return time -> false;
 
-        long min = Long.MAX_VALUE;
         overlapIterator.update(key);
-        for (SSTableReader sstable : overlapIterator.overlaps())
+        Set<SSTableReader> filteredSSTables = overlapIterator.overlaps();
+        Iterable<Memtable> memtables = cfs.getTracker().getView().getAllMemtables();
+        long minTimestampSeen = Long.MAX_VALUE;
+        boolean hasTimestamp = false;
+
+        for (SSTableReader sstable: filteredSSTables)
         {
             // if we don't have bloom filter(bf_fp_chance=1.0 or filter file is missing),
             // we check index file instead.
-            if ((sstable.getBloomFilter() instanceof AlwaysPresentFilter && sstable.getPosition(key, SSTableReader.Operator.EQ, false) != null)
+            if (sstable.getBloomFilter() instanceof AlwaysPresentFilter && sstable.getPosition(key, SSTableReader.Operator.EQ, false) != null
                 || sstable.getBloomFilter().isPresent(key))
-                min = Math.min(min, sstable.getMinTimestamp());
+            {
+                minTimestampSeen = Math.min(minTimestampSeen, sstable.getMinTimestamp());
+                hasTimestamp = true;
+            }
         }
 
-        for (Memtable memtable : cfs.getTracker().getView().getAllMemtables())
+        for (Memtable memtable : memtables)
         {
             Partition partition = memtable.getPartition(key);
             if (partition != null)
-                min = Math.min(min, partition.stats().minTimestamp);
+            {
+                minTimestampSeen = Math.min(minTimestampSeen, partition.stats().minTimestamp);
+                hasTimestamp = true;
+            }
         }
-        return min;
+
+        if (!hasTimestamp)
+            return time -> true;
+        else
+        {
+            final long finalTimestamp = minTimestampSeen;
+            return time -> time < finalTimestamp;
+        }
     }
 
     public void close()
     {
-        overlappingSSTables.release();
+        if (overlappingSSTables != null)
+            overlappingSSTables.release();
+
+        FileUtils.closeQuietly(openDataFiles.values());
+        openDataFiles.clear();
     }
 
     public boolean compactingRepaired()
@@ -220,4 +276,38 @@ public class CompactionController implements AutoCloseable
         return !cfs.getCompactionStrategyManager().onlyPurgeRepairedTombstones() || compactingRepaired;
     }
 
+    boolean provideTombstoneSources()
+    {
+        return tombstoneOption != TombstoneOption.NONE;
+    }
+
+    // caller must close iterators
+    public Iterable<UnfilteredRowIterator> shadowSources(DecoratedKey key, boolean tombstoneOnly)
+    {
+        if (!provideTombstoneSources() || !compactingRepaired() || NEVER_PURGE_TOMBSTONES)
+            return null;
+        overlapIterator.update(key);
+        return Iterables.filter(Iterables.transform(overlapIterator.overlaps(),
+                                                    reader -> getShadowIterator(reader, key, tombstoneOnly)),
+                                Predicates.notNull());
+    }
+
+    @SuppressWarnings("resource") // caller to close
+    private UnfilteredRowIterator getShadowIterator(SSTableReader reader, DecoratedKey key, boolean tombstoneOnly)
+    {
+        if (reader.isMarkedSuspect() ||
+            reader.getMaxTimestamp() <= minTimestamp ||
+            tombstoneOnly && !reader.hasTombstones())
+            return null;
+        RowIndexEntry<?> position = reader.getPosition(key, SSTableReader.Operator.EQ);
+        if (position == null)
+            return null;
+        FileDataInput dfile = openDataFiles.computeIfAbsent(reader, this::openDataFile);
+        return reader.simpleIterator(dfile, key, position, tombstoneOnly);
+    }
+
+    private FileDataInput openDataFile(SSTableReader reader)
+    {
+        return limiter != null ? reader.openDataReader(limiter) : reader.openDataReader();
+    }
 }

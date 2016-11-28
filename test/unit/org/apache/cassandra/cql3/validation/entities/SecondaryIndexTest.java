@@ -31,6 +31,7 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
 import org.apache.cassandra.cql3.statements.IndexTarget;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DeletionTime;
@@ -43,6 +44,7 @@ import org.apache.cassandra.index.IndexNotAvailableException;
 import org.apache.cassandra.index.SecondaryIndexManager;
 import org.apache.cassandra.index.StubIndex;
 import org.apache.cassandra.index.internal.CustomCassandraIndex;
+import org.apache.cassandra.index.sasi.SASIIndex;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.transport.messages.ResultMessage;
@@ -51,6 +53,8 @@ import org.apache.cassandra.utils.MD5Digest;
 import org.apache.cassandra.utils.Pair;
 
 import static org.apache.cassandra.Util.throwAssert;
+import static org.apache.cassandra.utils.ByteBufferUtil.EMPTY_BYTE_BUFFER;
+import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
@@ -105,7 +109,11 @@ public class SecondaryIndexTest extends CQLTester
                                            removeQuotes(indexName.toLowerCase(Locale.US))),
                              "CREATE INDEX " + indexName + " ON %s(b)");
 
+        // IF NOT EXISTS should apply in cases where the new index differs from an existing one in name only
         String otherIndexName = "index_" + System.nanoTime();
+        assertEquals(1, getCurrentColumnFamilyStore().metadata.getIndexes().size());
+        createIndex("CREATE INDEX IF NOT EXISTS " + otherIndexName + " ON %s(b)");
+        assertEquals(1, getCurrentColumnFamilyStore().metadata.getIndexes().size());
         assertInvalidMessage(String.format("Index %s is a duplicate of existing index %s",
                                            removeQuotes(otherIndexName.toLowerCase(Locale.US)),
                                            removeQuotes(indexName.toLowerCase(Locale.US))),
@@ -131,7 +139,7 @@ public class SecondaryIndexTest extends CQLTester
             execute("DROP INDEX " + indexName);
         }
 
-        assertInvalidMessage("No supported secondary index found for the non primary key columns restrictions",
+        assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE,
                              "SELECT * FROM %s where b = ?", 1);
         dropIndex("DROP INDEX IF EXISTS " + indexName);
         assertInvalidMessage(String.format("Index '%s' could not be found",
@@ -166,10 +174,12 @@ public class SecondaryIndexTest extends CQLTester
         execute("INSERT INTO %s (userid, firstname, lastname, age) VALUES (?, 'Frodo', 'Baggins', 32)", id1);
         execute("UPDATE %s SET firstname = 'Samwise', lastname = 'Gamgee', age = 33 WHERE userid = ?", id2);
 
-        assertEmpty(execute("SELECT firstname FROM %s WHERE userid = ? AND age = 33", id1));
+        beforeAndAfterFlush(() -> {
+            assertEmpty(execute("SELECT firstname FROM %s WHERE userid = ? AND age = 33", id1));
 
-        assertRows(execute("SELECT firstname FROM %s WHERE userid = ? AND age = 33", id2),
-                   row("Samwise"));
+            assertRows(execute("SELECT firstname FROM %s WHERE userid = ? AND age = 33", id2),
+                       row("Samwise"));
+        });
     }
 
     /**
@@ -187,9 +197,11 @@ public class SecondaryIndexTest extends CQLTester
         execute("INSERT INTO %s (id, birth_year) VALUES ('Paul', 24)");
         execute("INSERT INTO %s (id, birth_year) VALUES ('Bob', 42)");
 
-        assertRows(execute("SELECT id FROM %s WHERE birth_year = 42"),
-                   row("Tom"),
-                   row("Bob"));
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT id FROM %s WHERE birth_year = 42"),
+                       row("Tom"),
+                       row("Bob"));
+        });
 
         execute("DROP INDEX %s_birth_year_idx");
 
@@ -213,8 +225,10 @@ public class SecondaryIndexTest extends CQLTester
 
         assertInvalid("SELECT * FROM %s WHERE setid = 0 AND row < 1");
 
-        assertRows(execute("SELECT * FROM %s WHERE setid = 0 AND row < 1 ALLOW FILTERING"),
-                   row(0, 0, 0));
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT * FROM %s WHERE setid = 0 AND row < 1 ALLOW FILTERING"),
+                       row(0, 0, 0));
+        });
     }
 
     /**
@@ -229,16 +243,6 @@ public class SecondaryIndexTest extends CQLTester
 
         assertInvalidThrow(ConfigurationException.class, String.format("CREATE TABLE %s (key varchar PRIMARY KEY, password varchar, gender varchar) WITH compression = { 'sstable_compressor': 'DeflateCompressor' }",
                                                                        tableName));
-    }
-
-    /**
-     * Check one can use arbitrary name for datacenter when creating keyspace (#4278),
-     * migrated from cql_tests.py:TestCQL.keyspace_creation_options_test()
-     */
-    @Test
-    public void testDataCenterName() throws Throwable
-    {
-       execute("CREATE KEYSPACE Foo WITH replication = { 'class' : 'NetworkTopologyStrategy', 'us-east' : 1, 'us-west' : 1 };");
     }
 
     /**
@@ -259,27 +263,33 @@ public class SecondaryIndexTest extends CQLTester
 
         assertTrue(waitForIndex(keyspace(), tableName, "authoridx"));
 
-        assertRows(execute("SELECT blog_id, timestamp FROM %s WHERE author = 'bob'"),
-                   row(1, 0),
-                   row(0, 0),
-                   row(0, 2));
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT blog_id, timestamp FROM %s WHERE author = 'bob'"),
+                       row(1, 0),
+                       row(0, 0),
+                       row(0, 2));
+        });
 
         execute("INSERT INTO %s (blog_id, timestamp, author, content) VALUES (?, ?, ?, ?)", 1, 1, "tom", "6th post");
         execute("INSERT INTO %s (blog_id, timestamp, author, content) VALUES (?, ?, ?, ?)", 1, 2, "tom", "7th post");
         execute("INSERT INTO %s (blog_id, timestamp, author, content) VALUES (?, ?, ?, ?)", 1, 3, "bob", "8th post");
 
-        assertRows(execute("SELECT blog_id, timestamp FROM %s WHERE author = 'bob'"),
-                   row(1, 0),
-                   row(1, 3),
-                   row(0, 0),
-                   row(0, 2));
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT blog_id, timestamp FROM %s WHERE author = 'bob'"),
+                       row(1, 0),
+                       row(1, 3),
+                       row(0, 0),
+                       row(0, 2));
+        });
 
         execute("DELETE FROM %s WHERE blog_id = 0 AND timestamp = 2");
 
-        assertRows(execute("SELECT blog_id, timestamp FROM %s WHERE author = 'bob'"),
-                   row(1, 0),
-                   row(1, 3),
-                   row(0, 0));
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT blog_id, timestamp FROM %s WHERE author = 'bob'"),
+                       row(1, 0),
+                       row(1, 3),
+                       row(0, 0));
+        });
     }
 
     /**
@@ -329,17 +339,19 @@ public class SecondaryIndexTest extends CQLTester
         execute("INSERT INTO %s (pk0, pk1, ck0, ck1, ck2, value) VALUES (4, 5, 0, 1, 2, 3)");
         execute("INSERT INTO %s (pk0, pk1, ck0, ck1, ck2, value) VALUES (5, 0, 1, 2, 3, 4)");
 
-        assertRows(execute("SELECT value FROM %s WHERE pk0 = 2"),
-                   row(1));
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT value FROM %s WHERE pk0 = 2"),
+                       row(1));
 
-        assertRows(execute("SELECT value FROM %s WHERE ck0 = 0"),
-                   row(3));
+            assertRows(execute("SELECT value FROM %s WHERE ck0 = 0"),
+                       row(3));
 
-        assertRows(execute("SELECT value FROM %s WHERE pk0 = 3 AND pk1 = 4 AND ck1 = 0"),
-                   row(2));
+            assertRows(execute("SELECT value FROM %s WHERE pk0 = 3 AND pk1 = 4 AND ck1 = 0"),
+                       row(2));
 
-        assertRows(execute("SELECT value FROM %s WHERE pk0 = 5 AND pk1 = 0 AND ck0 = 1 AND ck2 = 3 ALLOW FILTERING"),
-                   row(4));
+            assertRows(execute("SELECT value FROM %s WHERE pk0 = 5 AND pk1 = 0 AND ck0 = 1 AND ck2 = 3 ALLOW FILTERING"),
+                       row(4));
+        });
     }
 
     /**
@@ -362,8 +374,11 @@ public class SecondaryIndexTest extends CQLTester
         execute("insert into %s (interval, seq, id , severity) values('t',2, 3, 1)");
         execute("insert into %s (interval, seq, id , severity) values('t',2, 4, 2)");
 
-        assertRows(execute("select * from %s where severity = 3 and interval = 't' and seq =1"),
-                   row("t", 1, 4, 3));
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("select * from %s where severity = 3 and interval = 't' and seq =1"),
+                       row("t", 1, 4, 3));
+
+        });
     }
 
     /**
@@ -394,23 +409,25 @@ public class SecondaryIndexTest extends CQLTester
         execute("INSERT INTO %s (k, v, l, s, m) VALUES (1, 0, [1, 2, 4], {},         {'b' : 1})");
         execute("INSERT INTO %s (k, v, l, s, m) VALUES (1, 1, [4, 5],    {'d'},      {'a' : 1, 'b' : 3})");
 
-        // lists
-        assertRows(execute("SELECT k, v FROM %s WHERE l CONTAINS 1"), row(1, 0), row(0, 0), row(0, 2));
-        assertRows(execute("SELECT k, v FROM %s WHERE k = 0 AND l CONTAINS 1"), row(0, 0), row(0, 2));
-        assertRows(execute("SELECT k, v FROM %s WHERE l CONTAINS 2"), row(1, 0), row(0, 0));
-        assertEmpty(execute("SELECT k, v FROM %s WHERE l CONTAINS 6"));
+        beforeAndAfterFlush(() -> {
+            // lists
+            assertRows(execute("SELECT k, v FROM %s WHERE l CONTAINS 1"), row(1, 0), row(0, 0), row(0, 2));
+            assertRows(execute("SELECT k, v FROM %s WHERE k = 0 AND l CONTAINS 1"), row(0, 0), row(0, 2));
+            assertRows(execute("SELECT k, v FROM %s WHERE l CONTAINS 2"), row(1, 0), row(0, 0));
+            assertEmpty(execute("SELECT k, v FROM %s WHERE l CONTAINS 6"));
 
-        // sets
-        assertRows(execute("SELECT k, v FROM %s WHERE s CONTAINS 'a'"), row(0, 0), row(0, 2));
-        assertRows(execute("SELECT k, v FROM %s WHERE k = 0 AND s CONTAINS 'a'"), row(0, 0), row(0, 2));
-        assertRows(execute("SELECT k, v FROM %s WHERE s CONTAINS 'd'"), row(1, 1));
-        assertEmpty(execute("SELECT k, v FROM %s  WHERE s CONTAINS 'e'"));
+            // sets
+            assertRows(execute("SELECT k, v FROM %s WHERE s CONTAINS 'a'"), row(0, 0), row(0, 2));
+            assertRows(execute("SELECT k, v FROM %s WHERE k = 0 AND s CONTAINS 'a'"), row(0, 0), row(0, 2));
+            assertRows(execute("SELECT k, v FROM %s WHERE s CONTAINS 'd'"), row(1, 1));
+            assertEmpty(execute("SELECT k, v FROM %s  WHERE s CONTAINS 'e'"));
 
-        // maps
-        assertRows(execute("SELECT k, v FROM %s WHERE m CONTAINS 1"), row(1, 0), row(1, 1), row(0, 0), row(0, 1));
-        assertRows(execute("SELECT k, v FROM %s WHERE k = 0 AND m CONTAINS 1"), row(0, 0), row(0, 1));
-        assertRows(execute("SELECT k, v FROM %s WHERE m CONTAINS 2"), row(0, 1));
-        assertEmpty(execute("SELECT k, v FROM %s  WHERE m CONTAINS 4"));
+            // maps
+            assertRows(execute("SELECT k, v FROM %s WHERE m CONTAINS 1"), row(1, 0), row(1, 1), row(0, 0), row(0, 1));
+            assertRows(execute("SELECT k, v FROM %s WHERE k = 0 AND m CONTAINS 1"), row(0, 0), row(0, 1));
+            assertRows(execute("SELECT k, v FROM %s WHERE m CONTAINS 2"), row(0, 1));
+            assertEmpty(execute("SELECT k, v FROM %s  WHERE m CONTAINS 4"));
+        });
     }
 
     /**
@@ -430,10 +447,12 @@ public class SecondaryIndexTest extends CQLTester
         execute("INSERT INTO %s (k, v, m) VALUES (1, 1, {'a' : 1, 'b' : 3})");
 
         // maps
-        assertRows(execute("SELECT k, v FROM %s WHERE m CONTAINS KEY 'a'"), row(1, 1), row(0, 0), row(0, 1));
-        assertRows(execute("SELECT k, v FROM %s WHERE k = 0 AND m CONTAINS KEY 'a'"), row(0, 0), row(0, 1));
-        assertRows(execute("SELECT k, v FROM %s WHERE m CONTAINS KEY 'c'"), row(0, 2));
-        assertEmpty(execute("SELECT k, v FROM %s  WHERE m CONTAINS KEY 'd'"));
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT k, v FROM %s WHERE m CONTAINS KEY 'a'"), row(1, 1), row(0, 0), row(0, 1));
+            assertRows(execute("SELECT k, v FROM %s WHERE k = 0 AND m CONTAINS KEY 'a'"), row(0, 0), row(0, 1));
+            assertRows(execute("SELECT k, v FROM %s WHERE m CONTAINS KEY 'c'"), row(0, 2));
+            assertEmpty(execute("SELECT k, v FROM %s  WHERE m CONTAINS KEY 'd'"));
+        });
     }
 
     /**
@@ -456,10 +475,12 @@ public class SecondaryIndexTest extends CQLTester
         execute("INSERT INTO %s (k1, k2, v) VALUES (2, 1, 8)");
         execute("INSERT INTO %s (k1, k2, v) VALUES (3, 0, 1)");
 
-        assertRows(execute("SELECT * FROM %s WHERE k2 = 0 AND v >= 2 ALLOW FILTERING"),
-                   row(2, 0, 7),
-                   row(0, 0, 3),
-                   row(1, 0, 4));
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT * FROM %s WHERE k2 = 0 AND v >= 2 ALLOW FILTERING"),
+                       row(2, 0, 7),
+                       row(0, 0, 3),
+                       row(1, 0, 4));
+        });
     }
 
     /**
@@ -474,11 +495,15 @@ public class SecondaryIndexTest extends CQLTester
         createIndex("create index ON %s (app_name)");
         createIndex("create index ON %s (last_access)");
 
-        assertRows(execute("select count(*) from %s where app_name='foo' and account='bar' and last_access > 4 allow filtering"), row(0L));
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("select count(*) from %s where app_name='foo' and account='bar' and last_access > 4 allow filtering"), row(0L));
+        });
 
         execute("insert into %s (username, session_id, app_name, account, last_access, created_on) values ('toto', 'foo', 'foo', 'bar', 12, 13)");
 
-        assertRows(execute("select count(*) from %s where app_name='foo' and account='bar' and last_access > 4 allow filtering"), row(1L));
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("select count(*) from %s where app_name='foo' and account='bar' and last_access > 4 allow filtering"), row(1L));
+        });
     }
 
     @Test
@@ -678,6 +703,65 @@ public class SecondaryIndexTest extends CQLTester
         failInsert("BEGIN BATCH\n" +
                    "INSERT INTO %s (a, b) VALUES (0, ?) IF NOT EXISTS;\n" +
                    "APPLY BATCH", map);
+    }
+
+    @Test
+    public void prepareStatementsWithLIKEClauses() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, c1 text, c2 text, v1 text, v2 text, v3 int, PRIMARY KEY (a, c1, c2))");
+        createIndex(String.format("CREATE CUSTOM INDEX c1_idx on %%s(c1) USING '%s' WITH OPTIONS = {'mode' : 'PREFIX'}",
+                                  SASIIndex.class.getName()));
+        createIndex(String.format("CREATE CUSTOM INDEX c2_idx on %%s(c2) USING '%s' WITH OPTIONS = {'mode' : 'CONTAINS'}",
+                                  SASIIndex.class.getName()));
+        createIndex(String.format("CREATE CUSTOM INDEX v1_idx on %%s(v1) USING '%s' WITH OPTIONS = {'mode' : 'PREFIX'}",
+                                  SASIIndex.class.getName()));
+        createIndex(String.format("CREATE CUSTOM INDEX v2_idx on %%s(v2) USING '%s' WITH OPTIONS = {'mode' : 'CONTAINS'}",
+                                  SASIIndex.class.getName()));
+        createIndex(String.format("CREATE CUSTOM INDEX v3_idx on %%s(v3) USING '%s'", SASIIndex.class.getName()));
+
+        forcePreparedValues();
+        // prefix mode indexes support prefix/contains/matches
+        assertInvalidMessage("c1 LIKE '%<term>' abc is only supported on properly indexed columns",
+                             "SELECT * FROM %s WHERE c1 LIKE ?",
+                             "%abc");
+        assertInvalidMessage("c1 LIKE '%<term>%' abc is only supported on properly indexed columns",
+                             "SELECT * FROM %s WHERE c1 LIKE ?",
+                             "%abc%");
+        execute("SELECT * FROM %s WHERE c1 LIKE ?", "abc%");
+        execute("SELECT * FROM %s WHERE c1 LIKE ?", "abc");
+        assertInvalidMessage("v1 LIKE '%<term>' abc is only supported on properly indexed columns",
+                             "SELECT * FROM %s WHERE v1 LIKE ?",
+                             "%abc");
+        assertInvalidMessage("v1 LIKE '%<term>%' abc is only supported on properly indexed columns",
+                             "SELECT * FROM %s WHERE v1 LIKE ?",
+                             "%abc%");
+        execute("SELECT * FROM %s WHERE v1 LIKE ?", "abc%");
+        execute("SELECT * FROM %s WHERE v1 LIKE ?", "abc");
+
+        // contains mode indexes support prefix/suffix/contains/matches
+        execute("SELECT * FROM %s WHERE c2 LIKE ?", "abc%");
+        execute("SELECT * FROM %s WHERE c2 LIKE ?", "%abc");
+        execute("SELECT * FROM %s WHERE c2 LIKE ?", "%abc%");
+        execute("SELECT * FROM %s WHERE c2 LIKE ?", "abc");
+        execute("SELECT * FROM %s WHERE v2 LIKE ?", "abc%");
+        execute("SELECT * FROM %s WHERE v2 LIKE ?", "%abc");
+        execute("SELECT * FROM %s WHERE v2 LIKE ?", "%abc%");
+        execute("SELECT * FROM %s WHERE v2 LIKE ?", "abc");
+
+        // LIKE is not supported on indexes of non-literal values
+        // this is rejected before binding, so the value isn't available in the error message
+        assertInvalidMessage("LIKE restriction is only supported on properly indexed columns. v3 LIKE ? is not valid",
+                             "SELECT * FROM %s WHERE v3 LIKE ?",
+                             "%abc");
+        assertInvalidMessage("LIKE restriction is only supported on properly indexed columns. v3 LIKE ? is not valid",
+                             "SELECT * FROM %s WHERE v3 LIKE ?",
+                             "%abc%");
+        assertInvalidMessage("LIKE restriction is only supported on properly indexed columns. v3 LIKE ? is not valid",
+                             "SELECT * FROM %s WHERE v3 LIKE ?",
+                             "%abc%");
+        assertInvalidMessage("LIKE restriction is only supported on properly indexed columns. v3 LIKE ? is not valid",
+                             "SELECT * FROM %s WHERE v3 LIKE ?",
+                             "abc");
     }
 
     public void failInsert(String insertCQL, Object...args) throws Throwable
@@ -979,6 +1063,230 @@ public class SecondaryIndexTest extends CQLTester
         execute("DELETE FROM %s WHERE a = 1 AND b = 1");
         assertEmpty(execute("SELECT * FROM %s WHERE b = 0"));
         assertEmpty(execute("SELECT * FROM %s WHERE d = 3"));
+    }
+
+    @Test
+    public void testWithEmptyRestrictionValueAndSecondaryIndex() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk blob, c blob, v blob, PRIMARY KEY ((pk), c))");
+        createIndex("CREATE INDEX on %s(c)");
+        createIndex("CREATE INDEX on %s(v)");
+
+        execute("INSERT INTO %s (pk, c, v) VALUES (?, ?, ?)", bytes("foo123"), bytes("1"), bytes("1"));
+        execute("INSERT INTO %s (pk, c, v) VALUES (?, ?, ?)", bytes("foo123"), bytes("2"), bytes("1"));
+
+        beforeAndAfterFlush(() -> {
+            // Test clustering columns restrictions
+            assertEmpty(execute("SELECT * FROM %s WHERE pk = textAsBlob('foo123') AND c = textAsBlob('');"));
+
+            assertEmpty(execute("SELECT * FROM %s WHERE pk = textAsBlob('foo123') AND (c) = (textAsBlob(''));"));
+
+            assertRows(execute("SELECT * FROM %s WHERE pk = textAsBlob('foo123') AND c IN (textAsBlob(''), textAsBlob('1'));"),
+                       row(bytes("foo123"), bytes("1"), bytes("1")));
+
+            assertRows(execute("SELECT * FROM %s WHERE pk = textAsBlob('foo123') AND (c) IN ((textAsBlob('')), (textAsBlob('1')));"),
+                       row(bytes("foo123"), bytes("1"), bytes("1")));
+
+            assertRows(execute("SELECT * FROM %s WHERE pk = textAsBlob('foo123') AND c > textAsBlob('') AND v = textAsBlob('1') ALLOW FILTERING;"),
+                       row(bytes("foo123"), bytes("1"), bytes("1")),
+                       row(bytes("foo123"), bytes("2"), bytes("1")));
+
+            assertRows(execute("SELECT * FROM %s WHERE pk = textAsBlob('foo123') AND c >= textAsBlob('') AND v = textAsBlob('1') ALLOW FILTERING;"),
+                       row(bytes("foo123"), bytes("1"), bytes("1")),
+                       row(bytes("foo123"), bytes("2"), bytes("1")));
+
+            assertRows(execute("SELECT * FROM %s WHERE pk = textAsBlob('foo123') AND (c) >= (textAsBlob('')) AND v = textAsBlob('1') ALLOW FILTERING;"),
+                       row(bytes("foo123"), bytes("1"), bytes("1")),
+                       row(bytes("foo123"), bytes("2"), bytes("1")));
+
+            assertEmpty(execute("SELECT * FROM %s WHERE pk = textAsBlob('foo123') AND c <= textAsBlob('') AND v = textAsBlob('1') ALLOW FILTERING;"));
+
+            assertEmpty(execute("SELECT * FROM %s WHERE pk = textAsBlob('foo123') AND (c) <= (textAsBlob('')) AND v = textAsBlob('1') ALLOW FILTERING;"));
+
+            assertEmpty(execute("SELECT * FROM %s WHERE pk = textAsBlob('foo123') AND (c) < (textAsBlob('')) AND v = textAsBlob('1') ALLOW FILTERING;"));
+
+            assertEmpty(execute("SELECT * FROM %s WHERE pk = textAsBlob('foo123') AND c < textAsBlob('') AND v = textAsBlob('1') ALLOW FILTERING;"));
+
+            assertEmpty(execute("SELECT * FROM %s WHERE pk = textAsBlob('foo123') AND c > textAsBlob('') AND c < textAsBlob('') AND v = textAsBlob('1') ALLOW FILTERING;"));
+
+            assertEmpty(execute("SELECT * FROM %s WHERE pk = textAsBlob('foo123') AND (c) > (textAsBlob('')) AND (c) < (textAsBlob('')) AND v = textAsBlob('1') ALLOW FILTERING;"));
+        });
+
+        execute("INSERT INTO %s (pk, c, v) VALUES (?, ?, ?)",
+                bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1"));
+
+        beforeAndAfterFlush(() -> {
+
+            assertRows(execute("SELECT * FROM %s WHERE pk = textAsBlob('foo123') AND c = textAsBlob('');"),
+                       row(bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1")));
+
+            assertRows(execute("SELECT * FROM %s WHERE pk = textAsBlob('foo123') AND (c) = (textAsBlob(''));"),
+                       row(bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1")));
+
+            assertRows(execute("SELECT * FROM %s WHERE pk = textAsBlob('foo123') AND c IN (textAsBlob(''), textAsBlob('1'));"),
+                       row(bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1")),
+                       row(bytes("foo123"), bytes("1"), bytes("1")));
+
+            assertRows(execute("SELECT * FROM %s WHERE pk = textAsBlob('foo123') AND (c) IN ((textAsBlob('')), (textAsBlob('1')));"),
+                       row(bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1")),
+                       row(bytes("foo123"), bytes("1"), bytes("1")));
+
+            assertRows(execute("SELECT * FROM %s WHERE pk = textAsBlob('foo123') AND c > textAsBlob('') AND v = textAsBlob('1') ALLOW FILTERING;"),
+                       row(bytes("foo123"), bytes("1"), bytes("1")),
+                       row(bytes("foo123"), bytes("2"), bytes("1")));
+
+            assertRows(execute("SELECT * FROM %s WHERE pk = textAsBlob('foo123') AND c >= textAsBlob('') AND v = textAsBlob('1') ALLOW FILTERING;"),
+                       row(bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1")),
+                       row(bytes("foo123"), bytes("1"), bytes("1")),
+                       row(bytes("foo123"), bytes("2"), bytes("1")));
+
+            assertRows(execute("SELECT * FROM %s WHERE pk = textAsBlob('foo123') AND (c) >= (textAsBlob('')) AND v = textAsBlob('1') ALLOW FILTERING;"),
+                       row(bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1")),
+                       row(bytes("foo123"), bytes("1"), bytes("1")),
+                       row(bytes("foo123"), bytes("2"), bytes("1")));
+
+            assertRows(execute("SELECT * FROM %s WHERE pk = textAsBlob('foo123') AND c <= textAsBlob('') AND v = textAsBlob('1') ALLOW FILTERING;"),
+                       row(bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1")));
+
+            assertRows(execute("SELECT * FROM %s WHERE pk = textAsBlob('foo123') AND (c) <= (textAsBlob('')) AND v = textAsBlob('1') ALLOW FILTERING;"),
+                       row(bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1")));
+
+            assertEmpty(execute("SELECT * FROM %s WHERE pk = textAsBlob('foo123') AND c < textAsBlob('') AND v = textAsBlob('1') ALLOW FILTERING;"));
+
+            assertEmpty(execute("SELECT * FROM %s WHERE pk = textAsBlob('foo123') AND (c) < (textAsBlob('')) AND v = textAsBlob('1') ALLOW FILTERING;"));
+
+            assertEmpty(execute("SELECT * FROM %s WHERE pk = textAsBlob('foo123') AND c >= textAsBlob('') AND c < textAsBlob('') AND v = textAsBlob('1') ALLOW FILTERING;"));
+
+            assertEmpty(execute("SELECT * FROM %s WHERE pk = textAsBlob('foo123') AND (c) >= (textAsBlob('')) AND c < textAsBlob('') AND v = textAsBlob('1') ALLOW FILTERING;"));
+
+            // Test restrictions on non-primary key value
+            assertEmpty(execute("SELECT * FROM %s WHERE pk = textAsBlob('foo123') AND v = textAsBlob('');"));
+        });
+
+        execute("INSERT INTO %s (pk, c, v) VALUES (?, ?, ?)",
+                bytes("foo123"), bytes("3"), EMPTY_BYTE_BUFFER);
+
+        beforeAndAfterFlush(() -> {
+
+            assertRows(execute("SELECT * FROM %s WHERE pk = textAsBlob('foo123') AND v = textAsBlob('');"),
+                       row(bytes("foo123"), bytes("3"), EMPTY_BYTE_BUFFER));
+        });
+    }
+
+    @Test
+    public void testEmptyRestrictionValueWithSecondaryIndexAndCompactTables() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk blob, c blob, v blob, PRIMARY KEY ((pk), c)) WITH COMPACT STORAGE");
+        assertInvalidMessage("Secondary indexes are not supported on COMPACT STORAGE tables that have clustering columns",
+                            "CREATE INDEX on %s(c)");
+
+        createTable("CREATE TABLE %s (pk blob PRIMARY KEY, v blob) WITH COMPACT STORAGE");
+        createIndex("CREATE INDEX on %s(v)");
+
+        execute("INSERT INTO %s (pk, v) VALUES (?, ?)", bytes("foo123"), bytes("1"));
+
+        // Test restrictions on non-primary key value
+        assertEmpty(execute("SELECT * FROM %s WHERE pk = textAsBlob('foo123') AND v = textAsBlob('');"));
+
+        execute("INSERT INTO %s (pk, v) VALUES (?, ?)", bytes("foo124"), EMPTY_BYTE_BUFFER);
+
+        assertRows(execute("SELECT * FROM %s WHERE v = textAsBlob('');"),
+                   row(bytes("foo124"), EMPTY_BYTE_BUFFER));
+    }
+
+    @Test
+    public void testPartitionKeyWithIndex() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b int, c int, PRIMARY KEY ((a, b)))");
+        createIndex("CREATE INDEX ON %s (a);");
+        createIndex("CREATE INDEX ON %s (b);");
+
+        execute("INSERT INTO %s (a, b, c) VALUES (1,2,3)");
+        execute("INSERT INTO %s (a, b, c) VALUES (2,3,4)");
+        execute("INSERT INTO %s (a, b, c) VALUES (5,6,7)");
+
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT * FROM %s WHERE a = 1"),
+                       row(1, 2, 3));
+            assertRows(execute("SELECT * FROM %s WHERE b = 3"),
+                       row(2, 3, 4));
+
+        });
+    }
+
+    @Test
+    public void testAllowFilteringOnPartitionKeyWithSecondaryIndex() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk1 int, pk2 int, c1 int, c2 int, v int, " +
+                    "PRIMARY KEY ((pk1, pk2), c1, c2))");
+        createIndex("CREATE INDEX v_idx_1 ON %s (v);");
+
+        for (int i = 1; i <= 5; i++)
+        {
+            for (int j = 1; j <= 2; j++)
+            {
+                execute("INSERT INTO %s (pk1, pk2, c1, c2, v) VALUES (?, ?, ?, ?, ?)", j, 1, 1, 1, i);
+                execute("INSERT INTO %s (pk1, pk2, c1, c2, v) VALUES (?, ?, ?, ?, ?)", j, 1, 1, i, i);
+                execute("INSERT INTO %s (pk1, pk2, c1, c2, v) VALUES (?, ?, ?, ?, ?)", j, 1, i, i, i);
+                execute("INSERT INTO %s (pk1, pk2, c1, c2, v) VALUES (?, ?, ?, ?, ?)", j, i, i, i, i);
+            }
+        }
+
+        beforeAndAfterFlush(() -> {
+            assertEmpty(execute("SELECT * FROM %s WHERE pk1 = 1 AND  c1 > 0 AND c1 < 5 AND c2 = 1 AND v = 3 ALLOW FILTERING;"));
+
+            assertRows(execute("SELECT * FROM %s WHERE pk1 = 1 AND  c1 > 0 AND c1 < 5 AND c2 = 3 AND v = 3 ALLOW FILTERING;"),
+                       row(1, 3, 3, 3, 3),
+                       row(1, 1, 1, 3, 3),
+                       row(1, 1, 3, 3, 3));
+
+            assertEmpty(execute("SELECT * FROM %s WHERE pk1 = 1 AND  c2 > 1 AND c2 < 5 AND v = 1 ALLOW FILTERING;"));
+
+            assertRows(execute("SELECT * FROM %s WHERE pk1 = 1 AND  c1 > 1 AND c2 > 2 AND v = 3 ALLOW FILTERING;"),
+                       row(1, 3, 3, 3, 3),
+                       row(1, 1, 3, 3, 3));
+
+            assertRows(execute("SELECT * FROM %s WHERE pk1 = 1 AND  pk2 > 1 AND c2 > 2 AND v = 3 ALLOW FILTERING;"),
+                       row(1, 3, 3, 3, 3));
+
+            assertRowsIgnoringOrder(execute("SELECT * FROM %s WHERE pk2 > 1 AND  c1 IN(0,1,2) AND v <= 3 ALLOW FILTERING;"),
+                                    row(1, 2, 2, 2, 2),
+                                    row(2, 2, 2, 2, 2));
+
+            assertRows(execute("SELECT * FROM %s WHERE pk1 >= 2 AND pk2 <=3 AND  c1 IN(0,1,2) AND c2 IN(0,1,2) AND v < 3  ALLOW FILTERING;"),
+                       row(2, 2, 2, 2, 2),
+                       row(2, 1, 1, 2, 2),
+                       row(2, 1, 2, 2, 2));
+
+            assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE,
+                                 "SELECT * FROM %s WHERE pk1 >= 1 AND pk2 <=3 AND  c1 IN(0,1,2) AND c2 IN(0,1,2) AND v = 3");
+        });
+    }
+
+    @Test
+    public void testAllowFilteringOnPartitionKeyWithIndexForContains() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k1 int, k2 int, v set<int>, PRIMARY KEY ((k1, k2)))");
+        createIndex("CREATE INDEX ON %s(k2)");
+
+        execute("INSERT INTO %s (k1, k2, v) VALUES (?, ?, ?)", 0, 0, set(1, 2, 3));
+        execute("INSERT INTO %s (k1, k2, v) VALUES (?, ?, ?)", 0, 1, set(2, 3, 4));
+        execute("INSERT INTO %s (k1, k2, v) VALUES (?, ?, ?)", 1, 0, set(3, 4, 5));
+        execute("INSERT INTO %s (k1, k2, v) VALUES (?, ?, ?)", 1, 1, set(4, 5, 6));
+
+        beforeAndAfterFlush(() -> {
+            assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE,
+                                 "SELECT * FROM %s WHERE k2 > ?", 0);
+
+            assertRows(execute("SELECT * FROM %s WHERE k2 > ? ALLOW FILTERING", 0),
+                       row(0, 1, set(2, 3, 4)),
+                       row(1, 1, set(4, 5, 6)));
+
+            assertRows(execute("SELECT * FROM %s WHERE k2 >= ? AND v CONTAINS ? ALLOW FILTERING", 1, 6),
+                       row(1, 1, set(4, 5, 6)));
+
+            assertEmpty(execute("SELECT * FROM %s WHERE k2 < ? AND v CONTAINS ? ALLOW FILTERING", 0, 7));
+        });
     }
 
     private ResultMessage.Prepared prepareStatement(String cql, boolean forThrift)

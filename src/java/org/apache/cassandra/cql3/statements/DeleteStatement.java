@@ -122,7 +122,7 @@ public class DeleteStatement extends ModificationStatement
                       Attributes.Raw attrs,
                       List<Operation.RawDeletion> deletions,
                       WhereClause whereClause,
-                      List<Pair<ColumnIdentifier.Raw, ColumnCondition.Raw>> conditions,
+                      List<Pair<ColumnDefinition.Raw, ColumnCondition.Raw>> conditions,
                       boolean ifExists)
         {
             super(name, StatementType.DELETE, attrs, conditions, false, ifExists);
@@ -147,7 +147,7 @@ public class DeleteStatement extends ModificationStatement
                 // list. However, we support having the value name for coherence with the static/sparse case
                 checkFalse(def.isPrimaryKeyColumn(), "Invalid identifier %s for deletion (should not be a PRIMARY KEY part)", def.name);
 
-                Operation op = deletion.prepare(cfm.ksName, def);
+                Operation op = deletion.prepare(cfm.ksName, def, cfm);
                 op.collectMarkerSpecification(boundNames);
                 operations.add(op);
             }
@@ -165,10 +165,17 @@ public class DeleteStatement extends ModificationStatement
                                                        conditions,
                                                        attrs);
 
-            if (stmt.hasConditions())
-                checkTrue(restrictions.hasAllPKColumnsRestrictedByEqualities(),
-                          "DELETE statements must restrict all PRIMARY KEY columns with equality relations" +
-                          " in order to use IF conditions");
+            if (stmt.hasConditions() && !restrictions.hasAllPKColumnsRestrictedByEqualities())
+            {
+                checkFalse(operations.appliesToRegularColumns(),
+                           "DELETE statements must restrict all PRIMARY KEY columns with equality relations in order to delete non static columns");
+
+                // All primary keys must be specified, unless this has static column restrictions
+                checkFalse(conditions.appliesToRegularColumns(),
+                           "DELETE statements must restrict all PRIMARY KEY columns with equality relations" +
+                           " in order to use IF condition on non static columns");
+            }
+
             return stmt;
         }
     }

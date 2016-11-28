@@ -29,6 +29,7 @@ import org.apache.cassandra.exceptions.SyntaxException;
 import org.apache.cassandra.serializers.CollectionSerializer;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.serializers.ListSerializer;
+import org.apache.cassandra.transport.ProtocolVersion;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -75,9 +76,15 @@ public class ListType<T> extends CollectionType<List<T>>
     }
 
     @Override
-    public boolean references(AbstractType<?> check)
+    public boolean referencesUserType(String userTypeName)
     {
-        return super.references(check) || elements.references(check);
+        return getElementsType().referencesUserType(userTypeName);
+    }
+
+    @Override
+    public boolean referencesDuration()
+    {
+        return getElementsType().referencesDuration();
     }
 
     public AbstractType<T> getElementsType()
@@ -107,6 +114,18 @@ public class ListType<T> extends CollectionType<List<T>>
             return getInstance(this.elements, false);
         else
             return this;
+    }
+
+    @Override
+    public AbstractType<?> freezeNestedMulticellTypes()
+    {
+        if (!isMultiCell())
+            return this;
+
+        if (elements.isFreezable() && elements.isMultiCell())
+            return getInstance(elements.freeze(), isMultiCell);
+
+        return getInstance(elements.freezeNestedMulticellTypes(), isMultiCell);
     }
 
     @Override
@@ -144,13 +163,13 @@ public class ListType<T> extends CollectionType<List<T>>
         ByteBuffer bb1 = o1.duplicate();
         ByteBuffer bb2 = o2.duplicate();
 
-        int size1 = CollectionSerializer.readCollectionSize(bb1, 3);
-        int size2 = CollectionSerializer.readCollectionSize(bb2, 3);
+        int size1 = CollectionSerializer.readCollectionSize(bb1, ProtocolVersion.V3);
+        int size2 = CollectionSerializer.readCollectionSize(bb2, ProtocolVersion.V3);
 
         for (int i = 0; i < Math.min(size1, size2); i++)
         {
-            ByteBuffer v1 = CollectionSerializer.readValue(bb1, 3);
-            ByteBuffer v2 = CollectionSerializer.readValue(bb2, 3);
+            ByteBuffer v1 = CollectionSerializer.readValue(bb1, ProtocolVersion.V3);
+            ByteBuffer v2 = CollectionSerializer.readValue(bb2, ProtocolVersion.V3);
             int cmp = elementsComparator.compare(v1, v2);
             if (cmp != 0)
                 return cmp;
@@ -205,7 +224,7 @@ public class ListType<T> extends CollectionType<List<T>>
         return new Lists.DelayedValue(terms);
     }
 
-    public static String setOrListToJsonString(ByteBuffer buffer, AbstractType elementsType, int protocolVersion)
+    public static String setOrListToJsonString(ByteBuffer buffer, AbstractType elementsType, ProtocolVersion protocolVersion)
     {
         StringBuilder sb = new StringBuilder("[");
         int size = CollectionSerializer.readCollectionSize(buffer, protocolVersion);
@@ -219,7 +238,7 @@ public class ListType<T> extends CollectionType<List<T>>
     }
 
     @Override
-    public String toJSONString(ByteBuffer buffer, int protocolVersion)
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
         return setOrListToJsonString(buffer, elements, protocolVersion);
     }

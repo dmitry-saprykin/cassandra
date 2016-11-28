@@ -17,17 +17,11 @@
  */
 package org.apache.cassandra.streaming.compress;
 
-import java.io.DataInputStream;
 import java.io.IOException;
 import java.nio.channels.Channels;
 import java.nio.channels.ReadableByteChannel;
 
 import com.google.common.base.Throwables;
-
-import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.io.sstable.SSTableMultiWriter;
-import org.apache.cassandra.io.sstable.format.RangeAwareSSTableWriter;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -35,12 +29,16 @@ import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.io.compress.CompressionMetadata;
+import org.apache.cassandra.io.sstable.SSTableMultiWriter;
+import org.apache.cassandra.io.util.TrackedInputStream;
 import org.apache.cassandra.streaming.ProgressInfo;
 import org.apache.cassandra.streaming.StreamReader;
 import org.apache.cassandra.streaming.StreamSession;
 import org.apache.cassandra.streaming.messages.FileMessageHeader;
-import org.apache.cassandra.utils.BytesReadTracker;
+import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Pair;
+
+import static org.apache.cassandra.utils.Throwables.extractIOExceptionCause;
 
 /**
  * StreamReader that reads from streamed compressed SSTable
@@ -84,12 +82,15 @@ public class CompressedStreamReader extends StreamReader
 
         CompressedInputStream cis = new CompressedInputStream(Channels.newInputStream(channel), compressionInfo,
                                                               inputVersion.compressedChecksumType(), cfs::getCrcCheckChance);
-        BytesReadTracker in = new BytesReadTracker(new DataInputStream(cis));
-        StreamDeserializer deserializer = new StreamDeserializer(cfs.metadata, in, inputVersion, header.toHeader(cfs.metadata));
+        TrackedInputStream in = new TrackedInputStream(cis);
+
+        StreamDeserializer deserializer = new StreamDeserializer(cfs.metadata, in, inputVersion, getHeader(cfs.metadata),
+                                                                 totalSize, session.planId());
         SSTableMultiWriter writer = null;
         try
         {
             writer = createWriter(cfs, totalSize, repairedAt, format);
+            String filename = writer.getFilename();
             int sectionIdx = 0;
             for (Pair<Long, Long> section : sections)
             {
@@ -105,27 +106,30 @@ public class CompressedStreamReader extends StreamReader
                 {
                     writePartition(deserializer, writer);
                     // when compressed, report total bytes of compressed chunks read since remoteFile.size is the sum of chunks transferred
-                    session.progress(writer.getFilename(), ProgressInfo.Direction.IN, cis.getTotalCompressedBytesRead(), totalSize);
+                    session.progress(filename, ProgressInfo.Direction.IN, cis.getTotalCompressedBytesRead(), totalSize);
                 }
             }
             logger.debug("[Stream #{}] Finished receiving file #{} from {} readBytes = {}, totalSize = {}", session.planId(), fileSeqNum,
-                         session.peer, cis.getTotalCompressedBytesRead(), totalSize);
+                         session.peer, FBUtilities.prettyPrintMemory(cis.getTotalCompressedBytesRead()), FBUtilities.prettyPrintMemory(totalSize));
             return writer;
         }
         catch (Throwable e)
         {
             if (deserializer != null)
                 logger.warn("[Stream {}] Error while reading partition {} from stream on ks='{}' and table='{}'.",
-                            session.planId(), deserializer.partitionKey(), cfs.keyspace.getName(), cfs.getColumnFamilyName());
+                            session.planId(), deserializer.partitionKey(), cfs.keyspace.getName(), cfs.getTableName());
             if (writer != null)
             {
                 writer.abort(e);
             }
-            drain(cis, in.getBytesRead());
-            if (e instanceof IOException)
-                throw (IOException) e;
-            else
-                throw Throwables.propagate(e);
+            if (extractIOExceptionCause(e).isPresent())
+                throw e;
+            throw Throwables.propagate(e);
+        }
+        finally
+        {
+            if (deserializer != null)
+                deserializer.cleanup();
         }
     }
 

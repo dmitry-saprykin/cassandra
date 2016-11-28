@@ -27,6 +27,7 @@ import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.db.transform.FilteredPartitions;
+import org.apache.cassandra.db.transform.MorePartitions;
 import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
@@ -76,6 +77,25 @@ public abstract class UnfilteredPartitionIterators
         }
         return Transformation.apply(toReturn, new Close());
     }
+
+    public static UnfilteredPartitionIterator concat(final List<UnfilteredPartitionIterator> iterators)
+    {
+        if (iterators.size() == 1)
+            return iterators.get(0);
+
+        class Extend implements MorePartitions<UnfilteredPartitionIterator>
+        {
+            int i = 1;
+            public UnfilteredPartitionIterator moreContents()
+            {
+                if (i >= iterators.size())
+                    return null;
+                return iterators.get(i++);
+            }
+        }
+        return MorePartitions.extend(iterators.get(0), new Extend());
+    }
+
 
     public static PartitionIterator mergeAndFilter(List<UnfilteredPartitionIterator> iterators, int nowInSec, MergeListener listener)
     {
@@ -232,11 +252,13 @@ public abstract class UnfilteredPartitionIterators
     /**
      * Digests the the provided iterator.
      *
+     * @param command the command that has yield {@code iterator}. This can be null if {@code version >= MessagingService.VERSION_30}
+     * as this is only used when producing digest to be sent to legacy nodes.
      * @param iterator the iterator to digest.
      * @param digest the {@code MessageDigest} to use for the digest.
      * @param version the messaging protocol to use when producing the digest.
      */
-    public static void digest(UnfilteredPartitionIterator iterator, MessageDigest digest, int version)
+    public static void digest(ReadCommand command, UnfilteredPartitionIterator iterator, MessageDigest digest, int version)
     {
         try (UnfilteredPartitionIterator iter = iterator)
         {
@@ -244,7 +266,7 @@ public abstract class UnfilteredPartitionIterators
             {
                 try (UnfilteredRowIterator partition = iter.next())
                 {
-                    UnfilteredRowIterators.digest(partition, digest, version);
+                    UnfilteredRowIterators.digest(command, partition, digest, version);
                 }
             }
         }

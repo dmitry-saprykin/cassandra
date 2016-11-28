@@ -40,6 +40,7 @@ import javax.net.ssl.SSLHandshakeException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.netty.util.concurrent.FastThreadLocalThread;
 import net.jpountz.lz4.LZ4BlockOutputStream;
 import net.jpountz.lz4.LZ4Compressor;
 import net.jpountz.lz4.LZ4Factory;
@@ -63,7 +64,7 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 
 import com.google.common.util.concurrent.Uninterruptibles;
 
-public class OutboundTcpConnection extends Thread
+public class OutboundTcpConnection extends FastThreadLocalThread
 {
     private static final Logger logger = LoggerFactory.getLogger(OutboundTcpConnection.class);
 
@@ -73,7 +74,7 @@ public class OutboundTcpConnection extends Thread
      * Enabled/disable TCP_NODELAY for intradc connections. Defaults to enabled.
      */
     private static final String INTRADC_TCP_NODELAY_PROPERTY = PREFIX + "otc_intradc_tcp_nodelay";
-    private static final boolean INTRADC_TCP_NODELAY = Boolean.valueOf(System.getProperty(INTRADC_TCP_NODELAY_PROPERTY, "true"));
+    private static final boolean INTRADC_TCP_NODELAY = Boolean.parseBoolean(System.getProperty(INTRADC_TCP_NODELAY_PROPERTY, "true"));
 
     /*
      * Size of buffer in output stream
@@ -112,7 +113,7 @@ public class OutboundTcpConnection extends Thread
 
         if (coalescingWindow < 0)
             throw new ExceptionInInitializerError(
-                    "Value provided for coalescing window must be greather than 0: " + coalescingWindow);
+                    "Value provided for coalescing window must be greater than 0: " + coalescingWindow);
     }
 
     private static final MessageOut CLOSE_SENTINEL = new MessageOut(MessagingService.Verb.INTERNAL_RESPONSE);
@@ -134,13 +135,22 @@ public class OutboundTcpConnection extends Thread
     private volatile long completed;
     private final AtomicLong dropped = new AtomicLong();
     private volatile int currentMsgBufferCount = 0;
-    private int targetVersion = MessagingService.current_version;
+    private volatile int targetVersion;
 
-    public OutboundTcpConnection(OutboundTcpConnectionPool pool)
+    public OutboundTcpConnection(OutboundTcpConnectionPool pool, String name)
     {
-        super("MessagingService-Outgoing-" + pool.endPoint());
+        super("MessagingService-Outgoing-" + pool.endPoint() + "-" + name);
         this.poolReference = pool;
         cs = newCoalescingStrategy(pool.endPoint().getHostAddress());
+
+        // We want to use the most precise version we know because while there is version detection on connect(),
+        // the target version might be accessed by the pool (in getConnection()) before we actually connect (as we
+        // connect when the first message is submitted). Note however that the only case where we'll connect
+        // without knowing the true version of a node is if that node is a seed (otherwise, we can't know a node
+        // unless it has been gossiped to us or it has connected to us and in both case this sets the version) and
+        // in that case we won't rely on that targetVersion before we're actually connected and so the version
+        // detection in connect() will do its job.
+        targetVersion = MessagingService.instance().getVersion(pool.endPoint());
     }
 
     private static boolean isLocalDC(InetAddress targetHost)
@@ -166,6 +176,7 @@ public class OutboundTcpConnection extends Thread
 
     void closeSocket(boolean destroyThread)
     {
+        logger.debug("Enqueuing socket close for {}", poolReference.endPoint());
         backlog.clear();
         isStopped = destroyThread; // Exit loop to stop the thread
         enqueue(CLOSE_SENTINEL, -1);
@@ -217,7 +228,7 @@ public class OutboundTcpConnection extends Thread
                         continue;
                     }
 
-                    if (qm.isTimedOut(TimeUnit.MILLISECONDS.toNanos(m.getTimeout()), System.nanoTime()))
+                    if (qm.isTimedOut())
                         dropped.incrementAndGet();
                     else if (socket != null || connect())
                         writeConnected(qm, count == 1 && backlog.isEmpty());
@@ -275,7 +286,7 @@ public class OutboundTcpConnection extends Thread
                 {
                     byte[] traceTypeBytes = qm.message.parameters.get(Tracing.TRACE_TYPE);
                     Tracing.TraceType traceType = traceTypeBytes == null ? Tracing.TraceType.QUERY : Tracing.TraceType.deserialize(traceTypeBytes[0]);
-                    TraceState.mutateWithTracing(ByteBuffer.wrap(sessionBytes), message, -1, traceType.getTTL());
+                    Tracing.instance.trace(ByteBuffer.wrap(sessionBytes), message, traceType.getTTL());
                 }
                 else
                 {
@@ -292,16 +303,16 @@ public class OutboundTcpConnection extends Thread
             if (flush)
                 out.flush();
         }
-        catch (Exception e)
+        catch (Throwable e)
         {
+            JVMStabilityInspector.inspectThrowable(e);
             disconnect();
             if (e instanceof IOException || e.getCause() instanceof IOException)
             {
-                if (logger.isTraceEnabled())
-                    logger.trace("error writing to {}", poolReference.endPoint(), e);
+                logger.debug("Error writing to {}", poolReference.endPoint(), e);
 
-                // if the message was important, such as a repair acknowledgement, put it back on the queue
-                // to retry after re-connecting.  See CASSANDRA-5393
+                // If we haven't retried this message yet, put it back on the queue to retry after re-connecting.
+                // See CASSANDRA-5393 and CASSANDRA-12192.
                 if (qm.shouldRetry())
                 {
                     try
@@ -359,13 +370,11 @@ public class OutboundTcpConnection extends Thread
             try
             {
                 socket.close();
-                if (logger.isTraceEnabled())
-                    logger.trace("Socket to {} closed", poolReference.endPoint());
+                logger.debug("Socket to {} closed", poolReference.endPoint());
             }
             catch (IOException e)
             {
-                if (logger.isTraceEnabled())
-                    logger.trace("exception closing connection to " + poolReference.endPoint(), e);
+                logger.debug("Exception closing connection to {}", poolReference.endPoint(), e);
             }
             out = null;
             socket = null;
@@ -375,8 +384,7 @@ public class OutboundTcpConnection extends Thread
     @SuppressWarnings("resource")
     private boolean connect()
     {
-        if (logger.isTraceEnabled())
-            logger.trace("attempting to connect to {}", poolReference.endPoint());
+        logger.debug("Attempting to connect to {}", poolReference.endPoint());
 
         long start = System.nanoTime();
         long timeout = TimeUnit.MILLISECONDS.toNanos(DatabaseDescriptor.getRpcTimeout());
@@ -395,7 +403,7 @@ public class OutboundTcpConnection extends Thread
                 {
                     socket.setTcpNoDelay(DatabaseDescriptor.getInterDCTcpNoDelay());
                 }
-                if (DatabaseDescriptor.getInternodeSendBufferSize() != null)
+                if (DatabaseDescriptor.getInternodeSendBufferSize() > 0)
                 {
                     try
                     {
@@ -452,7 +460,7 @@ public class OutboundTcpConnection extends Thread
                 if (shouldCompressConnection())
                 {
                     out.flush();
-                    logger.trace("Upgrading OutputStream to be compressed");
+                    logger.trace("Upgrading OutputStream to {} to be compressed", poolReference.endPoint());
                     if (targetVersion < MessagingService.VERSION_21)
                     {
                         // Snappy is buffered, so no need for extra buffering output stream
@@ -470,7 +478,7 @@ public class OutboundTcpConnection extends Thread
                                                                             true)); // no async flushing
                     }
                 }
-
+                logger.debug("Done connecting to {}", poolReference.endPoint());
                 return true;
             }
             catch (SSLHandshakeException e)
@@ -483,8 +491,7 @@ public class OutboundTcpConnection extends Thread
             catch (IOException e)
             {
                 socket = null;
-                if (logger.isTraceEnabled())
-                    logger.trace("unable to connect to " + poolReference.endPoint(), e);
+                logger.debug("Unable to connect to {}", poolReference.endPoint(), e);
                 Uninterruptibles.sleepUninterruptibly(OPEN_RETRY_DELAY, TimeUnit.MILLISECONDS);
             }
         }
@@ -540,7 +547,7 @@ public class OutboundTcpConnection extends Thread
             QueuedMessage qm = iter.next();
             if (!qm.droppable)
                 continue;
-            if (qm.timestampNanos >= System.nanoTime() - qm.message.getTimeout())
+            if (!qm.isTimedOut())
                 return;
             iter.remove();
             dropped.incrementAndGet();
@@ -564,14 +571,15 @@ public class OutboundTcpConnection extends Thread
         }
 
         /** don't drop a non-droppable message just because it's timestamp is expired */
-        boolean isTimedOut(long maxTimeNanos, long nowNanos)
+        boolean isTimedOut()
         {
-            return droppable && timestampNanos < nowNanos - maxTimeNanos;
+            return droppable && timestampNanos < System.nanoTime() - TimeUnit.MILLISECONDS.toNanos(message.getTimeout());
         }
 
         boolean shouldRetry()
         {
-            return !droppable;
+            // retry all messages once
+            return true;
         }
 
         public long timestampNanos()

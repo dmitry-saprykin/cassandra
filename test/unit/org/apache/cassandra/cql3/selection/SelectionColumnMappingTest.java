@@ -1,3 +1,23 @@
+/*
+ *
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ *
+ */
 package org.apache.cassandra.cql3.selection;
 
 import java.util.ArrayList;
@@ -19,6 +39,7 @@ import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
+import static java.util.Arrays.asList;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
@@ -31,9 +52,11 @@ public class SelectionColumnMappingTest extends CQLTester
     String functionName;
 
     @BeforeClass
-    public static void setUpClass()
+    public static void setUpClass()     // overrides CQLTester.setUpClass()
     {
         DatabaseDescriptor.setPartitionerUnsafe(ByteOrderedPartitioner.instance);
+
+        prepareServer();
     }
 
     @Test
@@ -48,7 +71,7 @@ public class SelectionColumnMappingTest extends CQLTester
                                 " v1 int," +
                                 " v2 ascii," +
                                 " v3 frozen<" + typeName + ">)");
-        userType = Schema.instance.getKSMetaData(KEYSPACE).types.get(ByteBufferUtil.bytes(typeName)).get();
+        userType = Schema.instance.getKSMetaData(KEYSPACE).types.get(ByteBufferUtil.bytes(typeName)).get().freeze();
         functionName = createFunction(KEYSPACE, "int, ascii",
                                       "CREATE FUNCTION %s (i int, a ascii) " +
                                       "CALLED ON NULL INPUT " +
@@ -80,6 +103,14 @@ public class SelectionColumnMappingTest extends CQLTester
         testMixedColumnTypes();
         testMultipleUnaliasedSelectionOfSameColumn();
         testUserDefinedAggregate();
+        testListLitteral();
+        testEmptyListLitteral();
+        testSetLitteral();
+        testEmptySetLitteral();
+        testMapLitteral();
+        testEmptyMapLitteral();
+        testUDTLitteral();
+        testTupleLitteral();
     }
 
     @Test
@@ -383,6 +414,91 @@ public class SelectionColumnMappingTest extends CQLTester
                                                                       columnDefinition("v1"));
 
         verify(expected, "SELECT v1, v1 FROM %s");
+    }
+
+    private void testListLitteral() throws Throwable
+    {
+        ColumnSpecification listSpec = columnSpecification("[k, v1]", ListType.getInstance(Int32Type.instance, false));
+        SelectionColumnMapping expected = SelectionColumnMapping.newMapping()
+                                                                .addMapping(listSpec, asList(columnDefinition("k"),
+                                                                                             columnDefinition("v1")));
+
+        verify(expected, "SELECT [k, v1] FROM %s");
+    }
+
+    private void testEmptyListLitteral() throws Throwable
+    {
+        ColumnSpecification listSpec = columnSpecification("(list<int>)[]", ListType.getInstance(Int32Type.instance, false));
+        SelectionColumnMapping expected = SelectionColumnMapping.newMapping()
+                                                                .addMapping(listSpec, (ColumnDefinition) null);
+
+        verify(expected, "SELECT (list<int>)[] FROM %s");
+    }
+
+    private void testSetLitteral() throws Throwable
+    {
+        ColumnSpecification setSpec = columnSpecification("{k, v1}", SetType.getInstance(Int32Type.instance, false));
+        SelectionColumnMapping expected = SelectionColumnMapping.newMapping()
+                                                                .addMapping(setSpec, asList(columnDefinition("k"),
+                                                                                             columnDefinition("v1")));
+
+        verify(expected, "SELECT {k, v1} FROM %s");
+    }
+
+    private void testEmptySetLitteral() throws Throwable
+    {
+        ColumnSpecification setSpec = columnSpecification("(set<int>){}", SetType.getInstance(Int32Type.instance, false));
+        SelectionColumnMapping expected = SelectionColumnMapping.newMapping()
+                                                                .addMapping(setSpec, (ColumnDefinition) null);
+
+        verify(expected, "SELECT (set<int>){} FROM %s");
+    }
+
+    private void testMapLitteral() throws Throwable
+    {
+        ColumnSpecification mapSpec = columnSpecification("(map<text, int>){'min': system.min(v1), 'max': system.max(v1)}", MapType.getInstance(UTF8Type.instance, Int32Type.instance, false));
+        SelectionColumnMapping expected = SelectionColumnMapping.newMapping()
+                                                                .addMapping(mapSpec, asList(columnDefinition("v1")));
+
+        verify(expected, "SELECT (map<text, int>){'min': min(v1), 'max': max(v1)} FROM %s");
+    }
+
+    private void testEmptyMapLitteral() throws Throwable
+    {
+        ColumnSpecification mapSpec = columnSpecification("(map<text, int>){}", MapType.getInstance(UTF8Type.instance, Int32Type.instance, false));
+        SelectionColumnMapping expected = SelectionColumnMapping.newMapping()
+                                                                .addMapping(mapSpec, (ColumnDefinition) null);
+
+        verify(expected, "SELECT (map<text, int>){} FROM %s");
+    }
+
+    private void testUDTLitteral() throws Throwable
+    {
+        UserType type = new UserType(KEYSPACE, ByteBufferUtil.bytes(typeName),
+                                      asList(FieldIdentifier.forUnquoted("f1"),
+                                             FieldIdentifier.forUnquoted("f2")),
+                                      asList(Int32Type.instance,
+                                             UTF8Type.instance),
+                                      false);
+
+        ColumnSpecification spec = columnSpecification("(" + KEYSPACE + "." + typeName + "){f1: v1, f2: v2}", type);
+        SelectionColumnMapping expected = SelectionColumnMapping.newMapping()
+                                                                .addMapping(spec, asList(columnDefinition("v1"),
+                                                                                         columnDefinition("v2")));
+
+        verify(expected, "SELECT ("+ typeName + "){f1: v1, f2: v2} FROM %s");
+    }
+
+    private void testTupleLitteral() throws Throwable
+    {
+        TupleType type = new TupleType(asList(Int32Type.instance, UTF8Type.instance));
+
+        ColumnSpecification setSpec = columnSpecification("(tuple<int, text>)(v1, v2)", type);
+        SelectionColumnMapping expected = SelectionColumnMapping.newMapping()
+                                                                .addMapping(setSpec, asList(columnDefinition("v1"),
+                                                                                            columnDefinition("v2")));
+
+        verify(expected, "SELECT (tuple<int, text>)(v1, v2) FROM %s");
     }
 
     private void testMixedColumnTypes() throws Throwable

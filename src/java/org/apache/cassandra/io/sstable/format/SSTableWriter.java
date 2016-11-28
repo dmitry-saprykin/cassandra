@@ -25,6 +25,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Sets;
 
 import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.db.RowIndexEntry;
 import org.apache.cassandra.db.SerializationHeader;
@@ -79,11 +80,11 @@ public abstract class SSTableWriter extends SSTable implements Transactional
                             SerializationHeader header,
                             Collection<SSTableFlushObserver> observers)
     {
-        super(descriptor, components(metadata), metadata);
+        super(descriptor, components(metadata), metadata, DatabaseDescriptor.getDiskOptimizationStrategy());
         this.keyCount = keyCount;
         this.repairedAt = repairedAt;
         this.metadataCollector = metadataCollector;
-        this.header = header;
+        this.header = header != null ? header : SerializationHeader.makeWithoutStats(metadata); //null header indicates streaming from pre-3.0 sstable
         this.rowIndexEntrySerializer = descriptor.version.getSSTableFormat().getIndexSerializer(metadata, descriptor.version, header);
         this.observers = observers == null ? Collections.emptySet() : observers;
     }
@@ -211,6 +212,11 @@ public abstract class SSTableWriter extends SSTable implements Transactional
     public abstract long getFilePointer();
 
     public abstract long getOnDiskFilePointer();
+
+    public long getEstimatedOnDiskBytesWritten()
+    {
+        return getOnDiskFilePointer();
+    }
 
     public abstract void resetAndTruncate();
 

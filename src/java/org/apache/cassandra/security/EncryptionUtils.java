@@ -30,6 +30,7 @@ import com.google.common.base.Preconditions;
 
 import org.apache.cassandra.db.commitlog.EncryptedSegment;
 import org.apache.cassandra.io.compress.ICompressor;
+import org.apache.cassandra.io.util.ChannelProxy;
 import org.apache.cassandra.io.util.FileDataInput;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
@@ -113,6 +114,7 @@ public class EncryptionUtils
         return outputBuffer;
     }
 
+    @SuppressWarnings("resource")
     public static ByteBuffer encrypt(ByteBuffer inputBuffer, ByteBuffer outputBuffer, boolean allowBufferResize, Cipher cipher) throws IOException
     {
         Preconditions.checkNotNull(outputBuffer, "output buffer may not be null");
@@ -164,6 +166,7 @@ public class EncryptionUtils
     }
 
     // path used when decrypting commit log files
+    @SuppressWarnings("resource")
     public static ByteBuffer decrypt(FileDataInput fileDataInput, ByteBuffer outputBuffer, boolean allowBufferResize, Cipher cipher) throws IOException
     {
         return decrypt(new DataInputReadChannel(fileDataInput), outputBuffer, allowBufferResize, cipher);
@@ -272,6 +275,46 @@ public class EncryptionUtils
         public void close()
         {
             // nop
+        }
+    }
+
+    public static class ChannelProxyReadChannel implements ReadableByteChannel
+    {
+        private final ChannelProxy channelProxy;
+        private volatile long currentPosition;
+
+        public ChannelProxyReadChannel(ChannelProxy channelProxy, long currentPosition)
+        {
+            this.channelProxy = channelProxy;
+            this.currentPosition = currentPosition;
+        }
+
+        public int read(ByteBuffer dst) throws IOException
+        {
+            int bytesRead = channelProxy.read(dst, currentPosition);
+            dst.flip();
+            currentPosition += bytesRead;
+            return bytesRead;
+        }
+
+        public long getCurrentPosition()
+        {
+            return currentPosition;
+        }
+
+        public boolean isOpen()
+        {
+            return channelProxy.isCleanedUp();
+        }
+
+        public void close()
+        {
+            // nop
+        }
+
+        public void setPosition(long sourcePosition)
+        {
+            this.currentPosition = sourcePosition;
         }
     }
 }

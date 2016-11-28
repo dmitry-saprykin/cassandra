@@ -21,12 +21,15 @@ package org.apache.cassandra.db.monitoring;
 public interface Monitorable
 {
     String name();
-    ConstructionTime constructionTime();
+    long constructionTime();
     long timeout();
+    long slowTimeout();
 
     boolean isInProgress();
     boolean isAborted();
     boolean isCompleted();
+    boolean isSlow();
+    boolean isCrossNode();
 
     boolean abort();
     boolean complete();

@@ -81,7 +81,7 @@ public abstract class UnfilteredDeserializer
      * comparison. Whenever we know what to do with this atom (read it or skip it),
      * readNext or skipNext should be called.
      */
-    public abstract int compareNextTo(Slice.Bound bound) throws IOException;
+    public abstract int compareNextTo(ClusteringBound bound) throws IOException;
 
     /**
      * Returns whether the next atom is a row or not.
@@ -173,7 +173,7 @@ public abstract class UnfilteredDeserializer
             isReady = true;
         }
 
-        public int compareNextTo(Slice.Bound bound) throws IOException
+        public int compareNextTo(ClusteringBound bound) throws IOException
         {
             if (!isReady)
                 prepareNext();
@@ -202,7 +202,7 @@ public abstract class UnfilteredDeserializer
             isReady = false;
             if (UnfilteredSerializer.kind(nextFlags) == Unfiltered.Kind.RANGE_TOMBSTONE_MARKER)
             {
-                RangeTombstone.Bound bound = clusteringDeserializer.deserializeNextBound();
+                ClusteringBoundOrBoundary bound = clusteringDeserializer.deserializeNextBound();
                 return UnfilteredSerializer.serializer.deserializeMarkerBody(in, header, bound);
             }
             else
@@ -326,7 +326,7 @@ public abstract class UnfilteredDeserializer
             return tombstone.isCollectionTombstone() || tombstone.isRowDeletion(metadata);
         }
 
-        public int compareNextTo(Slice.Bound bound) throws IOException
+        public int compareNextTo(ClusteringBound bound) throws IOException
         {
             if (!hasNext())
                 throw new IllegalStateException();
@@ -401,7 +401,7 @@ public abstract class UnfilteredDeserializer
             {
                 this.grouper = new LegacyLayout.CellGrouper(metadata, helper);
                 this.tombstoneTracker = new TombstoneTracker(partitionDeletion);
-                this.atoms = new AtomIterator(tombstoneTracker);
+                this.atoms = new AtomIterator();
             }
 
             public boolean hasNext()
@@ -485,13 +485,11 @@ public abstract class UnfilteredDeserializer
         // the internal state of the iterator so it's cleaner to do it ourselves.
         private class AtomIterator implements PeekingIterator<LegacyLayout.LegacyAtom>
         {
-            private final TombstoneTracker tombstoneTracker;
             private boolean isDone;
             private LegacyLayout.LegacyAtom next;
 
-            private AtomIterator(TombstoneTracker tombstoneTracker)
+            private AtomIterator()
             {
-                this.tombstoneTracker = tombstoneTracker;
             }
 
             public boolean hasNext()
@@ -656,11 +654,6 @@ public abstract class UnfilteredDeserializer
             public boolean hasOpenTombstones()
             {
                 return !openTombstones.isEmpty();
-            }
-
-            private boolean formBoundary(LegacyLayout.LegacyRangeTombstone close, LegacyLayout.LegacyRangeTombstone open)
-            {
-                return metadata.comparator.compare(close.stop.bound, open.start.bound) == 0;
             }
 
             public void clearState()

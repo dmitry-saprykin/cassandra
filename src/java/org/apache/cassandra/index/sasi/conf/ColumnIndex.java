@@ -22,22 +22,30 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicReference;
 
+import com.google.common.annotations.VisibleForTesting;
+
 import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.Memtable;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.AsciiType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.Row;
-import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.index.sasi.analyzer.AbstractAnalyzer;
 import org.apache.cassandra.index.sasi.conf.view.View;
+import org.apache.cassandra.index.sasi.disk.OnDiskIndexBuilder;
 import org.apache.cassandra.index.sasi.disk.Token;
 import org.apache.cassandra.index.sasi.memory.IndexMemtable;
 import org.apache.cassandra.index.sasi.plan.Expression;
+import org.apache.cassandra.index.sasi.plan.Expression.Op;
 import org.apache.cassandra.index.sasi.utils.RangeIterator;
+import org.apache.cassandra.index.sasi.utils.RangeUnionIterator;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.schema.IndexMetadata;
@@ -53,10 +61,14 @@ public class ColumnIndex
     private final Optional<IndexMetadata> config;
 
     private final AtomicReference<IndexMemtable> memtable;
+    private final ConcurrentMap<Memtable, IndexMemtable> pendingFlush = new ConcurrentHashMap<>();
+
     private final IndexMode mode;
 
     private final Component component;
     private final DataTracker tracker;
+
+    private final boolean isTokenized;
 
     public ColumnIndex(AbstractType<?> keyValidator, ColumnDefinition column, IndexMetadata metadata)
     {
@@ -67,11 +79,7 @@ public class ColumnIndex
         this.memtable = new AtomicReference<>(new IndexMemtable(this));
         this.tracker = new DataTracker(keyValidator, this);
         this.component = new Component(Component.Type.SECONDARY_INDEX, String.format(FILE_NAME_FORMAT, getIndexName()));
-    }
-
-    public void validate() throws ConfigurationException
-    {
-        mode.validate(config);
+        this.isTokenized = getAnalyzer().isTokenizing();
     }
 
     /**
@@ -93,17 +101,45 @@ public class ColumnIndex
 
     public long index(DecoratedKey key, Row row)
     {
-        return memtable.get().index(key, getValueOf(column, row, FBUtilities.nowInSeconds()));
+        return getCurrentMemtable().index(key, getValueOf(column, row, FBUtilities.nowInSeconds()));
     }
 
     public void switchMemtable()
     {
+        // discard current memtable with all of it's data, useful on truncate
         memtable.set(new IndexMemtable(this));
+    }
+
+    public void switchMemtable(Memtable parent)
+    {
+        pendingFlush.putIfAbsent(parent, memtable.getAndSet(new IndexMemtable(this)));
+    }
+
+    public void discardMemtable(Memtable parent)
+    {
+        pendingFlush.remove(parent);
+    }
+
+    @VisibleForTesting
+    public IndexMemtable getCurrentMemtable()
+    {
+        return memtable.get();
+    }
+
+    @VisibleForTesting
+    public Collection<IndexMemtable> getPendingMemtables()
+    {
+        return pendingFlush.values();
     }
 
     public RangeIterator<Long, Token> searchMemtable(Expression e)
     {
-        return memtable.get().search(e);
+        RangeIterator.Builder<Long, Token> builder = new RangeUnionIterator.Builder<>();
+        builder.add(getCurrentMemtable().search(e));
+        for (IndexMemtable memtable : getPendingMemtables())
+            builder.add(memtable.search(e));
+
+        return builder.build();
     }
 
     public void update(Collection<SSTableReader> oldSSTables, Collection<SSTableReader> newSSTables)
@@ -158,6 +194,11 @@ public class ColumnIndex
         return tracker.hasSSTable(sstable);
     }
 
+    public void dropData(Collection<SSTableReader> sstablesToRebuild)
+    {
+        tracker.dropData(sstablesToRebuild);
+    }
+
     public void dropData(long truncateUntil)
     {
         switchMemtable();
@@ -175,13 +216,38 @@ public class ColumnIndex
         return isIndexed() ? mode.isLiteral : (validator instanceof UTF8Type || validator instanceof AsciiType);
     }
 
+    public boolean supports(Operator op)
+    {
+        if (op == Operator.LIKE)
+            return isLiteral();
+
+        Op operator = Op.valueOf(op);
+        return !(isTokenized && operator == Op.EQ) // EQ is only applicable to non-tokenized indexes
+               && !(isTokenized && mode.mode == OnDiskIndexBuilder.Mode.CONTAINS && operator == Op.PREFIX) // PREFIX not supported on tokenized CONTAINS mode indexes
+               && !(isLiteral() && operator == Op.RANGE) // RANGE only applicable to indexes non-literal indexes
+               && mode.supports(operator); // for all other cases let's refer to index itself
+
+    }
+
     public static ByteBuffer getValueOf(ColumnDefinition column, Row row, int nowInSecs)
     {
+        if (row == null)
+            return null;
+
         switch (column.kind)
         {
             case CLUSTERING:
+                // skip indexing of static clustering when regular column is indexed
+                if (row.isStatic())
+                    return null;
+
                 return row.clustering().get(column.position());
 
+            // treat static cell retrieval the same was as regular
+            // only if row kind is STATIC otherwise return null
+            case STATIC:
+                if (!row.isStatic())
+                    return null;
             case REGULAR:
                 Cell cell = row.getCell(column);
                 return cell == null || !cell.isLive(nowInSecs) ? null : cell.value();

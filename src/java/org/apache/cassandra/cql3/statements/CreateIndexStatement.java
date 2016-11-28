@@ -22,6 +22,7 @@ import java.util.*;
 import com.google.common.base.Optional;
 import com.google.common.base.Strings;
 import com.google.common.collect.Iterables;
+import com.google.common.collect.Sets;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -173,7 +174,7 @@ public class CreateIndexStatement extends SchemaAlteringStatement
         if (!properties.isCustom)
             throw new InvalidRequestException("Only CUSTOM indexes support multiple columns");
 
-        Set<ColumnIdentifier> columns = new HashSet<>();
+        Set<ColumnIdentifier> columns = Sets.newHashSetWithExpectedSize(targets.size());
         for (IndexTarget target : targets)
             if (!columns.add(target.column))
                 throw new InvalidRequestException("Duplicate column " + target.column + " in index target list");
@@ -220,14 +221,19 @@ public class CreateIndexStatement extends SchemaAlteringStatement
         // check to disallow creation of an index which duplicates an existing one in all but name
         Optional<IndexMetadata> existingIndex = Iterables.tryFind(cfm.getIndexes(), existing -> existing.equalsWithoutName(index));
         if (existingIndex.isPresent())
-            throw new InvalidRequestException(String.format("Index %s is a duplicate of existing index %s",
-                                                            index.name,
-                                                            existingIndex.get().name));
+        {
+            if (ifNotExists)
+                return null;
+            else
+                throw new InvalidRequestException(String.format("Index %s is a duplicate of existing index %s",
+                                                                index.name,
+                                                                existingIndex.get().name));
+        }
 
         logger.trace("Updating index definition for {}", indexName);
         cfm.indexes(cfm.getIndexes().with(index));
 
-        MigrationManager.announceColumnFamilyUpdate(cfm, false, isLocalOnly);
+        MigrationManager.announceColumnFamilyUpdate(cfm, isLocalOnly);
 
         // Creating an index is akin to updating the CF
         return new Event.SchemaChange(Event.SchemaChange.Change.UPDATED, Event.SchemaChange.Target.TABLE, keyspace(), columnFamily());

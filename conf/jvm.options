@@ -75,12 +75,16 @@
 # strategies and benchmark write performance differences without affecting the production workload. 
 #-Dcassandra.write_survey=true
 
+# To disable configuration via JMX of auth caches (such as those for credentials, permissions and
+# roles). This will mean those config options can only be set (persistently) in cassandra.yaml
+# and will require a restart for new values to take effect.
+#-Dcassandra.disable_auth_caches_remote_configuration=true
+
 ########################
 # GENERAL JVM SETTINGS #
 ########################
 
-# enable assertions.  disabling this in production will give a modest
-# performance benefit (around 5%).
+# enable assertions. highly suggested for correct application functionality.
 -ea
 
 # enable thread priorities, primarily so we can give periodic tasks
@@ -113,6 +117,7 @@
 # resize them at runtime.
 -XX:+UseTLAB
 -XX:+ResizeTLAB
+-XX:+UseNUMA
 
 # http://www.evanjones.ca/jvm-mmap-pause.html
 -XX:+PerfDisableSharedMem

@@ -25,6 +25,7 @@ import com.datastax.driver.core.*;
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.config.ColumnDefinition.ClusteringOrder;
 import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.SchemaConstants;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.dht.*;
@@ -107,7 +108,7 @@ public class NativeSSTableLoaderClient extends SSTableLoader.Client
 
     private static Types fetchTypes(String keyspace, Session session)
     {
-        String query = String.format("SELECT * FROM %s.%s WHERE keyspace_name = ?", SchemaKeyspace.NAME, SchemaKeyspace.TYPES);
+        String query = String.format("SELECT * FROM %s.%s WHERE keyspace_name = ?", SchemaConstants.SCHEMA_KEYSPACE_NAME, SchemaKeyspace.TYPES);
 
         Types.RawBuilder types = Types.rawBuilder(keyspace);
         for (Row row : session.execute(query, keyspace))
@@ -132,7 +133,7 @@ public class NativeSSTableLoaderClient extends SSTableLoader.Client
     private static Map<String, CFMetaData> fetchTables(String keyspace, Session session, IPartitioner partitioner, Types types)
     {
         Map<String, CFMetaData> tables = new HashMap<>();
-        String query = String.format("SELECT * FROM %s.%s WHERE keyspace_name = ?", SchemaKeyspace.NAME, SchemaKeyspace.TABLES);
+        String query = String.format("SELECT * FROM %s.%s WHERE keyspace_name = ?", SchemaConstants.SCHEMA_KEYSPACE_NAME, SchemaKeyspace.TABLES);
 
         for (Row row : session.execute(query, keyspace))
         {
@@ -149,7 +150,7 @@ public class NativeSSTableLoaderClient extends SSTableLoader.Client
     private static Map<String, CFMetaData> fetchViews(String keyspace, Session session, IPartitioner partitioner, Types types)
     {
         Map<String, CFMetaData> tables = new HashMap<>();
-        String query = String.format("SELECT * FROM %s.%s WHERE keyspace_name = ?", SchemaKeyspace.NAME, SchemaKeyspace.VIEWS);
+        String query = String.format("SELECT * FROM %s.%s WHERE keyspace_name = ?", SchemaConstants.SCHEMA_KEYSPACE_NAME, SchemaKeyspace.VIEWS);
 
         for (Row row : session.execute(query, keyspace))
         {
@@ -169,15 +170,15 @@ public class NativeSSTableLoaderClient extends SSTableLoader.Client
                                                   Types types)
     {
         UUID id = row.getUUID("id");
-        Set<CFMetaData.Flag> flags = CFMetaData.flagsFromStrings(row.getSet("flags", String.class));
+        Set<CFMetaData.Flag> flags = isView ? Collections.emptySet() : CFMetaData.flagsFromStrings(row.getSet("flags", String.class));
 
         boolean isSuper = flags.contains(CFMetaData.Flag.SUPER);
         boolean isCounter = flags.contains(CFMetaData.Flag.COUNTER);
         boolean isDense = flags.contains(CFMetaData.Flag.DENSE);
-        boolean isCompound = flags.contains(CFMetaData.Flag.COMPOUND);
+        boolean isCompound = isView || flags.contains(CFMetaData.Flag.COMPOUND);
 
         String columnsQuery = String.format("SELECT * FROM %s.%s WHERE keyspace_name = ? AND table_name = ?",
-                                            SchemaKeyspace.NAME,
+                                            SchemaConstants.SCHEMA_KEYSPACE_NAME,
                                             SchemaKeyspace.COLUMNS);
 
         List<ColumnDefinition> defs = new ArrayList<>();
@@ -198,12 +199,14 @@ public class NativeSSTableLoaderClient extends SSTableLoader.Client
 
     private static ColumnDefinition createDefinitionFromRow(Row row, String keyspace, String table, Types types)
     {
-        ColumnIdentifier name = ColumnIdentifier.getInterned(row.getBytes("column_name_bytes"), row.getString("column_name"));
-
         ClusteringOrder order = ClusteringOrder.valueOf(row.getString("clustering_order").toUpperCase());
         AbstractType<?> type = CQLTypeParser.parse(keyspace, row.getString("type"), types);
         if (order == ClusteringOrder.DESC)
             type = ReversedType.getInstance(type);
+
+        ColumnIdentifier name = ColumnIdentifier.getInterned(type,
+                                                             row.getBytes("column_name_bytes"),
+                                                             row.getString("column_name"));
 
         int position = row.getInt("position");
         ColumnDefinition.Kind kind = ColumnDefinition.Kind.valueOf(row.getString("kind").toUpperCase());

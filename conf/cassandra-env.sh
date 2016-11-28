@@ -88,7 +88,7 @@ calculate_heap_sizes()
 
 # Determine the sort of JVM we'll be running on.
 java_ver_output=`"${JAVA:-java}" -version 2>&1`
-jvmver=`echo "$java_ver_output" | grep '[openjdk|java] version' | awk -F'"' 'NR==1 {print $2}'`
+jvmver=`echo "$java_ver_output" | grep '[openjdk|java] version' | awk -F'"' 'NR==1 {print $2}' | cut -d\- -f1`
 JVM_VERSION=${jvmver%_*}
 JVM_PATCH_VERSION=${jvmver#*_}
 
@@ -97,7 +97,7 @@ if [ "$JVM_VERSION" \< "1.8" ] ; then
     exit 1;
 fi
 
-if [ "$JVM_VERSION" \< "1.8" ] && [ "$JVM_PATCH_VERSION" \< "40" ] ; then
+if [ "$JVM_VERSION" \< "1.8" ] && [ "$JVM_PATCH_VERSION" -lt 40 ] ; then
     echo "Cassandra 3.0 and later require Java 8u40 or later."
     exit 1;
 fi
@@ -121,41 +121,6 @@ case "$jvm" in
         ;;
 esac
 
-# Override these to set the amount of memory to allocate to the JVM at
-# start-up. For production use you may wish to adjust this for your
-# environment. MAX_HEAP_SIZE is the total amount of memory dedicated
-# to the Java heap. HEAP_NEWSIZE refers to the size of the young
-# generation. Both MAX_HEAP_SIZE and HEAP_NEWSIZE should be either set
-# or not (if you set one, set the other).
-#
-# The main trade-off for the young generation is that the larger it
-# is, the longer GC pause times will be. The shorter it is, the more
-# expensive GC will be (usually).
-#
-# The example HEAP_NEWSIZE assumes a modern 8-core+ machine for decent pause
-# times. If in doubt, and if you do not particularly want to tweak, go with
-# 100 MB per physical CPU core.
-
-#MAX_HEAP_SIZE="4G"
-#HEAP_NEWSIZE="800M"
-
-# Set this to control the amount of arenas per-thread in glibc
-#export MALLOC_ARENA_MAX=4
-
-# only calculate the size if it's not set manually
-if [ "x$MAX_HEAP_SIZE" = "x" ] && [ "x$HEAP_NEWSIZE" = "x" ]; then
-    calculate_heap_sizes
-else
-    if [ "x$MAX_HEAP_SIZE" = "x" ] ||  [ "x$HEAP_NEWSIZE" = "x" ]; then
-        echo "please set or unset MAX_HEAP_SIZE and HEAP_NEWSIZE in pairs (see cassandra-env.sh)"
-        exit 1
-    fi
-fi
-
-if [ "x$MALLOC_ARENA_MAX" = "x" ] ; then
-    export MALLOC_ARENA_MAX=4
-fi
-
 #GC log path has to be defined here because it needs to access CASSANDRA_HOME
 JVM_OPTS="$JVM_OPTS -Xloggc:${CASSANDRA_HOME}/logs/gc.log"
 
@@ -178,6 +143,41 @@ echo $JVM_OPTS | grep -q Xms
 DEFINED_XMS=$?
 echo $JVM_OPTS | grep -q UseConcMarkSweepGC
 USING_CMS=$?
+echo $JVM_OPTS | grep -q UseG1GC
+USING_G1=$?
+
+# Override these to set the amount of memory to allocate to the JVM at
+# start-up. For production use you may wish to adjust this for your
+# environment. MAX_HEAP_SIZE is the total amount of memory dedicated
+# to the Java heap. HEAP_NEWSIZE refers to the size of the young
+# generation. Both MAX_HEAP_SIZE and HEAP_NEWSIZE should be either set
+# or not (if you set one, set the other).
+#
+# The main trade-off for the young generation is that the larger it
+# is, the longer GC pause times will be. The shorter it is, the more
+# expensive GC will be (usually).
+#
+# The example HEAP_NEWSIZE assumes a modern 8-core+ machine for decent pause
+# times. If in doubt, and if you do not particularly want to tweak, go with
+# 100 MB per physical CPU core.
+
+#MAX_HEAP_SIZE="4G"
+#HEAP_NEWSIZE="800M"
+
+# Set this to control the amount of arenas per-thread in glibc
+#export MALLOC_ARENA_MAX=4
+
+# only calculate the size if it's not set manually
+if [ "x$MAX_HEAP_SIZE" = "x" ] && [ "x$HEAP_NEWSIZE" = "x" -o $USING_G1 -eq 0 ]; then
+    calculate_heap_sizes
+elif [ "x$MAX_HEAP_SIZE" = "x" ] ||  [ "x$HEAP_NEWSIZE" = "x" -a $USING_G1 -ne 0 ]; then
+    echo "please set or unset MAX_HEAP_SIZE and HEAP_NEWSIZE in pairs when using CMS GC (see cassandra-env.sh)"
+    exit 1
+fi
+
+if [ "x$MALLOC_ARENA_MAX" = "x" ] ; then
+    export MALLOC_ARENA_MAX=4
+fi
 
 # We only set -Xms and -Xmx if they were not defined on jvm.options file
 # If defined, both Xmx and Xms should be defined together.
@@ -238,22 +238,44 @@ fi
 JMX_PORT="7199"
 
 if [ "$LOCAL_JMX" = "yes" ]; then
-  JVM_OPTS="$JVM_OPTS -Dcassandra.jmx.local.port=$JMX_PORT -XX:+DisableExplicitGC"
+  JVM_OPTS="$JVM_OPTS -Dcassandra.jmx.local.port=$JMX_PORT"
+  JVM_OPTS="$JVM_OPTS -Dcom.sun.management.jmxremote.authenticate=false"
 else
-  JVM_OPTS="$JVM_OPTS -Dcom.sun.management.jmxremote.port=$JMX_PORT"
+  JVM_OPTS="$JVM_OPTS -Dcassandra.jmx.remote.port=$JMX_PORT"
+  # if ssl is enabled the same port cannot be used for both jmx and rmi so either
+  # pick another value for this property or comment out to use a random port (though see CASSANDRA-7087 for origins)
   JVM_OPTS="$JVM_OPTS -Dcom.sun.management.jmxremote.rmi.port=$JMX_PORT"
-  JVM_OPTS="$JVM_OPTS -Dcom.sun.management.jmxremote.ssl=false"
+
+  # turn on JMX authentication. See below for further options
   JVM_OPTS="$JVM_OPTS -Dcom.sun.management.jmxremote.authenticate=true"
-  JVM_OPTS="$JVM_OPTS -Dcom.sun.management.jmxremote.password.file=/etc/cassandra/jmxremote.password"
-#  JVM_OPTS="$JVM_OPTS -Djavax.net.ssl.keyStore=/path/to/keystore"
-#  JVM_OPTS="$JVM_OPTS -Djavax.net.ssl.keyStorePassword=<keystore-password>"
-#  JVM_OPTS="$JVM_OPTS -Djavax.net.ssl.trustStore=/path/to/truststore"
-#  JVM_OPTS="$JVM_OPTS -Djavax.net.ssl.trustStorePassword=<truststore-password>"
-#  JVM_OPTS="$JVM_OPTS -Dcom.sun.management.jmxremote.ssl.need.client.auth=true"
-#  JVM_OPTS="$JVM_OPTS -Dcom.sun.management.jmxremote.registry.ssl=true"
-#  JVM_OPTS="$JVM_OPTS -Dcom.sun.management.jmxremote.ssl.enabled.protocols=<enabled-protocols>"
-#  JVM_OPTS="$JVM_OPTS -Dcom.sun.management.jmxremote.ssl.enabled.cipher.suites=<enabled-cipher-suites>"
+
+  # jmx ssl options
+  #JVM_OPTS="$JVM_OPTS -Dcom.sun.management.jmxremote.ssl=true"
+  #JVM_OPTS="$JVM_OPTS -Dcom.sun.management.jmxremote.ssl.need.client.auth=true"
+  #JVM_OPTS="$JVM_OPTS -Dcom.sun.management.jmxremote.ssl.enabled.protocols=<enabled-protocols>"
+  #JVM_OPTS="$JVM_OPTS -Dcom.sun.management.jmxremote.ssl.enabled.cipher.suites=<enabled-cipher-suites>"
+  #JVM_OPTS="$JVM_OPTS -Djavax.net.ssl.keyStore=/path/to/keystore"
+  #JVM_OPTS="$JVM_OPTS -Djavax.net.ssl.keyStorePassword=<keystore-password>"
+  #JVM_OPTS="$JVM_OPTS -Djavax.net.ssl.trustStore=/path/to/truststore"
+  #JVM_OPTS="$JVM_OPTS -Djavax.net.ssl.trustStorePassword=<truststore-password>"
 fi
+
+# jmx authentication and authorization options. By default, auth is only
+# activated for remote connections but they can also be enabled for local only JMX
+## Basic file based authn & authz
+JVM_OPTS="$JVM_OPTS -Dcom.sun.management.jmxremote.password.file=/etc/cassandra/jmxremote.password"
+#JVM_OPTS="$JVM_OPTS -Dcom.sun.management.jmxremote.access.file=/etc/cassandra/jmxremote.access"
+## Custom auth settings which can be used as alternatives to JMX's out of the box auth utilities.
+## JAAS login modules can be used for authentication by uncommenting these two properties.
+## Cassandra ships with a LoginModule implementation - org.apache.cassandra.auth.CassandraLoginModule -
+## which delegates to the IAuthenticator configured in cassandra.yaml. See the sample JAAS configuration
+## file cassandra-jaas.config
+#JVM_OPTS="$JVM_OPTS -Dcassandra.jmx.remote.login.config=CassandraLogin"
+#JVM_OPTS="$JVM_OPTS -Djava.security.auth.login.config=$CASSANDRA_HOME/conf/cassandra-jaas.config"
+
+## Cassandra also ships with a helper for delegating JMX authz calls to the configured IAuthorizer,
+## uncomment this to use it. Requires one of the two authentication options to be enabled
+#JVM_OPTS="$JVM_OPTS -Dcassandra.jmx.authorizer=org.apache.cassandra.auth.jmx.AuthorizationProxy"
 
 # To use mx4j, an HTML interface for JMX, add mx4j-tools.jar to the lib/
 # directory.

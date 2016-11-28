@@ -25,7 +25,6 @@ import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.ClusteringIndexNamesFilter;
 import org.apache.cassandra.db.filter.ClusteringIndexSliceFilter;
-import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.filter.DataLimits;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
@@ -166,8 +165,7 @@ public class CompositesSearcher extends CassandraIndexSearcher
                     @SuppressWarnings("resource") // We close right away if empty, and if it's assign to next it will be called either
                     // by the next caller of next, or through closing this iterator is this come before.
                     UnfilteredRowIterator dataIter =
-                        filterStaleEntries(dataCmd.queryMemtableAndDisk(index.baseCfs,
-                                                                        executionController.baseReadOpOrderGroup()),
+                        filterStaleEntries(dataCmd.queryMemtableAndDisk(index.baseCfs, executionController),
                                            indexKey.getKey(),
                                            entries,
                                            executionController.writeOpOrderGroup(),
@@ -229,7 +227,6 @@ public class CompositesSearcher extends CassandraIndexSearcher
         }
 
         UnfilteredRowIterator iteratorToReturn = null;
-        ClusteringComparator comparator = dataIter.metadata().comparator;
         if (isStaticColumn())
         {
             if (entries.size() != 1)
@@ -250,6 +247,8 @@ public class CompositesSearcher extends CassandraIndexSearcher
         }
         else
         {
+            ClusteringComparator comparator = dataIter.metadata().comparator;
+
             class Transform extends Transformation
             {
                 private int entriesIdx;

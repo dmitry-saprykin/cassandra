@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -122,7 +122,7 @@ public class StandaloneScrubber
                     try (LifecycleTransaction txn = LifecycleTransaction.offline(OperationType.SCRUB, sstable))
                     {
                         txn.obsoleteOriginals(); // make sure originals are deleted and avoid NPE if index is missing, CASSANDRA-9591
-                        try (Scrubber scrubber = new Scrubber(cfs, txn, options.skipCorrupted, handler, true, !options.noValidate))
+                        try (Scrubber scrubber = new Scrubber(cfs, txn, options.skipCorrupted, handler, !options.noValidate))
                         {
                             scrubber.scrub();
                         }
@@ -160,9 +160,10 @@ public class StandaloneScrubber
 
     private static void checkManifest(CompactionStrategyManager strategyManager, ColumnFamilyStore cfs, Collection<SSTableReader> sstables)
     {
-        int maxSizeInMB = (int)((cfs.getCompactionStrategyManager().getMaxSSTableBytes()) / (1024L * 1024L));
-        if (strategyManager.getStrategies().size() == 2 && strategyManager.getStrategies().get(0) instanceof LeveledCompactionStrategy)
+        if (strategyManager.getCompactionParams().klass().equals(LeveledCompactionStrategy.class))
         {
+            int maxSizeInMB = (int)((cfs.getCompactionStrategyManager().getMaxSSTableBytes()) / (1024L * 1024L));
+
             System.out.println("Checking leveled manifest");
             Predicate<SSTableReader> repairedPredicate = new Predicate<SSTableReader>()
             {
@@ -176,12 +177,12 @@ public class StandaloneScrubber
             List<SSTableReader> repaired = Lists.newArrayList(Iterables.filter(sstables, repairedPredicate));
             List<SSTableReader> unRepaired = Lists.newArrayList(Iterables.filter(sstables, Predicates.not(repairedPredicate)));
 
-            LeveledManifest repairedManifest = LeveledManifest.create(cfs, maxSizeInMB, repaired);
+            LeveledManifest repairedManifest = LeveledManifest.create(cfs, maxSizeInMB, cfs.getLevelFanoutSize(), repaired);
             for (int i = 1; i < repairedManifest.getLevelCount(); i++)
             {
                 repairedManifest.repairOverlappingSSTables(i);
             }
-            LeveledManifest unRepairedManifest = LeveledManifest.create(cfs, maxSizeInMB, unRepaired);
+            LeveledManifest unRepairedManifest = LeveledManifest.create(cfs, maxSizeInMB, cfs.getLevelFanoutSize(), unRepaired);
             for (int i = 1; i < unRepairedManifest.getLevelCount(); i++)
             {
                 unRepairedManifest.repairOverlappingSSTables(i);

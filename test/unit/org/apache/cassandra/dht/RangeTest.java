@@ -28,9 +28,12 @@ import java.util.Set;
 
 import com.google.common.base.Joiner;
 import org.apache.commons.lang3.StringUtils;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.commons.collections.CollectionUtils;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.dht.ByteOrderedPartitioner.BytesToken;
 import org.apache.cassandra.dht.RandomPartitioner.BigIntegerToken;
@@ -42,6 +45,12 @@ import static org.junit.Assert.*;
 
 public class RangeTest
 {
+    @BeforeClass
+    public static void setupDD()
+    {
+        DatabaseDescriptor.daemonInitialization();
+    }
+
     @Test
     public void testContains()
     {
@@ -658,5 +667,20 @@ public class RangeTest
     private static Token t(long t)
     {
         return new Murmur3Partitioner.LongToken(t);
+    }
+
+    @Test
+    public void testCompareTo_SameObject_WrapAround()
+    {
+        Range<Token> range = r(10, -10);
+        assertEquals(0, range.compareTo(range));
+    }
+
+    @Test
+    public void testCompareTo_BothWrapAround()
+    {
+        Range<Token> r0 = r(10, -10);
+        Range<Token> r1 = r(20, -5);
+        assertNotSame(r0.compareTo(r1), r1.compareTo(r0));
     }
 }

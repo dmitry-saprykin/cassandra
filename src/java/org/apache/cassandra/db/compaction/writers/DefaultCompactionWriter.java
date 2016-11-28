@@ -18,7 +18,6 @@
 package org.apache.cassandra.db.compaction.writers;
 
 
-import java.util.List;
 import java.util.Set;
 
 import org.slf4j.Logger;
@@ -44,13 +43,19 @@ public class DefaultCompactionWriter extends CompactionAwareWriter
 
     public DefaultCompactionWriter(ColumnFamilyStore cfs, Directories directories, LifecycleTransaction txn, Set<SSTableReader> nonExpiredSSTables)
     {
-        this(cfs, directories, txn, nonExpiredSSTables, false, false, 0);
+        this(cfs, directories, txn, nonExpiredSSTables, false, 0);
+    }
+
+    @Deprecated
+    public DefaultCompactionWriter(ColumnFamilyStore cfs, Directories directories, LifecycleTransaction txn, Set<SSTableReader> nonExpiredSSTables, boolean offline, boolean keepOriginals, int sstableLevel)
+    {
+        this(cfs, directories, txn, nonExpiredSSTables, keepOriginals, sstableLevel);
     }
 
     @SuppressWarnings("resource")
-    public DefaultCompactionWriter(ColumnFamilyStore cfs, Directories directories, LifecycleTransaction txn, Set<SSTableReader> nonExpiredSSTables, boolean offline, boolean keepOriginals, int sstableLevel)
+    public DefaultCompactionWriter(ColumnFamilyStore cfs, Directories directories, LifecycleTransaction txn, Set<SSTableReader> nonExpiredSSTables, boolean keepOriginals, int sstableLevel)
     {
-        super(cfs, directories, txn, nonExpiredSSTables, offline, keepOriginals);
+        super(cfs, directories, txn, nonExpiredSSTables, keepOriginals);
         this.sstableLevel = sstableLevel;
     }
 
@@ -73,12 +78,6 @@ public class DefaultCompactionWriter extends CompactionAwareWriter
                                                     cfs.indexManager.listIndexes(),
                                                     txn);
         sstableWriter.switchWriter(writer);
-    }
-
-    @Override
-    public List<SSTableReader> finish(long repairedAt)
-    {
-        return sstableWriter.setRepairedAt(repairedAt).finish();
     }
 
     @Override

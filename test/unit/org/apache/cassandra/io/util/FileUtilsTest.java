@@ -27,18 +27,22 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Arrays;
 
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.cql3.CQLTester;
-import org.apache.cassandra.schema.SchemaKeyspace;
-import org.apache.cassandra.utils.FBUtilities;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 public class FileUtilsTest
 {
+
+    @BeforeClass
+    public static void setupDD()
+    {
+        DatabaseDescriptor.daemonInitialization();
+    }
 
     @Test
     public void testTruncate() throws IOException
@@ -93,9 +97,8 @@ public class FileUtilsTest
 
     private File createFile(File file, long size)
     {
-        try
+        try (RandomAccessFile f = new RandomAccessFile(file, "rw"))
         {
-            RandomAccessFile f = new RandomAccessFile(file, "rw");
             f.setLength(size);
         }
         catch (Exception e)

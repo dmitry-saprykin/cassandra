@@ -30,15 +30,14 @@ import com.datastax.driver.core.DataType;
 import com.datastax.driver.core.LocalDate;
 import com.datastax.driver.core.PreparedStatement;
 import org.apache.cassandra.db.ConsistencyLevel;
-import org.apache.cassandra.stress.Operation;
 import org.apache.cassandra.stress.generate.Row;
+import org.apache.cassandra.stress.operations.PartitionOperation;
+import org.apache.cassandra.stress.report.Timer;
 import org.apache.cassandra.stress.settings.StressSettings;
 import org.apache.cassandra.stress.util.JavaDriverClient;
-import org.apache.cassandra.stress.util.Timer;
 
-public abstract class SchemaStatement extends Operation
+public abstract class SchemaStatement extends PartitionOperation
 {
-
     final PreparedStatement statement;
     final Integer thriftId;
     final ConsistencyLevel cl;
@@ -47,24 +46,27 @@ public abstract class SchemaStatement extends Operation
     final ColumnDefinitions definitions;
 
     public SchemaStatement(Timer timer, StressSettings settings, DataSpec spec,
-                           PreparedStatement statement, Integer thriftId, ConsistencyLevel cl)
+                           PreparedStatement statement, List<String> bindNames, Integer thriftId, ConsistencyLevel cl)
     {
         super(timer, settings, spec);
         this.statement = statement;
         this.thriftId = thriftId;
         this.cl = cl;
-        argumentIndex = new int[statement.getVariables().size()];
+        argumentIndex = new int[bindNames.size()];
         bindBuffer = new Object[argumentIndex.length];
-        definitions = statement.getVariables();
+        definitions = statement != null ? statement.getVariables() : null;
         int i = 0;
-        for (ColumnDefinitions.Definition definition : definitions)
-            argumentIndex[i++] = spec.partitionGenerator.indexOf(definition.getName());
+        for (String name : bindNames)
+            argumentIndex[i++] = spec.partitionGenerator.indexOf(name);
 
-        statement.setConsistencyLevel(JavaDriverClient.from(cl));
+        if (statement != null)
+            statement.setConsistencyLevel(JavaDriverClient.from(cl));
     }
 
     BoundStatement bindRow(Row row)
     {
+        assert statement != null;
+
         for (int i = 0 ; i < argumentIndex.length ; i++)
         {
             Object value = row.get(argumentIndex[i]);

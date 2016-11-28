@@ -104,6 +104,7 @@ public class OnDiskIndex implements Iterable<OnDiskIndex.DataTerm>, Closeable
     protected final AbstractType<?> comparator;
     protected final MappedBuffer indexFile;
     protected final long indexSize;
+    protected final boolean hasMarkedPartials;
 
     protected final Function<Long, DecoratedKey> keyFetcher;
 
@@ -114,6 +115,7 @@ public class OnDiskIndex implements Iterable<OnDiskIndex.DataTerm>, Closeable
 
     protected final ByteBuffer minTerm, maxTerm, minKey, maxKey;
 
+    @SuppressWarnings("resource")
     public OnDiskIndex(File index, AbstractType<?> cmp, Function<Long, DecoratedKey> keyReader)
     {
         keyFetcher = keyReader;
@@ -137,6 +139,7 @@ public class OnDiskIndex implements Iterable<OnDiskIndex.DataTerm>, Closeable
             maxKey = ByteBufferUtil.readWithShortLength(backingFile);
 
             mode = OnDiskIndexBuilder.Mode.mode(backingFile.readUTF());
+            hasMarkedPartials = backingFile.readBoolean();
 
             indexSize = backingFile.length();
             indexFile = new MappedBuffer(new ChannelProxy(indexPath, backingFile.getChannel()));
@@ -164,6 +167,16 @@ public class OnDiskIndex implements Iterable<OnDiskIndex.DataTerm>, Closeable
         {
             FileUtils.closeQuietly(backingFile);
         }
+    }
+
+    public boolean hasMarkedPartials()
+    {
+        return hasMarkedPartials;
+    }
+
+    public OnDiskIndexBuilder.Mode mode()
+    {
+        return mode;
     }
 
     public ByteBuffer minTerm()
@@ -206,6 +219,19 @@ public class OnDiskIndex implements Iterable<OnDiskIndex.DataTerm>, Closeable
      */
     public RangeIterator<Long, Token> search(Expression exp)
     {
+        assert mode.supports(exp.getOp());
+
+        if (exp.getOp() == Expression.Op.PREFIX && mode == OnDiskIndexBuilder.Mode.CONTAINS && !hasMarkedPartials)
+            throw new UnsupportedOperationException("prefix queries in CONTAINS mode are not supported by this index");
+
+        // optimization in case single term is requested from index
+        // we don't really need to build additional union iterator
+        if (exp.getOp() == Op.EQ)
+        {
+            DataTerm term = getTerm(exp.lower.value);
+            return term == null ? null : term.getTokens();
+        }
+
         // convert single NOT_EQ to range with exclusion
         final Expression expression = (exp.getOp() != Op.NOT_EQ)
                                         ? exp
@@ -246,6 +272,7 @@ public class OnDiskIndex implements Iterable<OnDiskIndex.DataTerm>, Closeable
         RangeUnionIterator.Builder<Long, Token> builder = RangeUnionIterator.builder();
         for (Expression e : ranges)
         {
+            @SuppressWarnings("resource")
             RangeIterator<Long, Token> range = searchRange(e);
             if (range != null)
                 builder.add(range);
@@ -426,6 +453,12 @@ public class OnDiskIndex implements Iterable<OnDiskIndex.DataTerm>, Closeable
         return ptr;
     }
 
+    private DataTerm getTerm(ByteBuffer query)
+    {
+        SearchResult<DataTerm> term = searchIndex(query, getDataBlock(query));
+        return term.cmp == 0 ? term.result : null;
+    }
+
     private SearchResult<DataTerm> searchIndex(ByteBuffer query, int blockIdx)
     {
         return dataLevel.getBlock(blockIdx).search(comparator, query);
@@ -584,7 +617,7 @@ public class OnDiskIndex implements Iterable<OnDiskIndex.DataTerm>, Closeable
 
         protected PointerTerm cast(MappedBuffer data)
         {
-            return new PointerTerm(data, termSize);
+            return new PointerTerm(data, termSize, hasMarkedPartials);
         }
     }
 
@@ -594,7 +627,7 @@ public class OnDiskIndex implements Iterable<OnDiskIndex.DataTerm>, Closeable
 
         protected DataTerm(MappedBuffer content, OnDiskIndexBuilder.TermSize size, TokenTree perBlockIndex)
         {
-            super(content, size);
+            super(content, size, hasMarkedPartials);
             this.perBlockIndex = perBlockIndex;
         }
 
@@ -642,9 +675,9 @@ public class OnDiskIndex implements Iterable<OnDiskIndex.DataTerm>, Closeable
 
     protected static class PointerTerm extends Term
     {
-        public PointerTerm(MappedBuffer content, OnDiskIndexBuilder.TermSize size)
+        public PointerTerm(MappedBuffer content, OnDiskIndexBuilder.TermSize size, boolean hasMarkedPartials)
         {
-            super(content, size);
+            super(content, size, hasMarkedPartials);
         }
 
         public int getBlock()
@@ -723,6 +756,13 @@ public class OnDiskIndex implements Iterable<OnDiskIndex.DataTerm>, Closeable
                 {
                     DataTerm currentTerm = currentBlock.getTerm(nextOffset());
 
+                    // we need to step over all of the partial terms, in PREFIX mode,
+                    // encountered by the query until upper-bound tells us to stop
+                    if (e.getOp() == Op.PREFIX && currentTerm.isPartial())
+                        continue;
+
+                    // haven't reached the start of the query range yet, let's
+                    // keep skip the current term until lower bound is satisfied
                     if (checkLower && !e.isLowerSatisfiedBy(currentTerm))
                         continue;
 

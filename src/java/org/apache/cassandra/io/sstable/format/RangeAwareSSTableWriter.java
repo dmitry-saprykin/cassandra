@@ -33,6 +33,7 @@ import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.SSTableMultiWriter;
 import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.FBUtilities;
 
 public class RangeAwareSSTableWriter implements SSTableMultiWriter
 {
@@ -42,7 +43,7 @@ public class RangeAwareSSTableWriter implements SSTableMultiWriter
     private final long estimatedKeys;
     private final long repairedAt;
     private final SSTableFormat.Type format;
-    private final SerializationHeader.Component header;
+    private final SerializationHeader header;
     private final LifecycleTransaction txn;
     private int currentIndex = -1;
     public final ColumnFamilyStore cfs;
@@ -50,7 +51,7 @@ public class RangeAwareSSTableWriter implements SSTableMultiWriter
     private final List<SSTableReader> finishedReaders = new ArrayList<>();
     private SSTableMultiWriter currentWriter = null;
 
-    public RangeAwareSSTableWriter(ColumnFamilyStore cfs, long estimatedKeys, long repairedAt, SSTableFormat.Type format, int sstableLevel, long totalSize, LifecycleTransaction txn, SerializationHeader.Component header) throws IOException
+    public RangeAwareSSTableWriter(ColumnFamilyStore cfs, long estimatedKeys, long repairedAt, SSTableFormat.Type format, int sstableLevel, long totalSize, LifecycleTransaction txn, SerializationHeader header) throws IOException
     {
         directories = cfs.getDirectories().getWriteableLocations();
         this.sstableLevel = sstableLevel;
@@ -65,9 +66,10 @@ public class RangeAwareSSTableWriter implements SSTableMultiWriter
         {
             Directories.DataDirectory localDir = cfs.getDirectories().getWriteableLocation(totalSize);
             if (localDir == null)
-                throw new IOException("Insufficient disk space to store " + totalSize + " bytes");
+                throw new IOException(String.format("Insufficient disk space to store %s",
+                                                    FBUtilities.prettyPrintMemory(totalSize)));
             Descriptor desc = Descriptor.fromFilename(cfs.getSSTablePath(cfs.getDirectories().getLocationForDisk(localDir), format));
-            currentWriter = cfs.createSSTableMultiWriter(desc, estimatedKeys, repairedAt, sstableLevel, header.toHeader(cfs.metadata), txn);
+            currentWriter = cfs.createSSTableMultiWriter(desc, estimatedKeys, repairedAt, sstableLevel, header, txn);
         }
     }
 
@@ -89,7 +91,7 @@ public class RangeAwareSSTableWriter implements SSTableMultiWriter
                 finishedWriters.add(currentWriter);
 
             Descriptor desc = Descriptor.fromFilename(cfs.getSSTablePath(cfs.getDirectories().getLocationForDisk(directories[currentIndex])), format);
-            currentWriter = cfs.createSSTableMultiWriter(desc, estimatedKeys, repairedAt, sstableLevel, header.toHeader(cfs.metadata), txn);
+            currentWriter = cfs.createSSTableMultiWriter(desc, estimatedKeys, repairedAt, sstableLevel, header, txn);
         }
     }
 

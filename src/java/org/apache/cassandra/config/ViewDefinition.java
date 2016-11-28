@@ -37,7 +37,6 @@ public class ViewDefinition
     public final UUID baseTableId;
     public final String baseTableName;
     public final boolean includeAllColumns;
-    // The order of partititon columns and clustering columns is important, so we cannot switch these two to sets
     public final CFMetaData metadata;
 
     public SelectStatement.RawStatement select;
@@ -131,8 +130,8 @@ public class ViewDefinition
     /**
      * Replace the column 'from' with 'to' in this materialized view definition's partition,
      * clustering, or included columns.
-     * @param from the existing column 
-     * @param to the new column 
+     * @param from the existing column
+     * @param to the new column
      */
     public void renameColumn(ColumnIdentifier from, ColumnIdentifier to)
     {
@@ -140,8 +139,8 @@ public class ViewDefinition
 
         // convert whereClause to Relations, rename ids in Relations, then convert back to whereClause
         List<Relation> relations = whereClauseToRelations(whereClause);
-        ColumnIdentifier.Raw fromRaw = new ColumnIdentifier.Literal(from.toString(), true);
-        ColumnIdentifier.Raw toRaw = new ColumnIdentifier.Literal(to.toString(), true);
+        ColumnDefinition.Raw fromRaw = ColumnDefinition.Raw.forQuoted(from.toString());
+        ColumnDefinition.Raw toRaw = ColumnDefinition.Raw.forQuoted(to.toString());
         List<Relation> newRelations = relations.stream()
                 .map(r -> r.renameIdentifier(fromRaw, toRaw))
                 .collect(Collectors.toList());

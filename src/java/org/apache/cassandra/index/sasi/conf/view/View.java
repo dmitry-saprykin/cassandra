@@ -32,14 +32,14 @@ import org.apache.cassandra.utils.Interval;
 import org.apache.cassandra.utils.IntervalTree;
 
 import com.google.common.collect.Iterables;
-import com.google.common.collect.Sets;
 
 public class View implements Iterable<SSTableIndex>
 {
     private final Map<Descriptor, SSTableIndex> view;
 
     private final TermTree termTree;
-    private final IntervalTree<ByteBuffer, SSTableIndex, Interval<ByteBuffer, SSTableIndex>> keyIntervalTree;
+    private final AbstractType<?> keyValidator;
+    private final IntervalTree<Key, SSTableIndex, Interval<Key, SSTableIndex>> keyIntervalTree;
 
     public View(ColumnIndex index, Set<SSTableIndex> indexes)
     {
@@ -58,7 +58,7 @@ public class View implements Iterable<SSTableIndex>
                                             ? new PrefixTermTree.Builder(index.getMode().mode, validator)
                                             : new RangeTermTree.Builder(index.getMode().mode, validator);
 
-        List<Interval<ByteBuffer, SSTableIndex>> keyIntervals = new ArrayList<>();
+        List<Interval<Key, SSTableIndex>> keyIntervals = new ArrayList<>();
         for (SSTableIndex sstableIndex : Iterables.concat(currentView, newIndexes))
         {
             SSTableReader sstable = sstableIndex.getSSTable();
@@ -71,25 +71,28 @@ public class View implements Iterable<SSTableIndex>
             newView.put(sstable.descriptor, sstableIndex);
 
             termTreeBuilder.add(sstableIndex);
-            keyIntervals.add(Interval.create(sstableIndex.minKey(), sstableIndex.maxKey(), sstableIndex));
+            keyIntervals.add(Interval.create(new Key(sstableIndex.minKey(), index.keyValidator()),
+                                             new Key(sstableIndex.maxKey(), index.keyValidator()),
+                                             sstableIndex));
         }
 
         this.view = newView;
         this.termTree = termTreeBuilder.build();
+        this.keyValidator = index.keyValidator();
         this.keyIntervalTree = IntervalTree.build(keyIntervals);
 
         if (keyIntervalTree.intervalCount() != termTree.intervalCount())
             throw new IllegalStateException(String.format("mismatched sizes for intervals tree for keys vs terms: %d != %d", keyIntervalTree.intervalCount(), termTree.intervalCount()));
     }
 
-    public Set<SSTableIndex> match(final Set<SSTableReader> scope, Expression expression)
+    public Set<SSTableIndex> match(Expression expression)
     {
-        return Sets.filter(termTree.search(expression), index -> scope.contains(index.getSSTable()));
+        return termTree.search(expression);
     }
 
     public List<SSTableIndex> match(ByteBuffer minKey, ByteBuffer maxKey)
     {
-        return keyIntervalTree.search(Interval.create(minKey, maxKey, (SSTableIndex) null));
+        return keyIntervalTree.search(Interval.create(new Key(minKey, keyValidator), new Key(maxKey, keyValidator), (SSTableIndex) null));
     }
 
     public Iterator<SSTableIndex> iterator()
@@ -100,5 +103,26 @@ public class View implements Iterable<SSTableIndex>
     public Collection<SSTableIndex> getIndexes()
     {
         return view.values();
+    }
+
+    /**
+     * This is required since IntervalTree doesn't support custom Comparator
+     * implementations and relied on items to be comparable which "raw" keys are not.
+     */
+    private static class Key implements Comparable<Key>
+    {
+        private final ByteBuffer key;
+        private final AbstractType<?> comparator;
+
+        public Key(ByteBuffer key, AbstractType<?> comparator)
+        {
+            this.key = key;
+            this.comparator = comparator;
+        }
+
+        public int compareTo(Key o)
+        {
+            return comparator.compare(key, o.key);
+        }
     }
 }

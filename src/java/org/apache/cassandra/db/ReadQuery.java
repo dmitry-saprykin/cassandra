@@ -23,6 +23,7 @@ import org.apache.cassandra.exceptions.RequestExecutionException;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.pager.QueryPager;
 import org.apache.cassandra.service.pager.PagingState;
+import org.apache.cassandra.transport.ProtocolVersion;
 
 /**
  * Generic abstraction for read queries.
@@ -40,7 +41,7 @@ public interface ReadQuery
             return ReadExecutionController.empty();
         }
 
-        public PartitionIterator execute(ConsistencyLevel consistency, ClientState clientState) throws RequestExecutionException
+        public PartitionIterator execute(ConsistencyLevel consistency, ClientState clientState, long queryStartNanoTime) throws RequestExecutionException
         {
             return EmptyIterators.partition();
         }
@@ -48,6 +49,11 @@ public interface ReadQuery
         public PartitionIterator executeInternal(ReadExecutionController controller)
         {
             return EmptyIterators.partition();
+        }
+
+        public UnfilteredPartitionIterator executeLocally(ReadExecutionController executionController)
+        {
+            return EmptyIterators.unfilteredPartition(executionController.metaData(), false);
         }
 
         public DataLimits limits()
@@ -58,12 +64,7 @@ public interface ReadQuery
             return DataLimits.cqlLimits(0);
         }
 
-        public QueryPager getPager(PagingState state, int protocolVersion)
-        {
-            return QueryPager.EMPTY;
-        }
-
-        public QueryPager getLocalPager()
+        public QueryPager getPager(PagingState state, ProtocolVersion protocolVersion)
         {
             return QueryPager.EMPTY;
         }
@@ -99,7 +100,7 @@ public interface ReadQuery
      *
      * @return the result of the query.
      */
-    public PartitionIterator execute(ConsistencyLevel consistency, ClientState clientState) throws RequestExecutionException;
+    public PartitionIterator execute(ConsistencyLevel consistency, ClientState clientState, long queryStartNanoTime) throws RequestExecutionException;
 
     /**
      * Execute the query for internal queries (that is, it basically executes the query locally).
@@ -110,6 +111,15 @@ public interface ReadQuery
     public PartitionIterator executeInternal(ReadExecutionController controller);
 
     /**
+     * Execute the query locally. This is similar to {@link ReadQuery#executeInternal(ReadExecutionController)}
+     * but it returns an unfiltered partition iterator that can be merged later on.
+     *
+     * @param controller the {@code ReadExecutionController} protecting the read.
+     * @return the result of the read query.
+     */
+    public UnfilteredPartitionIterator executeLocally(ReadExecutionController executionController);
+
+    /**
      * Returns a pager for the query.
      *
      * @param pagingState the {@code PagingState} to start from if this is a paging continuation. This can be
@@ -118,7 +128,7 @@ public interface ReadQuery
      *
      * @return a pager for the query.
      */
-    public QueryPager getPager(PagingState pagingState, int protocolVersion);
+    public QueryPager getPager(PagingState pagingState, ProtocolVersion protocolVersion);
 
     /**
      * The limits for the query.

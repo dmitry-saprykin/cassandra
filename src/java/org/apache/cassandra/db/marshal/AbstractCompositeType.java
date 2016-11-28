@@ -27,6 +27,7 @@ import org.apache.cassandra.cql3.Term;
 import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.BytesSerializer;
 import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 /**
@@ -251,7 +252,7 @@ public abstract class AbstractCompositeType extends AbstractType<ByteBuffer>
     }
 
     @Override
-    public String toJSONString(ByteBuffer buffer, int protocolVersion)
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
         throw new UnsupportedOperationException();
     }
@@ -294,6 +295,12 @@ public abstract class AbstractCompositeType extends AbstractType<ByteBuffer>
     public TypeSerializer<ByteBuffer> getSerializer()
     {
         return BytesSerializer.instance;
+    }
+
+    @Override
+    public boolean referencesUserType(String name)
+    {
+        return getComponents().stream().anyMatch(f -> f.referencesUserType(name));
     }
 
     /**

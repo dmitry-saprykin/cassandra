@@ -20,8 +20,12 @@ package org.apache.cassandra.db;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicLong;
 
+import com.google.common.base.Throwables;
+import com.google.common.util.concurrent.Uninterruptibles;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.DatabaseDescriptor;
@@ -56,6 +60,8 @@ public class Mutation implements IMutation
     public final long createdAt = System.currentTimeMillis();
     // keep track of when mutation has started waiting for a MV partition lock
     public final AtomicLong viewLockAcquireStart = new AtomicLong(0);
+
+    private boolean cdcEnabled = false;
 
     public Mutation(String keyspaceName, DecoratedKey key)
     {
@@ -119,10 +125,21 @@ public class Mutation implements IMutation
         return modifications.get(cfId);
     }
 
+    /**
+     * Adds PartitionUpdate to the local set of modifications.
+     * Assumes no updates for the Table this PartitionUpdate impacts.
+     *
+     * @param update PartitionUpdate to append to Modifications list
+     * @return Mutation this mutation
+     * @throws IllegalArgumentException If PartitionUpdate for duplicate table is passed as argument
+     */
     public Mutation add(PartitionUpdate update)
     {
         assert update != null;
         assert update.partitionKey().getPartitioner() == key.getPartitioner();
+
+        cdcEnabled |= update.metadata().params.cdc;
+
         PartitionUpdate prev = modifications.put(update.metadata().cfId, update);
         if (prev != null)
             // developer error
@@ -192,24 +209,37 @@ public class Mutation implements IMutation
         return new Mutation(ks, key, modifications);
     }
 
+    public CompletableFuture<?> applyFuture()
+    {
+        Keyspace ks = Keyspace.open(keyspaceName);
+        return ks.apply(this, Keyspace.open(keyspaceName).getMetadata().params.durableWrites);
+    }
+
+    public void apply(boolean durableWrites)
+    {
+        try
+        {
+            Keyspace ks = Keyspace.open(keyspaceName);
+            Uninterruptibles.getUninterruptibly(ks.applyNotDeferrable(this, durableWrites));
+        }
+        catch (ExecutionException e)
+        {
+            throw Throwables.propagate(e.getCause());
+        }
+    }
+
     /*
      * This is equivalent to calling commit. Applies the changes to
      * to the keyspace that is obtained by calling Keyspace.open().
      */
     public void apply()
     {
-        Keyspace ks = Keyspace.open(keyspaceName);
-        ks.apply(this, ks.getMetadata().params.durableWrites);
-    }
-
-    public void apply(boolean durableWrites)
-    {
-        Keyspace.open(keyspaceName).apply(this, durableWrites);
+        apply(Keyspace.open(keyspaceName).getMetadata().params.durableWrites);
     }
 
     public void applyUnsafe()
     {
-        Keyspace.open(keyspaceName).apply(this, false);
+        apply(false);
     }
 
     public MessageOut<Mutation> createMessage()
@@ -233,6 +263,11 @@ public class Mutation implements IMutation
         for (PartitionUpdate update : getPartitionUpdates())
             gcgs = Math.min(gcgs, update.metadata().params.gcGraceSeconds);
         return gcgs;
+    }
+
+    public boolean trackedByCDC()
+    {
+        return cdcEnabled;
     }
 
     public String toString()
@@ -261,6 +296,72 @@ public class Mutation implements IMutation
             buff.append("\n  ").append(StringUtils.join(modifications.values(), "\n  ")).append('\n');
         }
         return buff.append("])").toString();
+    }
+
+    /**
+     * Creates a new simple mutuation builder.
+     *
+     * @param keyspaceName the name of the keyspace this is a mutation for.
+     * @param partitionKey the key of partition this if a mutation for.
+     * @return a newly created builder.
+     */
+    public static SimpleBuilder simpleBuilder(String keyspaceName, DecoratedKey partitionKey)
+    {
+        return new SimpleBuilders.MutationBuilder(keyspaceName, partitionKey);
+    }
+
+    /**
+     * Interface for building mutations geared towards human.
+     * <p>
+     * This should generally not be used when performance matters too much, but provides a more convenient interface to
+     * build a mutation than using the class constructor when performance is not of the utmost importance.
+     */
+    public interface SimpleBuilder
+    {
+        /**
+         * Sets the timestamp to use for the following additions to this builder or any derived (update or row) builder.
+         *
+         * @param timestamp the timestamp to use for following additions. If that timestamp hasn't been set, the current
+         * time in microseconds will be used.
+         * @return this builder.
+         */
+        public SimpleBuilder timestamp(long timestamp);
+
+        /**
+         * Sets the ttl to use for the following additions to this builder or any derived (update or row) builder.
+         * <p>
+         * Note that the for non-compact tables, this method must be called before any column addition for this
+         * ttl to be used for the row {@code LivenessInfo}.
+         *
+         * @param ttl the ttl to use for following additions. If that ttl hasn't been set, no ttl will be used.
+         * @return this builder.
+         */
+        public SimpleBuilder ttl(int ttl);
+
+        /**
+         * Adds an update for table identified by the provided metadata and return a builder for that partition.
+         *
+         * @param metadata the metadata of the table for which to add an update.
+         * @return a builder for the partition identified by {@code metadata} (and the partition key for which this is a
+         * mutation of).
+         */
+        public PartitionUpdate.SimpleBuilder update(CFMetaData metadata);
+
+        /**
+         * Adds an update for table identified by the provided name and return a builder for that partition.
+         *
+         * @param tableName the name of the table for which to add an update.
+         * @return a builder for the partition identified by {@code metadata} (and the partition key for which this is a
+         * mutation of).
+         */
+        public PartitionUpdate.SimpleBuilder update(String tableName);
+
+        /**
+         * Build the mutation represented by this builder.
+         *
+         * @return the built mutation.
+         */
+        public Mutation build();
     }
 
     public static class MutationSerializer implements IVersionedSerializer<Mutation>

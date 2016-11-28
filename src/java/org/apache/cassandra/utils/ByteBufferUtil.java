@@ -305,7 +305,8 @@ public class ByteBufferUtil
     public static void writeWithShortLength(ByteBuffer buffer, DataOutputPlus out) throws IOException
     {
         int length = buffer.remaining();
-        assert 0 <= length && length <= FBUtilities.MAX_UNSIGNED_SHORT : length;
+        assert 0 <= length && length <= FBUtilities.MAX_UNSIGNED_SHORT
+            : String.format("Attempted serializing to buffer exceeded maximum of %s bytes: %s", FBUtilities.MAX_UNSIGNED_SHORT, length);
         out.writeShort(length);
         out.write(buffer);
     }
@@ -313,7 +314,8 @@ public class ByteBufferUtil
     public static void writeWithShortLength(byte[] buffer, DataOutput out) throws IOException
     {
         int length = buffer.length;
-        assert 0 <= length && length <= FBUtilities.MAX_UNSIGNED_SHORT : length;
+        assert 0 <= length && length <= FBUtilities.MAX_UNSIGNED_SHORT
+            : String.format("Attempted serializing to buffer exceeded maximum of %s bytes: %s", FBUtilities.MAX_UNSIGNED_SHORT, length);
         out.writeShort(length);
         out.write(buffer);
     }
@@ -433,6 +435,18 @@ public class ByteBufferUtil
         return bytes.getShort(bytes.position());
     }
 
+    /**
+     * Convert a byte buffer to a short.
+     * Does not change the byte buffer position.
+     *
+     * @param bytes byte buffer to convert to byte
+     * @return byte representation of the byte buffer
+     */
+    public static byte toByte(ByteBuffer bytes)
+    {
+        return bytes.get(bytes.position());
+    }
+
     public static long toLong(ByteBuffer bytes)
     {
         return bytes.getLong(bytes.position());
@@ -446,6 +460,11 @@ public class ByteBufferUtil
     public static double toDouble(ByteBuffer bytes)
     {
         return bytes.getDouble(bytes.position());
+    }
+
+    public static ByteBuffer bytes(byte b)
+    {
+        return ByteBuffer.allocate(1).put(0, b);
     }
 
     public static ByteBuffer bytes(short s)
@@ -512,7 +531,8 @@ public class ByteBufferUtil
      */
     public static String bytesToHex(ByteBuffer bytes)
     {
-        if (bytes.hasArray()) {
+        if (bytes.hasArray())
+        {
             return Hex.bytesToHex(bytes.array(), bytes.arrayOffset() + bytes.position(), bytes.remaining());
         }
 
@@ -709,5 +729,37 @@ public class ByteBufferUtil
             }
         }
         return false;
+    }
+
+    public static boolean startsWith(ByteBuffer src, ByteBuffer prefix)
+    {
+        return startsWith(src, prefix, 0);
+    }
+
+    public static boolean endsWith(ByteBuffer src, ByteBuffer suffix)
+    {
+        return startsWith(src, suffix, src.remaining() - suffix.remaining());
+    }
+
+    private static boolean startsWith(ByteBuffer src, ByteBuffer prefix, int offset)
+    {
+        if (offset < 0)
+            return false;
+
+        int sPos = src.position() + offset;
+        int pPos = prefix.position();
+
+        if (src.remaining() - offset < prefix.remaining())
+            return false;
+
+        int len = Math.min(src.remaining() - offset, prefix.remaining());
+
+        while (len-- > 0)
+        {
+            if (src.get(sPos++) != prefix.get(pPos++))
+                return false;
+        }
+
+        return true;
     }
 }

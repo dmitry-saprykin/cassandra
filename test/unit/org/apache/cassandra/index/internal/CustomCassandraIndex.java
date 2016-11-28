@@ -1,3 +1,23 @@
+/*
+ *
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ *
+ */
 package org.apache.cassandra.index.internal;
 
 import java.nio.ByteBuffer;
@@ -8,6 +28,7 @@ import java.util.function.BiFunction;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
 
+import org.apache.cassandra.index.TargetParser;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -40,7 +61,6 @@ import org.apache.cassandra.utils.concurrent.Refs;
 
 import static org.apache.cassandra.index.internal.CassandraIndex.getFunctions;
 import static org.apache.cassandra.index.internal.CassandraIndex.indexCfsMetadata;
-import static org.apache.cassandra.index.internal.CassandraIndex.parseTarget;
 
 /**
  * Clone of KeysIndex used in CassandraIndexTest#testCustomIndexWithCFS to verify
@@ -139,7 +159,7 @@ public class CustomCassandraIndex implements Index
     private void setMetadata(IndexMetadata indexDef)
     {
         metadata = indexDef;
-        Pair<ColumnDefinition, IndexTarget.Type> target = parseTarget(baseCfs.metadata, indexDef);
+        Pair<ColumnDefinition, IndexTarget.Type> target = TargetParser.parse(baseCfs.metadata, indexDef);
         functions = getFunctions(indexDef, target);
         CFMetaData cfm = indexCfsMetadata(baseCfs.metadata, indexDef);
         indexCfs = ColumnFamilyStore.createColumnFamilyStore(baseCfs.keyspace,
@@ -356,7 +376,7 @@ public class CustomCassandraIndex implements Index
                 insert(key.getKey(),
                        clustering,
                        cell,
-                       LivenessInfo.create(cell.timestamp(), cell.ttl(), cell.localDeletionTime()),
+                       LivenessInfo.withExpirationTime(cell.timestamp(), cell.ttl(), cell.localDeletionTime()),
                        opGroup);
             }
 
@@ -404,7 +424,7 @@ public class CustomCassandraIndex implements Index
                         }
                     }
                 }
-                return LivenessInfo.create(baseCfs.metadata, timestamp, ttl, nowInSec);
+                return LivenessInfo.create(timestamp, ttl, nowInSec);
             }
         };
     }
@@ -603,7 +623,7 @@ public class CustomCassandraIndex implements Index
     {
         baseCfs.forceBlockingFlush();
 
-        try (ColumnFamilyStore.RefViewFragment viewFragment = baseCfs.selectAndReference(View.select(SSTableSet.CANONICAL));
+        try (ColumnFamilyStore.RefViewFragment viewFragment = baseCfs.selectAndReference(View.selectFunction(SSTableSet.CANONICAL));
              Refs<SSTableReader> sstables = viewFragment.refs)
         {
             if (sstables.isEmpty())
