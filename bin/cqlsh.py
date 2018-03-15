@@ -104,7 +104,7 @@ elif webbrowser._tryorder[0] == 'xdg-open' and os.environ.get('XDG_DATA_DIRS', '
     webbrowser._tryorder.remove('xdg-open')
     webbrowser._tryorder.append('xdg-open')
 
-# use bundled libs for python-cql and thrift, if available. if there
+# use bundled lib for python-cql if available. if there
 # is a ../lib dir, use bundled libs there preferentially.
 ZIPLIB_DIRS = [os.path.join(CASSANDRA_PATH, 'lib')]
 myplatform = platform.system()
@@ -126,6 +126,7 @@ def find_zip(libprefix):
         zips = glob(os.path.join(ziplibdir, libprefix + '*.zip'))
         if zips:
             return max(zips)   # probably the highest version, if multiple
+
 
 cql_zip = find_zip(CQL_LIB_PREFIX)
 if cql_zip:
@@ -178,7 +179,6 @@ from cqlshlib.util import get_file_encoding_bomsize, trim_if_present
 DEFAULT_HOST = '127.0.0.1'
 DEFAULT_PORT = 9042
 DEFAULT_SSL = False
-DEFAULT_PROTOCOL_VERSION = 4
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 5
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 10
 
@@ -223,6 +223,9 @@ parser.add_option('--cqlversion', default=None,
                   help='Specify a particular CQL version, '
                        'by default the highest version supported by the server will be used.'
                        ' Examples: "3.0.3", "3.1.0"')
+parser.add_option("--protocol-version", type="int", default=None,
+                  help='Specify a specific protcol version otherwise the client will default and downgrade as necessary')
+
 parser.add_option("-e", "--execute", help='Execute the statement and quit.')
 parser.add_option("--connect-timeout", default=DEFAULT_CONNECT_TIMEOUT_SECONDS, dest='connect_timeout',
                   help='Specify the connection timeout in seconds (default: %default seconds).')
@@ -371,6 +374,8 @@ def show_warning_without_quoting_line(message, category, filename, lineno, file=
         file.write(warnings.formatwarning(message, category, filename, lineno, line=''))
     except IOError:
         pass
+
+
 warnings.showwarning = show_warning_without_quoting_line
 warnings.filterwarnings('always', category=cql3handling.UnexpectedTableStructure)
 
@@ -449,8 +454,9 @@ class Shell(cmd.Cmd):
                  ssl=False,
                  single_statement=None,
                  request_timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS,
-                 protocol_version=DEFAULT_PROTOCOL_VERSION,
-                 connect_timeout=DEFAULT_CONNECT_TIMEOUT_SECONDS):
+                 protocol_version=None,
+                 connect_timeout=DEFAULT_CONNECT_TIMEOUT_SECONDS,
+                 allow_server_port_discovery=False):
         cmd.Cmd.__init__(self, completekey=completekey)
         self.hostname = hostname
         self.port = port
@@ -465,16 +471,21 @@ class Shell(cmd.Cmd):
         self.tracing_enabled = tracing_enabled
         self.page_size = self.default_page_size
         self.expand_enabled = expand_enabled
+        self.allow_server_port_discovery = allow_server_port_discovery
         if use_conn:
             self.conn = use_conn
         else:
+            kwargs = {}
+            if protocol_version is not None:
+                kwargs['protocol_version'] = protocol_version
             self.conn = Cluster(contact_points=(self.hostname,), port=self.port, cql_version=cqlver,
-                                protocol_version=protocol_version,
                                 auth_provider=self.auth_provider,
                                 ssl_options=sslhandling.ssl_settings(hostname, CONFIG_FILE) if ssl else None,
                                 load_balancing_policy=WhiteListRoundRobinPolicy([self.hostname]),
                                 control_connection_timeout=connect_timeout,
-                                connect_timeout=connect_timeout)
+                                connect_timeout=connect_timeout,
+                                allow_server_port_discovery=allow_server_port_discovery,
+                                **kwargs)
         self.owns_connection = not use_conn
 
         if keyspace:
@@ -1079,7 +1090,9 @@ class Shell(cmd.Cmd):
                     num_rows += len(result.current_rows)
                     self.print_static_result(result, table_meta)
                 if result.has_more_pages:
-                    raw_input("---MORE---")
+                    if self.shunted_query_out is None:
+                        # Only pause when not capturing.
+                        raw_input("---MORE---")
                     result.fetch_next_page()
                 else:
                     break
@@ -1112,7 +1125,7 @@ class Shell(cmd.Cmd):
             ks_meta = self.conn.metadata.keyspaces.get(ks_name, None)
             cql_types = [CqlType(cql_typename(t), ks_meta) for t in result.column_types]
 
-        formatted_values = [map(self.myformat_value, row.values(), cql_types) for row in result.current_rows]
+        formatted_values = [map(self.myformat_value, [row[c] for c in column_names], cql_types) for row in result.current_rows]
 
         if self.expand_enabled:
             self.print_formatted_result_vertically(formatted_names, formatted_values)
@@ -1318,12 +1331,10 @@ class Shell(cmd.Cmd):
                 name = protect_name(ksmeta.name)
                 print 'Keyspace %s' % (name,)
                 print '---------%s' % ('-' * len(name))
-                cmd.Cmd.columnize(self, protect_names(ksmeta.functions.keys()))
-                print
+                self._columnize_unicode(ksmeta.functions.keys())
         else:
             ksmeta = self.get_keyspace_meta(ksname)
-            cmd.Cmd.columnize(self, protect_names(ksmeta.functions.keys()))
-            print
+            self._columnize_unicode(ksmeta.functions.keys())
 
     def describe_function(self, ksname, functionname):
         if ksname is None:
@@ -1345,12 +1356,10 @@ class Shell(cmd.Cmd):
                 name = protect_name(ksmeta.name)
                 print 'Keyspace %s' % (name,)
                 print '---------%s' % ('-' * len(name))
-                cmd.Cmd.columnize(self, protect_names(ksmeta.aggregates.keys()))
-                print
+                self._columnize_unicode(ksmeta.aggregates.keys())
         else:
             ksmeta = self.get_keyspace_meta(ksname)
-            cmd.Cmd.columnize(self, protect_names(ksmeta.aggregates.keys()))
-            print
+            self._columnize_unicode(ksmeta.aggregates.keys())
 
     def describe_aggregate(self, ksname, aggregatename):
         if ksname is None:
@@ -1372,12 +1381,10 @@ class Shell(cmd.Cmd):
                 name = protect_name(ksmeta.name)
                 print 'Keyspace %s' % (name,)
                 print '---------%s' % ('-' * len(name))
-                cmd.Cmd.columnize(self, protect_names(ksmeta.user_types.keys()))
-                print
+                self._columnize_unicode(ksmeta.user_types.keys(), quote=True)
         else:
             ksmeta = self.get_keyspace_meta(ksname)
-            cmd.Cmd.columnize(self, protect_names(ksmeta.user_types.keys()))
-            print
+            self._columnize_unicode(ksmeta.user_types.keys(), quote=True)
 
     def describe_usertype(self, ksname, typename):
         if ksname is None:
@@ -1391,6 +1398,16 @@ class Shell(cmd.Cmd):
         except KeyError:
             raise UserTypeNotFound("User type %r not found" % typename)
         print usertype.export_as_string()
+
+    def _columnize_unicode(self, name_list, quote=False):
+        """
+        Used when columnizing identifiers that may contain unicode
+        """
+        names = [n.encode('utf-8') for n in name_list]
+        if quote:
+            names = protect_names(names)
+        cmd.Cmd.columnize(self, names)
+        print
 
     def describe_cluster(self):
         print '\nCluster: %s' % self.get_cluster_name()
@@ -1669,9 +1686,9 @@ class Shell(cmd.Cmd):
 
         direction = parsed.get_binding('dir').upper()
         if direction == 'FROM':
-            task = ImportTask(self, ks, table, columns, fname, opts, DEFAULT_PROTOCOL_VERSION, CONFIG_FILE)
+            task = ImportTask(self, ks, table, columns, fname, opts, self.conn.protocol_version, CONFIG_FILE)
         elif direction == 'TO':
-            task = ExportTask(self, ks, table, columns, fname, opts, DEFAULT_PROTOCOL_VERSION, CONFIG_FILE)
+            task = ExportTask(self, ks, table, columns, fname, opts, self.conn.protocol_version, CONFIG_FILE)
         else:
             raise SyntaxError("Unknown direction %s" % direction)
 
@@ -1687,8 +1704,8 @@ class Shell(cmd.Cmd):
         SHOW VERSION
 
           Shows the version and build of the connected Cassandra instance, as
-          well as the versions of the CQL spec and the Thrift protocol that
-          the connected Cassandra instance understands.
+          well as the version of the CQL spec that the connected Cassandra
+          instance understands.
 
         SHOW HOST
 
@@ -1754,7 +1771,8 @@ class Shell(cmd.Cmd):
                          display_timezone=self.display_timezone,
                          max_trace_wait=self.max_trace_wait, ssl=self.ssl,
                          request_timeout=self.session.default_timeout,
-                         connect_timeout=self.conn.connect_timeout)
+                         connect_timeout=self.conn.connect_timeout,
+                         allow_server_port_discovery=self.allow_server_port_discovery)
         subshell.cmdloop()
         f.close()
 
@@ -1947,6 +1965,12 @@ class Shell(cmd.Cmd):
             session = conn.connect(self.current_keyspace)
         else:
             session = conn.connect()
+
+        # Copy session properties
+        session.default_timeout = self.session.default_timeout
+        session.row_factory = self.session.row_factory
+        session.default_consistency_level = self.session.default_consistency_level
+        session.max_trace_wait = self.session.max_trace_wait
 
         # Update after we've connected in case we fail to authenticate
         self.conn = conn
@@ -2227,10 +2251,12 @@ def read_options(cmdlineargs, environment):
     optvalues.encoding = option_with_default(configs.get, 'ui', 'encoding', UTF8)
 
     optvalues.tty = option_with_default(configs.getboolean, 'ui', 'tty', sys.stdin.isatty())
+    optvalues.protocol_version = option_with_default(configs.getint, 'protocol', 'version', None)
     optvalues.cqlversion = option_with_default(configs.get, 'cql', 'version', None)
     optvalues.connect_timeout = option_with_default(configs.getint, 'connection', 'timeout', DEFAULT_CONNECT_TIMEOUT_SECONDS)
     optvalues.request_timeout = option_with_default(configs.getint, 'connection', 'request_timeout', DEFAULT_REQUEST_TIMEOUT_SECONDS)
     optvalues.execute = None
+    optvalues.allow_server_port_discovery = option_with_default(configs.getboolean, 'connection', 'allow_server_port_discovery', 'False')
 
     (options, arguments) = parser.parse_args(cmdlineargs, values=optvalues)
 
@@ -2348,12 +2374,12 @@ def main(options, hostname, port):
             if options.timezone:
                 try:
                     timezone = pytz.timezone(options.timezone)
-                except:
+                except Exception:
                     sys.stderr.write("Warning: could not recognize timezone '%s' specified in cqlshrc\n\n" % (options.timezone))
             if 'TZ' in os.environ:
                 try:
                     timezone = pytz.timezone(os.environ['TZ'])
-                except:
+                except Exception:
                     sys.stderr.write("Warning: could not recognize timezone '%s' from environment value TZ\n\n" % (os.environ['TZ']))
         except ImportError:
             sys.stderr.write("Warning: Timezone defined and 'pytz' module for timezone conversion not installed. Timestamps will be displayed in UTC timezone.\n\n")
@@ -2380,6 +2406,7 @@ def main(options, hostname, port):
                       tty=options.tty,
                       completekey=options.completekey,
                       browser=options.browser,
+                      protocol_version=options.protocol_version,
                       cqlver=options.cqlversion,
                       keyspace=options.keyspace,
                       display_timestamp_format=options.time_format,
@@ -2393,7 +2420,8 @@ def main(options, hostname, port):
                       single_statement=options.execute,
                       request_timeout=options.request_timeout,
                       connect_timeout=options.connect_timeout,
-                      encoding=options.encoding)
+                      encoding=options.encoding,
+                      allow_server_port_discovery=options.allow_server_port_discovery)
     except KeyboardInterrupt:
         sys.exit('Connection aborted.')
     except CQL_ERRORS, e:
@@ -2408,6 +2436,7 @@ def main(options, hostname, port):
     batch_mode = options.file or options.execute
     if batch_mode and shell.statement_error:
         sys.exit(2)
+
 
 # always call this regardless of module name: when a sub-process is spawned
 # on Windows then the module name is not __main__, see CASSANDRA-9304

@@ -20,7 +20,6 @@ package org.apache.cassandra.stress;
 
 import java.io.File;
 import java.io.IOError;
-import java.net.InetAddress;
 import java.net.URI;
 import java.util.*;
 import java.util.concurrent.*;
@@ -29,7 +28,7 @@ import javax.inject.Inject;
 import com.google.common.collect.Lists;
 import com.google.common.util.concurrent.Uninterruptibles;
 
-import io.airlift.command.*;
+import io.airlift.airline.*;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.statements.CreateTableStatement;
 import org.apache.cassandra.db.ColumnFamilyStore;
@@ -44,6 +43,7 @@ import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.TokenMetadata;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.stress.generate.PartitionGenerator;
@@ -74,7 +74,7 @@ public abstract class CompactionStress implements Runnable
 
     static
     {
-        DatabaseDescriptor.toolInitialization();
+        DatabaseDescriptor.daemonInitialization();
     }
 
     List<File> getDataDirectories()
@@ -143,6 +143,10 @@ public abstract class CompactionStress implements Runnable
 
             cfs.disableAutoCompaction();
 
+            // We want to add the SSTables without firing their indexing by any eventual unsupported 2i
+            if (cfs.indexManager.hasIndexes())
+                throw new IllegalStateException("CompactionStress does not support secondary indexes");
+
             //Register with cfs
             cfs.addSSTables(sstables);
         }
@@ -181,7 +185,7 @@ public abstract class CompactionStress implements Runnable
         tokenMetadata.clearUnsafe();
         for (int i = 1; i <= numTokens; i++)
         {
-            InetAddress addr = FBUtilities.getBroadcastAddress();
+            InetAddressAndPort addr = FBUtilities.getBroadcastAddressAndPort();
             List<Token> tokens = Lists.newArrayListWithCapacity(numTokens);
             for (int j = 0; j < numTokens; ++j)
                 tokens.add(p.getRandomToken(random));

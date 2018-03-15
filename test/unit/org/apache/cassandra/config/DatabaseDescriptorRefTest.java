@@ -54,6 +54,7 @@ import static org.junit.Assert.fail;
 public class DatabaseDescriptorRefTest
 {
     static final String[] validClasses = {
+    "org.apache.cassandra.auth.AllowAllInternodeAuthenticator",
     "org.apache.cassandra.auth.IInternodeAuthenticator",
     "org.apache.cassandra.auth.IAuthenticator",
     "org.apache.cassandra.auth.IAuthorizer",
@@ -62,7 +63,6 @@ public class DatabaseDescriptorRefTest
     "org.apache.cassandra.config.ConfigurationLoader",
     "org.apache.cassandra.config.Config",
     "org.apache.cassandra.config.Config$1",
-    "org.apache.cassandra.config.Config$RequestSchedulerId",
     "org.apache.cassandra.config.Config$CommitLogSync",
     "org.apache.cassandra.config.Config$DiskAccessMode",
     "org.apache.cassandra.config.Config$DiskFailurePolicy",
@@ -70,18 +70,20 @@ public class DatabaseDescriptorRefTest
     "org.apache.cassandra.config.Config$DiskOptimizationStrategy",
     "org.apache.cassandra.config.Config$InternodeCompression",
     "org.apache.cassandra.config.Config$MemtableAllocationType",
+    "org.apache.cassandra.config.Config$RepairCommandPoolFullStrategy",
     "org.apache.cassandra.config.Config$UserFunctionTimeoutPolicy",
-    "org.apache.cassandra.config.RequestSchedulerOptions",
     "org.apache.cassandra.config.ParameterizedClass",
     "org.apache.cassandra.config.EncryptionOptions",
     "org.apache.cassandra.config.EncryptionOptions$ClientEncryptionOptions",
     "org.apache.cassandra.config.EncryptionOptions$ServerEncryptionOptions",
     "org.apache.cassandra.config.EncryptionOptions$ServerEncryptionOptions$InternodeEncryption",
+    "org.apache.cassandra.config.EncryptionOptions$ServerEncryptionOptions$OutgoingEncryptedPortSource",
     "org.apache.cassandra.config.YamlConfigurationLoader",
     "org.apache.cassandra.config.YamlConfigurationLoader$PropertiesChecker",
     "org.apache.cassandra.config.YamlConfigurationLoader$PropertiesChecker$1",
     "org.apache.cassandra.config.YamlConfigurationLoader$CustomConstructor",
     "org.apache.cassandra.config.TransparentDataEncryptionOptions",
+    "org.apache.cassandra.db.ConsistencyLevel",
     "org.apache.cassandra.dht.IPartitioner",
     "org.apache.cassandra.exceptions.ConfigurationException",
     "org.apache.cassandra.exceptions.RequestValidationException",
@@ -103,7 +105,6 @@ public class DatabaseDescriptorRefTest
     "org.apache.cassandra.locator.SimpleSeedProvider",
     "org.apache.cassandra.locator.SeedProvider",
     "org.apache.cassandra.net.BackPressureStrategy",
-    "org.apache.cassandra.scheduler.IRequestScheduler",
     "org.apache.cassandra.security.EncryptionContext",
     "org.apache.cassandra.service.CacheService$CacheType",
     "org.apache.cassandra.utils.FBUtilities",
@@ -126,6 +127,7 @@ public class DatabaseDescriptorRefTest
     "org.apache.cassandra.config.EncryptionOptions$ServerEncryptionOptionsCustomizer",
     "org.apache.cassandra.ConsoleAppenderBeanInfo",
     "org.apache.cassandra.ConsoleAppenderCustomizer",
+    "org.apache.cassandra.locator.InetAddressAndPort"
     };
 
     static final Set<String> checkedClasses = new HashSet<>(Arrays.asList(validClasses));
@@ -201,7 +203,6 @@ public class DatabaseDescriptorRefTest
         for (String methodName : new String[]{
             "clientInitialization",
             "applyAddressConfig",
-            "applyThriftHSHA",
             "applyInitialTokens",
             // no seed provider in default configuration for clients
             // "applySeedProvider",
@@ -211,17 +212,16 @@ public class DatabaseDescriptorRefTest
             // "applySnitch",
             "applyEncryptionContext",
             // starts "REQUEST-SCHEDULER" thread via RoundRobinScheduler
-            // "applyRequestScheduler",
         })
         {
             Method method = cDatabaseDescriptor.getDeclaredMethod(methodName);
             method.invoke(null);
 
             if ("clientInitialization".equals(methodName) &&
-                threadCount + 1 == threads.getThreadCount())
+                threadCount + 2 == threads.getThreadCount())
             {
-                // ignore the "AsyncAppender-Worker-ASYNC" thread
-                threadCount++;
+                // ignore the "AsyncAppender-Worker-ASYNC" and "logback-1" threads
+                threadCount = threadCount + 2;
             }
 
             if (threadCount != threads.getThreadCount())

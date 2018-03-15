@@ -102,11 +102,14 @@ public interface ColumnFamilyStoreMBean
      */
     public Map<String,String> getCompressionParameters();
 
+    public String getCompressionParametersJson();
+
     /**
-     * Set the compression parameters
+     * Set the compression parameters locally for this node
      * @param opts map of string names to values
      */
     public void setCompressionParameters(Map<String,String> opts);
+    public void setCompressionParametersJson(String options);
 
     /**
      * Set new crc check chance
@@ -192,4 +195,8 @@ public interface ColumnFamilyStoreMBean
        Enable/Disable compaction space check
      */
     public void compactionDiskSpaceCheck(boolean enable);
+
+    public void setNeverPurgeTombstones(boolean value);
+
+    public boolean getNeverPurgeTombstones();
 }

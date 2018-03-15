@@ -19,7 +19,6 @@ package org.apache.cassandra.hints;
 
 import java.io.File;
 import java.lang.management.ManagementFactory;
-import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.util.Collections;
 import java.util.UUID;
@@ -40,6 +39,7 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.ParameterizedClass;
 import org.apache.cassandra.gms.FailureDetector;
 import org.apache.cassandra.gms.IFailureDetector;
+import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.metrics.HintedHandoffMetrics;
 import org.apache.cassandra.metrics.StorageMetrics;
 import org.apache.cassandra.dht.Token;
@@ -159,8 +159,7 @@ public final class HintsService implements HintsServiceMBean
         // we have to make sure that the HintsStore instances get properly initialized - otherwise dispatch will not trigger
         catalog.maybeLoadStores(hostIds);
 
-        if (hint.isLive())
-            bufferPool.write(hostIds, hint);
+        bufferPool.write(hostIds, hint);
 
         StorageMetrics.totalHints.inc(size(hostIds));
     }
@@ -268,10 +267,10 @@ public final class HintsService implements HintsServiceMBean
      */
     public void deleteAllHintsForEndpoint(String address)
     {
-        InetAddress target;
+        InetAddressAndPort target;
         try
         {
-            target = InetAddress.getByName(address);
+            target = InetAddressAndPort.getByName(address);
         }
         catch (UnknownHostException e)
         {
@@ -285,7 +284,7 @@ public final class HintsService implements HintsServiceMBean
      *
      * @param target inet address of the target node
      */
-    public void deleteAllHintsForEndpoint(InetAddress target)
+    public void deleteAllHintsForEndpoint(InetAddressAndPort target)
     {
         UUID hostId = StorageService.instance.getHostIdForEndpoint(target);
         if (hostId == null)
@@ -296,10 +295,11 @@ public final class HintsService implements HintsServiceMBean
     /**
      * Cleans up hints-related state after a node with id = hostId left.
      *
-     * Dispatcher should stop itself (isHostAlive() will start returning false for the leaving host), but we'll wait for
-     * completion anyway.
+     * Dispatcher can not stop itself (isHostAlive() can not start returning false for the leaving host because this
+     * method is called by the same thread as gossip, which blocks gossip), so we can't simply wait for
+     * completion.
      *
-     * We should also flush the buffer is there are any thints for the node there, and close the writer (if any),
+     * We should also flush the buffer if there are any hints for the node there, and close the writer (if any),
      * so that we don't leave any hint files lying around.
      *
      * Once that is done, we can simply delete all hint files and remove the host id from the catalog.
@@ -328,8 +328,8 @@ public final class HintsService implements HintsServiceMBean
             throw new RuntimeException(e);
         }
 
-        // wait for the current dispatch session to end (if any), so that the currently dispatched file gets removed
-        dispatchExecutor.completeDispatchBlockingly(store);
+        // interrupt the current dispatch session to end (if any), so that the currently dispatched file gets removed
+        dispatchExecutor.interruptDispatch(store.hostId);
 
         // delete all the hints files and remove the HintsStore instance from the map in the catalog
         catalog.exciseStore(hostId);

@@ -37,6 +37,7 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.lifecycle.LogRecord.Type;
 import org.apache.cassandra.io.sstable.SSTable;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.format.big.BigFormat;
 import org.apache.cassandra.utils.Throwables;
 
@@ -281,8 +282,33 @@ final class LogFile implements AutoCloseable
 
     void add(Type type, SSTable table)
     {
-        if (!addRecord(makeRecord(type, table)))
+        add(makeRecord(type, table));
+    }
+
+    void add(LogRecord record)
+    {
+        if (!addRecord(record))
             throw new IllegalStateException();
+    }
+
+    public void addAll(Type type, Iterable<SSTableReader> toBulkAdd)
+    {
+        for (LogRecord record : makeRecords(type, toBulkAdd).values())
+            if (!addRecord(record))
+                throw new IllegalStateException();
+    }
+
+    Map<SSTable, LogRecord> makeRecords(Type type, Iterable<SSTableReader> tables)
+    {
+        assert type == Type.ADD || type == Type.REMOVE;
+
+        for (SSTableReader sstable : tables)
+        {
+            File directory = sstable.descriptor.directory;
+            String fileName = StringUtils.join(directory, File.separator, getFileName());
+            replicas.maybeCreateReplica(directory, fileName, records);
+        }
+        return LogRecord.make(type, tables);
     }
 
     private LogRecord makeRecord(Type type, SSTable table)
@@ -293,6 +319,21 @@ final class LogFile implements AutoCloseable
         String fileName = StringUtils.join(directory, File.separator, getFileName());
         replicas.maybeCreateReplica(directory, fileName, records);
         return LogRecord.make(type, table);
+    }
+
+    /**
+     * this version of makeRecord takes an existing LogRecord and converts it to a
+     * record with the given type. This avoids listing the directory and if the
+     * LogRecord already exists, we have all components for the sstable
+     */
+    private LogRecord makeRecord(Type type, SSTable table, LogRecord record)
+    {
+        assert type == Type.ADD || type == Type.REMOVE;
+
+        File directory = table.descriptor.directory;
+        String fileName = StringUtils.join(directory, File.separator, getFileName());
+        replicas.maybeCreateReplica(directory, fileName, records);
+        return record.asType(type);
     }
 
     private boolean addRecord(LogRecord record)
@@ -316,7 +357,17 @@ final class LogFile implements AutoCloseable
 
     boolean contains(Type type, SSTable table)
     {
-        return records.contains(makeRecord(type, table));
+        return contains(makeRecord(type, table));
+    }
+
+    boolean contains(Type type, SSTable sstable, LogRecord record)
+    {
+        return contains(makeRecord(type, sstable, record));
+    }
+
+    private boolean contains(LogRecord record)
+    {
+        return records.contains(record);
     }
 
     void deleteFilesForRecordsOfType(Type type)
@@ -427,5 +478,10 @@ final class LogFile implements AutoCloseable
                                 LogFile.SEP,
                                 id.toString(),
                                 LogFile.EXT);
+    }
+
+    public boolean isEmpty()
+    {
+        return records.isEmpty();
     }
 }

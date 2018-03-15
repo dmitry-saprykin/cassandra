@@ -24,6 +24,7 @@ import java.util.concurrent.locks.Lock;
 
 import com.google.common.base.Function;
 import com.google.common.base.Objects;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Iterators;
 import com.google.common.collect.PeekingIterator;
@@ -40,6 +41,7 @@ import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.net.MessageOut;
 import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.service.CacheService;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.*;
@@ -65,9 +67,9 @@ public class CounterMutation implements IMutation
         return mutation.getKeyspaceName();
     }
 
-    public Collection<UUID> getColumnFamilyIds()
+    public Collection<TableId> getTableIds()
     {
-        return mutation.getColumnFamilyIds();
+        return mutation.getTableIds();
     }
 
     public Collection<PartitionUpdate> getPartitionUpdates()
@@ -111,7 +113,7 @@ public class CounterMutation implements IMutation
      */
     public Mutation applyCounterMutation() throws WriteTimeoutException
     {
-        Mutation result = new Mutation(getKeyspaceName(), key());
+        Mutation.PartitionUpdateCollector resultBuilder = new Mutation.PartitionUpdateCollector(getKeyspaceName(), key());
         Keyspace keyspace = Keyspace.open(getKeyspaceName());
 
         List<Lock> locks = new ArrayList<>();
@@ -120,7 +122,9 @@ public class CounterMutation implements IMutation
         {
             grabCounterLocks(keyspace, locks);
             for (PartitionUpdate upd : getPartitionUpdates())
-                result.add(processModifications(upd));
+                resultBuilder.add(processModifications(upd));
+
+            Mutation result = resultBuilder.build();
             result.apply();
             return result;
         }
@@ -175,7 +179,7 @@ public class CounterMutation implements IMutation
                         {
                             public Object apply(final ColumnData data)
                             {
-                                return Objects.hashCode(update.metadata().cfId, key(), row.clustering(), data.column());
+                                return Objects.hashCode(update.metadata().id, key(), row.clustering(), data.column());
                             }
                         }));
                     }
@@ -186,7 +190,7 @@ public class CounterMutation implements IMutation
 
     private PartitionUpdate processModifications(PartitionUpdate changes)
     {
-        ColumnFamilyStore cfs = Keyspace.open(getKeyspaceName()).getColumnFamilyStore(changes.metadata().cfId);
+        ColumnFamilyStore cfs = Keyspace.open(getKeyspaceName()).getColumnFamilyStore(changes.metadata().id);
 
         List<PartitionUpdate.CounterMark> marks = changes.collectCounterMarks();
 
@@ -239,7 +243,7 @@ public class CounterMutation implements IMutation
     private void updateWithCurrentValuesFromCFS(List<PartitionUpdate.CounterMark> marks, ColumnFamilyStore cfs)
     {
         ColumnFilter.Builder builder = ColumnFilter.selectionBuilder();
-        BTreeSet.Builder<Clustering> names = BTreeSet.builder(cfs.metadata.comparator);
+        BTreeSet.Builder<Clustering> names = BTreeSet.builder(cfs.metadata().comparator);
         for (PartitionUpdate.CounterMark mark : marks)
         {
             if (mark.clustering() != Clustering.STATIC_CLUSTERING)
@@ -252,7 +256,7 @@ public class CounterMutation implements IMutation
 
         int nowInSec = FBUtilities.nowInSeconds();
         ClusteringIndexNamesFilter filter = new ClusteringIndexNamesFilter(names.build(), false);
-        SinglePartitionReadCommand cmd = SinglePartitionReadCommand.create(cfs.metadata, nowInSec, key(), builder.build(), filter);
+        SinglePartitionReadCommand cmd = SinglePartitionReadCommand.create(cfs.metadata(), nowInSec, key(), builder.build(), filter);
         PeekingIterator<PartitionUpdate.CounterMark> markIter = Iterators.peekingIterator(marks.iterator());
         try (ReadExecutionController controller = cmd.executionController();
              RowIterator partition = UnfilteredRowIterators.filter(cmd.queryMemtableAndDisk(cfs, controller), nowInSec))

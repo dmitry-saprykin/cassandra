@@ -46,6 +46,8 @@ import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.marshal.UUIDType;
 import org.apache.cassandra.transport.ProtocolVersion;
 
+import static org.apache.cassandra.cql3.functions.TimeFcts.*;
+
 import org.apache.commons.lang3.text.WordUtils;
 
 /**
@@ -79,7 +81,7 @@ public final class CastFcts
             addFunctionIfNeeded(functions, inputType, LongType.instance, Number::longValue);
             addFunctionIfNeeded(functions, inputType, FloatType.instance, Number::floatValue);
             addFunctionIfNeeded(functions, inputType, DoubleType.instance, Number::doubleValue);
-            addFunctionIfNeeded(functions, inputType, DecimalType.instance, p -> BigDecimal.valueOf(p.doubleValue()));
+            addFunctionIfNeeded(functions, inputType, DecimalType.instance, getDecimalConversionFunction(inputType));
             addFunctionIfNeeded(functions, inputType, IntegerType.instance, p -> BigInteger.valueOf(p.longValue()));
             functions.add(CastAsTextFunction.create(inputType, AsciiType.instance));
             functions.add(CastAsTextFunction.create(inputType, UTF8Type.instance));
@@ -93,14 +95,14 @@ public final class CastFcts
         functions.add(CastAsTextFunction.create(BooleanType.instance, AsciiType.instance));
         functions.add(CastAsTextFunction.create(BooleanType.instance, UTF8Type.instance));
 
-        functions.add(CassandraFunctionWrapper.create(TimeUUIDType.instance, SimpleDateType.instance, TimeFcts.timeUuidtoDate));
-        functions.add(CassandraFunctionWrapper.create(TimeUUIDType.instance, TimestampType.instance, TimeFcts.timeUuidToTimestamp));
+        functions.add(CassandraFunctionWrapper.create(TimeUUIDType.instance, SimpleDateType.instance, toDate(TimeUUIDType.instance)));
+        functions.add(CassandraFunctionWrapper.create(TimeUUIDType.instance, TimestampType.instance, toTimestamp(TimeUUIDType.instance)));
         functions.add(CastAsTextFunction.create(TimeUUIDType.instance, AsciiType.instance));
         functions.add(CastAsTextFunction.create(TimeUUIDType.instance, UTF8Type.instance));
-        functions.add(CassandraFunctionWrapper.create(TimestampType.instance, SimpleDateType.instance, TimeFcts.timestampToDate));
+        functions.add(CassandraFunctionWrapper.create(TimestampType.instance, SimpleDateType.instance, toDate(TimestampType.instance)));
         functions.add(CastAsTextFunction.create(TimestampType.instance, AsciiType.instance));
         functions.add(CastAsTextFunction.create(TimestampType.instance, UTF8Type.instance));
-        functions.add(CassandraFunctionWrapper.create(SimpleDateType.instance, TimestampType.instance, TimeFcts.dateToTimestamp));
+        functions.add(CassandraFunctionWrapper.create(SimpleDateType.instance, TimestampType.instance, toTimestamp(SimpleDateType.instance)));
         functions.add(CastAsTextFunction.create(SimpleDateType.instance, AsciiType.instance));
         functions.add(CastAsTextFunction.create(SimpleDateType.instance, UTF8Type.instance));
         functions.add(CastAsTextFunction.create(TimeType.instance, AsciiType.instance));
@@ -110,6 +112,23 @@ public final class CastFcts
         functions.add(CastAsTextFunction.create(UUIDType.instance, UTF8Type.instance));
 
         return functions;
+    }
+
+    /**
+     * Returns the conversion function to convert the specified type into a Decimal type
+     *
+     * @param inputType the input type
+     * @return the conversion function to convert the specified type into a Decimal type
+     */
+    private static <I extends Number> java.util.function.Function<I, BigDecimal> getDecimalConversionFunction(AbstractType<? extends Number> inputType)
+    {
+        if (inputType == FloatType.instance || inputType == DoubleType.instance)
+            return p -> BigDecimal.valueOf(p.doubleValue());
+
+        if (inputType == IntegerType.instance)
+            return p -> new BigDecimal((BigInteger) p);
+
+        return p -> BigDecimal.valueOf(p.longValue());
     }
 
     /**

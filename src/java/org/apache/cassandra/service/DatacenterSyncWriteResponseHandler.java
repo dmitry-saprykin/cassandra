@@ -17,7 +17,6 @@
  */
 package org.apache.cassandra.service;
 
-import java.net.InetAddress;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.Map;
@@ -26,6 +25,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.locator.IEndpointSnitch;
+import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.NetworkTopologyStrategy;
 import org.apache.cassandra.net.MessageIn;
 import org.apache.cassandra.db.ConsistencyLevel;
@@ -41,8 +41,8 @@ public class DatacenterSyncWriteResponseHandler<T> extends AbstractWriteResponse
     private final Map<String, AtomicInteger> responses = new HashMap<String, AtomicInteger>();
     private final AtomicInteger acks = new AtomicInteger(0);
 
-    public DatacenterSyncWriteResponseHandler(Collection<InetAddress> naturalEndpoints,
-                                              Collection<InetAddress> pendingEndpoints,
+    public DatacenterSyncWriteResponseHandler(Collection<InetAddressAndPort> naturalEndpoints,
+                                              Collection<InetAddressAndPort> pendingEndpoints,
                                               ConsistencyLevel consistencyLevel,
                                               Keyspace keyspace,
                                               Runnable callback,
@@ -63,7 +63,7 @@ public class DatacenterSyncWriteResponseHandler<T> extends AbstractWriteResponse
 
         // During bootstrap, we have to include the pending endpoints or we may fail the consistency level
         // guarantees (see #833)
-        for (InetAddress pending : pendingEndpoints)
+        for (InetAddressAndPort pending : pendingEndpoints)
         {
             responses.get(snitch.getDatacenter(pending)).incrementAndGet();
         }
@@ -71,21 +71,29 @@ public class DatacenterSyncWriteResponseHandler<T> extends AbstractWriteResponse
 
     public void response(MessageIn<T> message)
     {
-        String dataCenter = message == null
-                            ? DatabaseDescriptor.getLocalDataCenter()
-                            : snitch.getDatacenter(message.from);
-
-        responses.get(dataCenter).getAndDecrement();
-        acks.incrementAndGet();
-
-        for (AtomicInteger i : responses.values())
+        try
         {
-            if (i.get() > 0)
-                return;
-        }
+            String dataCenter = message == null
+                                ? DatabaseDescriptor.getLocalDataCenter()
+                                : snitch.getDatacenter(message.from);
 
-        // all the quorum conditions are met
-        signal();
+            responses.get(dataCenter).getAndDecrement();
+            acks.incrementAndGet();
+
+            for (AtomicInteger i : responses.values())
+            {
+                if (i.get() > 0)
+                    return;
+            }
+
+            // all the quorum conditions are met
+            signal();
+        }
+        finally
+        {
+            //Must be last after all subclass processing
+            logResponseToIdealCLDelegate(message);
+        }
     }
 
     protected int ackCount()

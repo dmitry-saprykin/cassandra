@@ -18,12 +18,25 @@
 
 Security
 --------
-
 There are three main components to the security features provided by Cassandra:
 
 - TLS/SSL encryption for client and inter-node communication
 - Client authentication
 - Authorization
+
+By default, these features are disabled as Cassandra is configured to easily find and be found by other members of a
+cluster. In other words, an out-of-the-box Cassandra installation presents a large attack surface for a bad actor.
+Enabling authentication for clients using the binary protocol is not sufficient to protect a cluster. Malicious users
+able to access internode communication and JMX ports can still:
+
+- Craft internode messages to insert users into authentication schema
+- Craft internode messages to truncate or drop schema
+- Use tools such as ``sstableloader`` to overwrite ``system_auth`` tables 
+- Attach to the cluster directly to capture write traffic
+
+Correct configuration of all three security components should negate theses vectors. Therefore, understanding Cassandra's
+security features is crucial to configuring your cluster to meet your security needs.
+
 
 TLS/SSL Encryption
 ^^^^^^^^^^^^^^^^^^
@@ -42,6 +55,16 @@ for more details.
 
 For information on generating the keystore and truststore files used in SSL communications, see the
 `java documentation on creating keystores <http://download.oracle.com/javase/6/docs/technotes/guides/security/jsse/JSSERefGuide.html#CreateKeystore>`__
+
+SSL Certificate Hot Reloading
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Beginning with Cassandra 4, Cassandra supports hot reloading of SSL Certificates. If SSL/TLS support is enabled in Cassandra,
+the node periodically polls the Trust and Key Stores specified in cassandra.yaml. When the files are updated, Cassandra will
+reload them and use them for subsequent connections. Please note that the Trust & Key Store passwords are part of the yaml so
+the updated files should also use the same passwords. The default polling interval is 10 minutes.
+
+Certificate Hot reloading may also be triggered using the ``nodetool reloadssl`` command. Use this if you want to Cassandra to
+immediately notice the changed certificates.
 
 Inter-node Encryption
 ~~~~~~~~~~~~~~~~~~~~~
