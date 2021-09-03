@@ -59,6 +59,9 @@ public final class ResultSetBuilder
     final long[] timestamps;
     final int[] ttls;
 
+    private long size = 0;
+    private boolean sizeWarningEmitted = false;
+
     public ResultSetBuilder(ResultMetadata metadata, Selectors selectors)
     {
         this(metadata, selectors, null);
@@ -79,12 +82,36 @@ public final class ResultSetBuilder
             Arrays.fill(ttls, -1);
     }
 
+    private void addSize(List<ByteBuffer> row)
+    {
+        for (int i=0, isize=row.size(); i<isize; i++)
+        {
+            ByteBuffer value = row.get(i);
+            size += value != null ? value.remaining() : 0;
+        }
+    }
+
+    public boolean shouldWarn(long thresholdKB)
+    {
+        if (thresholdKB > 0 && !sizeWarningEmitted && size > thresholdKB << 10)
+        {
+            sizeWarningEmitted = true;
+            return true;
+        }
+        return false;
+    }
+
+    public boolean shouldReject(long thresholdKB)
+    {
+        return thresholdKB > 0 && size > thresholdKB << 10;
+    }
+
     public void add(ByteBuffer v)
     {
         current.add(v);
     }
 
-    public void add(Cell c, int nowInSec)
+    public void add(Cell<?> c, int nowInSec)
     {
         if (c == null)
         {
@@ -101,7 +128,7 @@ public final class ResultSetBuilder
             ttls[current.size() - 1] = remainingTTL(c, nowInSec);
     }
 
-    private int remainingTTL(Cell c, int nowInSec)
+    private int remainingTTL(Cell<?> c, int nowInSec)
     {
         if (!c.isExpiring())
             return -1;
@@ -110,11 +137,11 @@ public final class ResultSetBuilder
         return remaining >= 0 ? remaining : -1;
     }
 
-    private ByteBuffer value(Cell c)
+    private <V> ByteBuffer value(Cell<V> c)
     {
         return c.isCounterCell()
-             ? ByteBufferUtil.bytes(CounterContext.instance().total(c.value()))
-             : c.value();
+             ? ByteBufferUtil.bytes(CounterContext.instance().total(c.value(), c.accessor()))
+             : c.buffer();
     }
 
     /**
@@ -123,7 +150,7 @@ public final class ResultSetBuilder
      * @param partitionKey the partition key of the new row
      * @param clustering the clustering of the new row
      */
-    public void newRow(DecoratedKey partitionKey, Clustering clustering)
+    public void newRow(DecoratedKey partitionKey, Clustering<?> clustering)
     {
         // The groupMaker needs to be called for each row
         boolean isNewAggregate = groupMaker == null || groupMaker.isNewGroup(partitionKey, clustering);
@@ -166,6 +193,8 @@ public final class ResultSetBuilder
 
     private List<ByteBuffer> getOutputRow()
     {
-        return selectors.getOutputRow();
+        List<ByteBuffer> row = selectors.getOutputRow();
+        addSize(row);
+        return row;
     }
 }

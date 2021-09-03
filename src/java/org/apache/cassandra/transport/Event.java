@@ -23,7 +23,10 @@ import java.util.Iterator;
 import java.util.List;
 
 import com.google.common.base.Objects;
+
 import io.netty.buffer.ByteBuf;
+import org.apache.cassandra.cql3.functions.UDAggregate;
+import org.apache.cassandra.cql3.functions.UDFunction;
 import org.apache.cassandra.locator.InetAddressAndPort;
 
 public abstract class Event
@@ -87,9 +90,9 @@ public abstract class Event
     {
         public final InetSocketAddress node;
 
-        public InetAddress nodeAddress()
+        public InetAddressAndPort nodeAddressAndPort()
         {
-            return node.getAddress();
+            return InetAddressAndPort.getByAddressOverrideDefaults(node.getAddress(), node.getPort());
         }
 
         private NodeEvent(Type type, InetSocketAddress node)
@@ -268,6 +271,16 @@ public abstract class Event
             this(change, Target.KEYSPACE, keyspace, null);
         }
 
+        public static SchemaChange forFunction(Change change, UDFunction function)
+        {
+            return new SchemaChange(change, Target.FUNCTION, function.name().keyspace, function.name().name, function.argumentsList());
+        }
+
+        public static SchemaChange forAggregate(Change change, UDAggregate aggregate)
+        {
+            return new SchemaChange(change, Target.AGGREGATE, aggregate.name().keyspace, aggregate.name().name, aggregate.argumentsList());
+        }
+
         // Assumes the type has already been deserialized
         public static SchemaChange deserializeEvent(ByteBuf cb, ProtocolVersion version)
         {
@@ -300,8 +313,8 @@ public abstract class Event
                     // available since protocol version 4
                     CBUtil.writeEnumValue(change, dest);
                     CBUtil.writeEnumValue(target, dest);
-                    CBUtil.writeString(keyspace, dest);
-                    CBUtil.writeString(name, dest);
+                    CBUtil.writeAsciiString(keyspace, dest);
+                    CBUtil.writeAsciiString(name, dest);
                     CBUtil.writeStringList(argTypes, dest);
                 }
                 else
@@ -310,8 +323,8 @@ public abstract class Event
                     CBUtil.writeEnumValue(Change.UPDATED, dest);
                     if (version.isGreaterOrEqualTo(ProtocolVersion.V3))
                         CBUtil.writeEnumValue(Target.KEYSPACE, dest);
-                    CBUtil.writeString(keyspace, dest);
-                    CBUtil.writeString("", dest);
+                    CBUtil.writeAsciiString(keyspace, dest);
+                    CBUtil.writeAsciiString("", dest);
                 }
                 return;
             }
@@ -320,9 +333,9 @@ public abstract class Event
             {
                 CBUtil.writeEnumValue(change, dest);
                 CBUtil.writeEnumValue(target, dest);
-                CBUtil.writeString(keyspace, dest);
+                CBUtil.writeAsciiString(keyspace, dest);
                 if (target != Target.KEYSPACE)
-                    CBUtil.writeString(name, dest);
+                    CBUtil.writeAsciiString(name, dest);
             }
             else
             {
@@ -331,14 +344,14 @@ public abstract class Event
                     // For the v1/v2 protocol, we have no way to represent type changes, so we simply say the keyspace
                     // was updated.  See CASSANDRA-7617.
                     CBUtil.writeEnumValue(Change.UPDATED, dest);
-                    CBUtil.writeString(keyspace, dest);
-                    CBUtil.writeString("", dest);
+                    CBUtil.writeAsciiString(keyspace, dest);
+                    CBUtil.writeAsciiString("", dest);
                 }
                 else
                 {
                     CBUtil.writeEnumValue(change, dest);
-                    CBUtil.writeString(keyspace, dest);
-                    CBUtil.writeString(target == Target.KEYSPACE ? "" : name, dest);
+                    CBUtil.writeAsciiString(keyspace, dest);
+                    CBUtil.writeAsciiString(target == Target.KEYSPACE ? "" : name, dest);
                 }
             }
         }
@@ -350,26 +363,26 @@ public abstract class Event
                 if (version.isGreaterOrEqualTo(ProtocolVersion.V4))
                     return CBUtil.sizeOfEnumValue(change)
                                + CBUtil.sizeOfEnumValue(target)
-                               + CBUtil.sizeOfString(keyspace)
-                               + CBUtil.sizeOfString(name)
+                               + CBUtil.sizeOfAsciiString(keyspace)
+                               + CBUtil.sizeOfAsciiString(name)
                                + CBUtil.sizeOfStringList(argTypes);
                 if (version.isGreaterOrEqualTo(ProtocolVersion.V3))
                     return CBUtil.sizeOfEnumValue(Change.UPDATED)
                            + CBUtil.sizeOfEnumValue(Target.KEYSPACE)
-                           + CBUtil.sizeOfString(keyspace);
+                           + CBUtil.sizeOfAsciiString(keyspace);
                 return CBUtil.sizeOfEnumValue(Change.UPDATED)
-                       + CBUtil.sizeOfString(keyspace)
-                       + CBUtil.sizeOfString("");
+                       + CBUtil.sizeOfAsciiString(keyspace)
+                       + CBUtil.sizeOfAsciiString("");
             }
 
             if (version.isGreaterOrEqualTo(ProtocolVersion.V3))
             {
                 int size = CBUtil.sizeOfEnumValue(change)
                          + CBUtil.sizeOfEnumValue(target)
-                         + CBUtil.sizeOfString(keyspace);
+                         + CBUtil.sizeOfAsciiString(keyspace);
 
                 if (target != Target.KEYSPACE)
-                    size += CBUtil.sizeOfString(name);
+                    size += CBUtil.sizeOfAsciiString(name);
 
                 return size;
             }
@@ -378,12 +391,12 @@ public abstract class Event
                 if (target == Target.TYPE)
                 {
                     return CBUtil.sizeOfEnumValue(Change.UPDATED)
-                         + CBUtil.sizeOfString(keyspace)
-                         + CBUtil.sizeOfString("");
+                         + CBUtil.sizeOfAsciiString(keyspace)
+                         + CBUtil.sizeOfAsciiString("");
                 }
                 return CBUtil.sizeOfEnumValue(change)
-                     + CBUtil.sizeOfString(keyspace)
-                     + CBUtil.sizeOfString(target == Target.KEYSPACE ? "" : name);
+                     + CBUtil.sizeOfAsciiString(keyspace)
+                     + CBUtil.sizeOfAsciiString(target == Target.KEYSPACE ? "" : name);
             }
         }
 

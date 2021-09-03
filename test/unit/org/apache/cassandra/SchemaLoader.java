@@ -17,32 +17,34 @@
  */
 package org.apache.cassandra;
 
-import java.io.File;
 import java.io.IOException;
 import java.util.*;
 
-import org.apache.cassandra.cql3.statements.CreateTableStatement;
-import org.apache.cassandra.dht.Murmur3Partitioner;
-import org.apache.cassandra.index.sasi.SASIIndex;
-import org.apache.cassandra.index.sasi.disk.OnDiskIndexBuilder;
-import org.junit.After;
-import org.junit.BeforeClass;
-
+import org.apache.cassandra.auth.AuthKeyspace;
+import org.apache.cassandra.auth.AuthSchemaChangeListener;
+import org.apache.cassandra.auth.IAuthenticator;
+import org.apache.cassandra.auth.IAuthorizer;
+import org.apache.cassandra.auth.INetworkAuthorizer;
+import org.apache.cassandra.auth.IRoleManager;
 import org.apache.cassandra.config.*;
-import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.ColumnIdentifier;
-import org.apache.cassandra.cql3.statements.IndexTarget;
+import org.apache.cassandra.cql3.statements.schema.CreateTableStatement;
+import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.db.RowUpdateBuilder;
-import org.apache.cassandra.db.commitlog.CommitLog;
 import org.apache.cassandra.db.marshal.*;
+import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.index.StubIndex;
-import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.index.sasi.SASIIndex;
+import org.apache.cassandra.index.sasi.disk.OnDiskIndexBuilder;
 import org.apache.cassandra.schema.*;
 import org.apache.cassandra.schema.MigrationManager;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
+
+import org.junit.After;
+import org.junit.BeforeClass;
 
 public class SchemaLoader
 {
@@ -67,7 +69,8 @@ public class SchemaLoader
 
     public static void prepareServer()
     {
-       CQLTester.prepareServer();
+        ServerTestUtils.daemonInitialization();
+        ServerTestUtils.prepareServer();
     }
 
     public static void startGossiper()
@@ -96,6 +99,8 @@ public class SchemaLoader
         String ks_nocommit = testName + "NoCommitlogSpace";
         String ks_prsi = testName + "PerRowSecondaryIndex";
         String ks_cql = testName + "cql_keyspace";
+        String ks_cql_replicated = testName + "cql_keyspace_replicated";
+        String ks_with_transient = testName + "ks_with_transient";
 
         AbstractType bytes = BytesType.instance;
 
@@ -120,22 +125,15 @@ public class SchemaLoader
                 KeyspaceParams.simple(1),
                 Tables.of(
                 // Column Families
-                standardCFMD(ks1, "Standard1").compaction(CompactionParams.scts(compactionOptions)).build(),
+                standardCFMD(ks1, "Standard1").compaction(CompactionParams.stcs(compactionOptions)).build(),
                 standardCFMD(ks1, "Standard2").build(),
                 standardCFMD(ks1, "Standard3").build(),
                 standardCFMD(ks1, "Standard4").build(),
                 standardCFMD(ks1, "StandardGCGS0").gcGraceSeconds(0).build(),
                 standardCFMD(ks1, "StandardLong1").build(),
                 standardCFMD(ks1, "StandardLong2").build(),
-                superCFMD(ks1, "Super1", LongType.instance).build(),
-                superCFMD(ks1, "Super2", LongType.instance).build(),
-                superCFMD(ks1, "Super3", LongType.instance).build(),
-                superCFMD(ks1, "Super4", UTF8Type.instance).build(),
-                superCFMD(ks1, "Super5", bytes).build(),
-                superCFMD(ks1, "Super6", LexicalUUIDType.instance, UTF8Type.instance).build(),
                 keysIndexCFMD(ks1, "Indexed1", true).build(),
                 keysIndexCFMD(ks1, "Indexed2", false).build(),
-                superCFMD(ks1, "SuperDirectGC", BytesType.instance).gcGraceSeconds(0).build(),
                 jdbcCFMD(ks1, "JdbcUtf8", UTF8Type.instance).addColumn(utf8Column(ks1, "JdbcUtf8")).build(),
                 jdbcCFMD(ks1, "JdbcLong", LongType.instance).build(),
                 jdbcCFMD(ks1, "JdbcBytes", bytes).build(),
@@ -154,8 +152,6 @@ public class SchemaLoader
                 // Column Families
                 standardCFMD(ks2, "Standard1").build(),
                 standardCFMD(ks2, "Standard3").build(),
-                superCFMD(ks2, "Super3", bytes).build(),
-                superCFMD(ks2, "Super4", TimeUUIDType.instance).build(),
                 keysIndexCFMD(ks2, "Indexed1", true).build(),
                 compositeIndexCFMD(ks2, "Indexed2", true).build(),
                 compositeIndexCFMD(ks2, "Indexed3", true).gcGraceSeconds(0).build())));
@@ -172,10 +168,7 @@ public class SchemaLoader
                 KeyspaceParams.simple(3),
                 Tables.of(
                 standardCFMD(ks4, "Standard1").build(),
-                standardCFMD(ks4, "Standard3").build(),
-                superCFMD(ks4, "Super3", bytes).build(),
-                superCFMD(ks4, "Super4", TimeUUIDType.instance).build(),
-                superCFMD(ks4, "Super5", TimeUUIDType.instance, BytesType.instance).build())));
+                standardCFMD(ks4, "Standard3").build())));
 
         // Keyspace 5
         schema.add(KeyspaceMetadata.create(ks5,
@@ -184,8 +177,8 @@ public class SchemaLoader
 
         // Keyspace 6
         schema.add(KeyspaceMetadata.create(ks6,
-                KeyspaceParams.simple(1),
-                Tables.of(keysIndexCFMD(ks6, "Indexed1", true).build())));
+                                           KeyspaceParams.simple(1),
+                                           Tables.of(keysIndexCFMD(ks6, "Indexed1", true).build())));
 
         // Keyspace 7
         schema.add(KeyspaceMetadata.create(ks7,
@@ -212,16 +205,16 @@ public class SchemaLoader
         schema.add(KeyspaceMetadata.create(ks_nocommit, KeyspaceParams.simpleTransient(1), Tables.of(
                 standardCFMD(ks_nocommit, "Standard1").build())));
 
+        String simpleTable = "CREATE TABLE table1 ("
+                             + "k int PRIMARY KEY,"
+                             + "v1 text,"
+                             + "v2 int"
+                             + ")";
         // CQLKeyspace
         schema.add(KeyspaceMetadata.create(ks_cql, KeyspaceParams.simple(1), Tables.of(
 
         // Column Families
-        CreateTableStatement.parse("CREATE TABLE table1 ("
-                                   + "k int PRIMARY KEY,"
-                                   + "v1 text,"
-                                   + "v2 int"
-                                   + ")", ks_cql)
-                            .build(),
+        CreateTableStatement.parse(simpleTable, ks_cql).build(),
 
         CreateTableStatement.parse("CREATE TABLE table2 ("
                                    + "k text,"
@@ -230,6 +223,12 @@ public class SchemaLoader
                                    + "PRIMARY KEY (k, c))", ks_cql)
                             .build()
         )));
+
+        schema.add(KeyspaceMetadata.create(ks_cql_replicated, KeyspaceParams.simple(3),
+                                           Tables.of(CreateTableStatement.parse(simpleTable, ks_cql_replicated).build())));
+
+        schema.add(KeyspaceMetadata.create(ks_with_transient, KeyspaceParams.simple("3/1"),
+                                           Tables.of(CreateTableStatement.parse(simpleTable, ks_with_transient).build())));
 
         if (DatabaseDescriptor.getPartitioner() instanceof Murmur3Partitioner)
         {
@@ -245,7 +244,7 @@ public class SchemaLoader
             MigrationManager.announceNewKeyspace(ksm, false);
 
         if (Boolean.parseBoolean(System.getProperty("cassandra.test.compression", "false")))
-            useCompression(schema);
+            useCompression(schema, compressionParams(CompressionParams.DEFAULT_CHUNK_LENGTH));
     }
 
     public static void createKeyspace(String name, KeyspaceParams params)
@@ -270,6 +269,20 @@ public class SchemaLoader
     public static void createKeyspace(String name, KeyspaceParams params, Tables tables, Types types)
     {
         MigrationManager.announceNewKeyspace(KeyspaceMetadata.create(name, params, tables, Views.none(), types, Functions.none()), true);
+    }
+
+    public static void setupAuth(IRoleManager roleManager, IAuthenticator authenticator, IAuthorizer authorizer, INetworkAuthorizer networkAuthorizer)
+    {
+        DatabaseDescriptor.setRoleManager(roleManager);
+        DatabaseDescriptor.setAuthenticator(authenticator);
+        DatabaseDescriptor.setAuthorizer(authorizer);
+        DatabaseDescriptor.setNetworkAuthorizer(networkAuthorizer);
+        MigrationManager.announceNewKeyspace(AuthKeyspace.metadata(), true);
+        DatabaseDescriptor.getRoleManager().setup();
+        DatabaseDescriptor.getAuthenticator().setup();
+        DatabaseDescriptor.getAuthorizer().setup();
+        DatabaseDescriptor.getNetworkAuthorizer().setup();
+        Schema.instance.registerListener(new AuthSchemaChangeListener());
     }
 
     public static ColumnMetadata integerColumn(String ksName, String cfName)
@@ -312,11 +325,11 @@ public class SchemaLoader
         return builder.build();
     }
 
-    private static void useCompression(List<KeyspaceMetadata> schema)
+    private static void useCompression(List<KeyspaceMetadata> schema, CompressionParams compressionParams)
     {
         for (KeyspaceMetadata ksm : schema)
             for (TableMetadata cfm : ksm.tablesAndViews())
-                MigrationManager.announceTableUpdate(cfm.unbuild().compression(CompressionParams.snappy()).build(), true);
+                MigrationManager.announceTableUpdate(cfm.unbuild().compression(compressionParams.copy()).build(), true);
     }
 
     public static TableMetadata.Builder counterCFMD(String ksName, String cfName)
@@ -362,44 +375,15 @@ public class SchemaLoader
         return builder;
     }
 
-
-    public static TableMetadata.Builder denseCFMD(String ksName, String cfName)
+    public static TableMetadata.Builder staticCFMD(String ksName, String cfName)
     {
-        return denseCFMD(ksName, cfName, AsciiType.instance);
-    }
-    public static TableMetadata.Builder denseCFMD(String ksName, String cfName, AbstractType cc)
-    {
-        return denseCFMD(ksName, cfName, cc, null);
-    }
-    public static TableMetadata.Builder denseCFMD(String ksName, String cfName, AbstractType cc, AbstractType subcc)
-    {
-        AbstractType comp = cc;
-        if (subcc != null)
-            comp = CompositeType.getInstance(Arrays.asList(new AbstractType<?>[]{cc, subcc}));
-
         return TableMetadata.builder(ksName, cfName)
-                            .isDense(true)
-                            .isCompound(subcc != null)
-                            .addPartitionKeyColumn("key", AsciiType.instance)
-                            .addClusteringColumn("cols", comp)
-                            .addRegularColumn("val", AsciiType.instance)
-                            .compression(getCompressionParameters());
+                                 .addPartitionKeyColumn("key", AsciiType.instance)
+                                 .addClusteringColumn("cols", AsciiType.instance)
+                                 .addStaticColumn("val", AsciiType.instance)
+                                 .addRegularColumn("val2", AsciiType.instance);
     }
 
-    // TODO: Fix superCFMD failing on legacy table creation. Seems to be applying composite comparator to partition key
-    public static TableMetadata.Builder superCFMD(String ksName, String cfName, AbstractType subcc)
-    {
-        return superCFMD(ksName, cfName, BytesType.instance, subcc);
-    }
-    public static TableMetadata.Builder superCFMD(String ksName, String cfName, AbstractType cc, AbstractType subcc)
-    {
-        return superCFMD(ksName, cfName, "cols", cc, subcc);
-    }
-    public static TableMetadata.Builder superCFMD(String ksName, String cfName, String ccName, AbstractType cc, AbstractType subcc)
-    {
-        return standardCFMD(ksName, cfName);
-
-    }
     public static TableMetadata.Builder compositeIndexCFMD(String ksName, String cfName, boolean withRegularIndex) throws ConfigurationException
     {
         return compositeIndexCFMD(ksName, cfName, withRegularIndex, false);
@@ -445,28 +429,55 @@ public class SchemaLoader
         return builder.indexes(indexes.build());
     }
 
+    public static TableMetadata.Builder compositeMultipleIndexCFMD(String ksName, String cfName) throws ConfigurationException
+    {
+        TableMetadata.Builder builder = TableMetadata.builder(ksName, cfName)
+                                                     .addPartitionKeyColumn("key", AsciiType.instance)
+                                                     .addClusteringColumn("c1", AsciiType.instance)
+                                                     .addRegularColumn("birthdate", LongType.instance)
+                                                     .addRegularColumn("notbirthdate", LongType.instance)
+                                                     .compression(getCompressionParameters());
+
+
+        Indexes.Builder indexes = Indexes.builder();
+
+        indexes.add(IndexMetadata.fromIndexTargets(Collections.singletonList(
+                                                   new IndexTarget(new ColumnIdentifier("birthdate", true),
+                                                                   IndexTarget.Type.VALUES)),
+                                                   "birthdate_key_index",
+                                                   IndexMetadata.Kind.COMPOSITES,
+                                                   Collections.EMPTY_MAP));
+        indexes.add(IndexMetadata.fromIndexTargets(Collections.singletonList(
+                                                   new IndexTarget(new ColumnIdentifier("notbirthdate", true),
+                                                                   IndexTarget.Type.VALUES)),
+                                                   "notbirthdate_key_index",
+                                                   IndexMetadata.Kind.COMPOSITES,
+                                                   Collections.EMPTY_MAP));
+
+
+        return builder.indexes(indexes.build());
+    }
+
     public static TableMetadata.Builder keysIndexCFMD(String ksName, String cfName, boolean withIndex)
     {
         TableMetadata.Builder builder =
-            TableMetadata.builder(ksName, cfName)
-                         .isCompound(false)
-                         .isDense(true)
-                         .addPartitionKeyColumn("key", AsciiType.instance)
-                         .addClusteringColumn("c1", AsciiType.instance)
-                         .addStaticColumn("birthdate", LongType.instance)
-                         .addStaticColumn("notbirthdate", LongType.instance)
-                         .addRegularColumn("value", LongType.instance)
-                         .compression(getCompressionParameters());
+        TableMetadata.builder(ksName, cfName)
+                     .addPartitionKeyColumn("key", AsciiType.instance)
+                     .addClusteringColumn("c1", AsciiType.instance)
+                     .addStaticColumn("birthdate", LongType.instance)
+                     .addStaticColumn("notbirthdate", LongType.instance)
+                     .addRegularColumn("value", LongType.instance)
+                     .compression(getCompressionParameters());
 
         if (withIndex)
         {
             IndexMetadata index =
-                IndexMetadata.fromIndexTargets(
-                Collections.singletonList(new IndexTarget(new ColumnIdentifier("birthdate", true),
-                                                                                         IndexTarget.Type.VALUES)),
-                                                                                         cfName + "_birthdate_composite_index",
-                                                                                         IndexMetadata.Kind.KEYS,
-                                                                                         Collections.EMPTY_MAP);
+            IndexMetadata.fromIndexTargets(
+            Collections.singletonList(new IndexTarget(new ColumnIdentifier("birthdate", true),
+                                                      IndexTarget.Type.VALUES)),
+            cfName + "_birthdate_composite_index",
+            IndexMetadata.Kind.KEYS,
+            Collections.EMPTY_MAP);
             builder.indexes(Indexes.builder().add(index).build());
         }
 
@@ -477,8 +488,6 @@ public class SchemaLoader
     {
         TableMetadata.Builder builder  =
             TableMetadata.builder(ksName, cfName)
-                         .isCompound(false)
-                         .isDense(true)
                          .addPartitionKeyColumn("key", AsciiType.instance)
                          .addClusteringColumn("c1", AsciiType.instance)
                          .addRegularColumn("value", LongType.instance)
@@ -708,54 +717,14 @@ public static TableMetadata.Builder clusteringSASICFMD(String ksName, String cfN
     public static CompressionParams getCompressionParameters(Integer chunkSize)
     {
         if (Boolean.parseBoolean(System.getProperty("cassandra.test.compression", "false")))
-            return chunkSize != null ? CompressionParams.snappy(chunkSize) : CompressionParams.snappy();
+            return chunkSize != null ? compressionParams(chunkSize) : compressionParams(CompressionParams.DEFAULT_CHUNK_LENGTH);
 
         return CompressionParams.noCompression();
     }
 
     public static void cleanupAndLeaveDirs() throws IOException
     {
-        // We need to stop and unmap all CLS instances prior to cleanup() or we'll get failures on Windows.
-        CommitLog.instance.stopUnsafe(true);
-        mkdirs();
-        cleanup();
-        mkdirs();
-        CommitLog.instance.restartUnsafe();
-    }
-
-    public static void cleanup()
-    {
-        // clean up commitlog
-        String[] directoryNames = { DatabaseDescriptor.getCommitLogLocation(), };
-        for (String dirName : directoryNames)
-        {
-            File dir = new File(dirName);
-            if (!dir.exists())
-                throw new RuntimeException("No such directory: " + dir.getAbsolutePath());
-
-            // Leave the folder around as Windows will complain about directory deletion w/handles open to children files
-            String[] children = dir.list();
-            for (String child : children)
-                FileUtils.deleteRecursive(new File(dir, child));
-        }
-
-        cleanupSavedCaches();
-
-        // clean up data directory which are stored as data directory/keyspace/data files
-        for (String dirName : DatabaseDescriptor.getAllDataFileLocations())
-        {
-            File dir = new File(dirName);
-            if (!dir.exists())
-                throw new RuntimeException("No such directory: " + dir.getAbsolutePath());
-            String[] children = dir.list();
-            for (String child : children)
-                FileUtils.deleteRecursive(new File(dir, child));
-        }
-    }
-
-    public static void mkdirs()
-    {
-        DatabaseDescriptor.createAllDirectories();
+        ServerTestUtils.cleanupAndLeaveDirs();
     }
 
     public static void insertData(String keyspace, String columnFamily, int offset, int numberOfRows)
@@ -776,11 +745,28 @@ public static TableMetadata.Builder clusteringSASICFMD(String ksName, String cfN
 
     public static void cleanupSavedCaches()
     {
-        File cachesDir = new File(DatabaseDescriptor.getSavedCachesLocation());
+        ServerTestUtils.cleanupSavedCaches();
+    }
 
-        if (!cachesDir.exists() || !cachesDir.isDirectory())
-            return;
-
-        FileUtils.delete(cachesDir.listFiles());
+    private static CompressionParams compressionParams(int chunkLength)
+    {
+        String algo = System.getProperty("cassandra.test.compression.algo", "lz4").toLowerCase();
+        switch (algo)
+        {
+            case "deflate":
+                return CompressionParams.deflate(chunkLength);
+            case "lz4":
+                return CompressionParams.lz4(chunkLength);
+            case "snappy":
+                return CompressionParams.snappy(chunkLength);
+            case "noop":
+                return CompressionParams.noop();
+            case "zstd":
+                return CompressionParams.zstd(chunkLength);
+            case "none":
+                return CompressionParams.noCompression();
+            default:
+                throw new IllegalArgumentException("Invalid compression algorithm has been provided in cassandra.test.compression system property: " + algo);
+        }
     }
 }

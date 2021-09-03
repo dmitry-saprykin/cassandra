@@ -23,10 +23,13 @@ import java.util.UUID;
 
 import org.apache.commons.lang3.StringUtils;
 import org.junit.Assert;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.io.sstable.format.SSTableFormat;
+import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.Pair;
 
@@ -42,7 +45,13 @@ public class DescriptorTest
     public DescriptorTest() throws IOException
     {
         // create CF directories, one without CFID and one with it
-        tempDataDir = File.createTempFile("DescriptorTest", null).getParentFile();
+        tempDataDir = FileUtils.createTempFile("DescriptorTest", null).getParentFile();
+    }
+
+    @BeforeClass
+    public static void setup()
+    {
+        DatabaseDescriptor.daemonInitialization();
     }
 
     @Test

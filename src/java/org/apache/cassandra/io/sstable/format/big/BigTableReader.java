@@ -21,10 +21,10 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.*;
 
+import org.apache.cassandra.io.sstable.format.SSTableReaderBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.cache.KeyCacheKey;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.columniterator.SSTableIterator;
 import org.apache.cassandra.db.columniterator.SSTableReversedIterator;
@@ -40,9 +40,7 @@ import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.format.SSTableReadsListener;
 import org.apache.cassandra.io.sstable.format.SSTableReadsListener.SelectionReason;
 import org.apache.cassandra.io.sstable.format.SSTableReadsListener.SkippingReason;
-import org.apache.cassandra.io.sstable.metadata.StatsMetadata;
 import org.apache.cassandra.io.util.FileDataInput;
-import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
@@ -54,9 +52,9 @@ public class BigTableReader extends SSTableReader
 {
     private static final Logger logger = LoggerFactory.getLogger(BigTableReader.class);
 
-    BigTableReader(Descriptor desc, Set<Component> components, TableMetadataRef metadata, Long maxDataAge, StatsMetadata sstableMetadata, OpenReason openReason, SerializationHeader header)
+    BigTableReader(SSTableReaderBuilder builder)
     {
-        super(desc, components, metadata, maxDataAge, sstableMetadata, openReason, header);
+        super(builder);
     }
 
     public UnfilteredRowIterator iterator(DecoratedKey key,
@@ -69,6 +67,7 @@ public class BigTableReader extends SSTableReader
         return iterator(null, key, rie, slices, selectedColumns, reversed);
     }
 
+    @SuppressWarnings("resource")
     public UnfilteredRowIterator iterator(FileDataInput file, DecoratedKey key, RowIndexEntry indexEntry, Slices slices, ColumnFilter selectedColumns, boolean reversed)
     {
         if (indexEntry == null)
@@ -140,6 +139,13 @@ public class BigTableReader extends SSTableReader
                                         boolean permitMatchPastLast,
                                         SSTableReadsListener listener)
     {
+        // Having no index file is impossible in a normal operation. The only way it might happen is running
+        // Scrubber that does not really rely onto this method.
+        if (ifile == null)
+        {
+            return null;
+        }
+
         if (op == Operator.EQ)
         {
             assert key instanceof DecoratedKey; // EQ only make sense if the key is a valid row key
@@ -147,6 +153,7 @@ public class BigTableReader extends SSTableReader
             {
                 listener.onSSTableSkipped(this, SkippingReason.BLOOM_FILTER);
                 Tracing.trace("Bloom filter allows skipping sstable {}", descriptor.generation);
+                bloomFilterTracker.addTrueNegative();
                 return null;
             }
         }
@@ -154,11 +161,12 @@ public class BigTableReader extends SSTableReader
         // next, the key cache (only make sense for valid row key)
         if ((op == Operator.EQ || op == Operator.GE) && (key instanceof DecoratedKey))
         {
-            DecoratedKey decoratedKey = (DecoratedKey)key;
-            KeyCacheKey cacheKey = new KeyCacheKey(metadata(), descriptor, decoratedKey.getKey());
-            RowIndexEntry cachedPosition = getCachedPosition(cacheKey, updateCacheAndStats);
+            DecoratedKey decoratedKey = (DecoratedKey) key;
+            RowIndexEntry cachedPosition = getCachedPosition(decoratedKey, updateCacheAndStats);
             if (cachedPosition != null)
             {
+                // we do not need to track "true positive" for Bloom Filter here because it has been already tracked
+                // inside getCachedPosition method
                 listener.onSSTableSelected(this, cachedPosition, SelectionReason.KEY_CACHE_HIT);
                 Tracing.trace("Key cache hit for sstable {}", descriptor.generation);
                 return cachedPosition;
@@ -199,9 +207,6 @@ public class BigTableReader extends SSTableReader
 
         int effectiveInterval = indexSummary.getEffectiveIndexIntervalAfterIndex(sampledIndex);
 
-        if (ifile == null)
-            return null;
-
         // scan the on-disk index, starting at the nearest sampled position.
         // The check against IndexInterval is to be exit the loop in the EQ case when the key looked for is not present
         // (bloom filter false positive). But note that for non-EQ cases, we might need to check the first key of the
@@ -236,6 +241,8 @@ public class BigTableReader extends SSTableReader
                     exactMatch = (comparison == 0);
                     if (v < 0)
                     {
+                        if (op == SSTableReader.Operator.EQ && updateCacheAndStats)
+                            bloomFilterTracker.addFalsePositive();
                         listener.onSSTableSkipped(this, SkippingReason.PARTITION_INDEX_LOOKUP);
                         Tracing.trace("Partition index lookup allows skipping sstable {}", descriptor.generation);
                         return null;
@@ -245,7 +252,7 @@ public class BigTableReader extends SSTableReader
                 if (opSatisfied)
                 {
                     // read data position from index entry
-                    RowIndexEntry indexEntry = rowIndexEntrySerializer.deserialize(in, in.getFilePointer());
+                    RowIndexEntry indexEntry = rowIndexEntrySerializer.deserialize(in);
                     if (exactMatch && updateCacheAndStats)
                     {
                         assert key instanceof DecoratedKey; // key can be == to the index key only if it's a true row key

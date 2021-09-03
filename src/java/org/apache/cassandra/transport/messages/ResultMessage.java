@@ -22,10 +22,7 @@ import com.google.common.annotations.VisibleForTesting;
 
 import io.netty.buffer.ByteBuf;
 
-import org.apache.cassandra.cql3.ColumnSpecification;
-import org.apache.cassandra.cql3.CQLStatement;
 import org.apache.cassandra.cql3.ResultSet;
-import org.apache.cassandra.cql3.statements.ParsedStatement;
 import org.apache.cassandra.transport.*;
 import org.apache.cassandra.utils.MD5Digest;
 
@@ -155,13 +152,13 @@ public abstract class ResultMessage extends Message.Response
             public void encode(ResultMessage msg, ByteBuf dest, ProtocolVersion version)
             {
                 assert msg instanceof SetKeyspace;
-                CBUtil.writeString(((SetKeyspace)msg).keyspace, dest);
+                CBUtil.writeAsciiString(((SetKeyspace)msg).keyspace, dest);
             }
 
             public int encodedSize(ResultMessage msg, ProtocolVersion version)
             {
                 assert msg instanceof SetKeyspace;
-                return CBUtil.sizeOfString(((SetKeyspace)msg).keyspace);
+                return CBUtil.sizeOfAsciiString(((SetKeyspace)msg).keyspace);
             }
         };
 

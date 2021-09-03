@@ -18,6 +18,7 @@
 package org.apache.cassandra.io.util;
 
 import java.io.IOException;
+import java.nio.BufferOverflowException;
 import java.nio.ByteBuffer;
 import java.nio.channels.WritableByteChannel;
 
@@ -38,7 +39,7 @@ public class DataOutputBuffer extends BufferedDataOutputStreamPlus
     /*
      * Threshold at which resizing transitions from doubling to increasing by 50%
      */
-    private static final long DOUBLING_THRESHOLD = Long.getLong(Config.PROPERTY_PREFIX + "DOB_DOUBLING_THRESHOLD_MB", 64);
+    static final long DOUBLING_THRESHOLD = Long.getLong(Config.PROPERTY_PREFIX + "DOB_DOUBLING_THRESHOLD_MB", 64);
 
     /*
      * Only recycle OutputBuffers up to 1Mb. Larger buffers will be trimmed back to this size.
@@ -53,7 +54,8 @@ public class DataOutputBuffer extends BufferedDataOutputStreamPlus
      */
     public static final FastThreadLocal<DataOutputBuffer> scratchBuffer = new FastThreadLocal<DataOutputBuffer>()
     {
-        protected DataOutputBuffer initialValue() throws Exception
+        @Override
+        protected DataOutputBuffer initialValue()
         {
             return new DataOutputBuffer()
             {
@@ -88,9 +90,9 @@ public class DataOutputBuffer extends BufferedDataOutputStreamPlus
     }
 
     @Override
-    public void flush() throws IOException
+    public void flush()
     {
-        throw new UnsupportedOperationException();
+
     }
 
     //The actual value observed in Hotspot is only -2
@@ -116,7 +118,7 @@ public class DataOutputBuffer extends BufferedDataOutputStreamPlus
     @Override
     protected void doFlush(int count) throws IOException
     {
-        reallocate(count);
+        expandToFit(count);
     }
 
     //Hack for test, make it possible to override checking the buffer capacity
@@ -131,7 +133,7 @@ public class DataOutputBuffer extends BufferedDataOutputStreamPlus
     {
         int saturatedSize = saturatedArraySizeCast(newSize);
         if (saturatedSize <= capacity())
-            throw new RuntimeException();
+            throw new BufferOverflowException();
         return saturatedSize;
     }
 
@@ -152,7 +154,7 @@ public class DataOutputBuffer extends BufferedDataOutputStreamPlus
         return validateReallocation(newSize);
     }
 
-    protected void reallocate(long count)
+    protected void expandToFit(long count)
     {
         if (count <= 0)
             return;
@@ -176,10 +178,10 @@ public class DataOutputBuffer extends BufferedDataOutputStreamPlus
     @VisibleForTesting
     final class GrowingChannel implements WritableByteChannel
     {
-        public int write(ByteBuffer src) throws IOException
+        public int write(ByteBuffer src)
         {
             int count = src.remaining();
-            reallocate(count);
+            expandToFit(count);
             buffer.put(src);
             return count;
         }
@@ -201,6 +203,19 @@ public class DataOutputBuffer extends BufferedDataOutputStreamPlus
 
     public ByteBuffer buffer()
     {
+        return buffer(true);
+    }
+
+    public ByteBuffer buffer(boolean duplicate)
+    {
+        if (!duplicate)
+        {
+            ByteBuffer buf = buffer;
+            buf.flip();
+            buffer = null;
+            return buf;
+        }
+
         ByteBuffer result = buffer.duplicate();
         result.flip();
         return result;

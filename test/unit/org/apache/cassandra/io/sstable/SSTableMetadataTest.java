@@ -20,7 +20,6 @@ package org.apache.cassandra.io.sstable;
 import java.nio.charset.CharacterCodingException;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.ExecutionException;
 
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -29,7 +28,6 @@ import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.db.ColumnFamilyStore;
-import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.RowUpdateBuilder;
 import org.apache.cassandra.db.marshal.AsciiType;
@@ -38,7 +36,6 @@ import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
-import static org.apache.cassandra.Util.getBytes;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
@@ -51,8 +48,15 @@ public class SSTableMetadataTest
     public static final String CF_STANDARDCOMPOSITE2 = "StandardComposite2";
     public static final String CF_COUNTER1 = "Counter1";
 
+    /**
+     * Max allowed difference between compared SSTable metadata timestamps, in seconds.
+     * We use a {@code double} to force the usage of {@link org.junit.Assert#assertEquals(double, double, double)} when
+     * comparing integer timestamps, otherwise {@link org.junit.Assert#assertEquals(float, float, float)} would be used.
+     */
+    public static final double DELTA = 10;
+
     @BeforeClass
-    public static void defineSchema() throws Exception
+    public static void defineSchema()
     {
         SchemaLoader.prepareServer();
         SchemaLoader.createKeyspace(KEYSPACE1,
@@ -74,9 +78,8 @@ public class SSTableMetadataTest
         Keyspace keyspace = Keyspace.open(KEYSPACE1);
         ColumnFamilyStore store = keyspace.getColumnFamilyStore("Standard1");
         long timestamp = System.currentTimeMillis();
-        for(int i = 0; i < 10; i++)
+        for (int i = 0; i < 10; i++)
         {
-            DecoratedKey key = Util.dk(Integer.toString(i));
             for (int j = 0; j < 10; j++)
                 new RowUpdateBuilder(store.metadata(), timestamp, 10 + j, Integer.toString(i))
                     .clustering(Integer.toString(j))
@@ -92,15 +95,14 @@ public class SSTableMetadataTest
             .build()
             .applyUnsafe();
 
-
         store.forceBlockingFlush();
         assertEquals(1, store.getLiveSSTables().size());
-        int ttltimestamp = (int)(System.currentTimeMillis()/1000);
+        int ttltimestamp = (int) (System.currentTimeMillis() / 1000);
         int firstDelTime = 0;
-        for(SSTableReader sstable : store.getLiveSSTables())
+        for (SSTableReader sstable : store.getLiveSSTables())
         {
             firstDelTime = sstable.getSSTableMetadata().maxLocalDeletionTime;
-            assertEquals(ttltimestamp + 10000, firstDelTime, 10);
+            assertEquals(ttltimestamp + 10000, firstDelTime, DELTA);
 
         }
 
@@ -110,27 +112,26 @@ public class SSTableMetadataTest
         .build()
         .applyUnsafe();
 
-
-        ttltimestamp = (int) (System.currentTimeMillis()/1000);
+        ttltimestamp = (int) (System.currentTimeMillis() / 1000);
         store.forceBlockingFlush();
         assertEquals(2, store.getLiveSSTables().size());
         List<SSTableReader> sstables = new ArrayList<>(store.getLiveSSTables());
-        if(sstables.get(0).getSSTableMetadata().maxLocalDeletionTime < sstables.get(1).getSSTableMetadata().maxLocalDeletionTime)
+        if (sstables.get(0).getSSTableMetadata().maxLocalDeletionTime < sstables.get(1).getSSTableMetadata().maxLocalDeletionTime)
         {
             assertEquals(sstables.get(0).getSSTableMetadata().maxLocalDeletionTime, firstDelTime);
-            assertEquals(sstables.get(1).getSSTableMetadata().maxLocalDeletionTime, ttltimestamp + 20000, 10);
+            assertEquals(sstables.get(1).getSSTableMetadata().maxLocalDeletionTime, ttltimestamp + 20000, DELTA);
         }
         else
         {
             assertEquals(sstables.get(1).getSSTableMetadata().maxLocalDeletionTime, firstDelTime);
-            assertEquals(sstables.get(0).getSSTableMetadata().maxLocalDeletionTime, ttltimestamp + 20000, 10);
+            assertEquals(sstables.get(0).getSSTableMetadata().maxLocalDeletionTime, ttltimestamp + 20000, DELTA);
         }
 
         Util.compact(store, store.getLiveSSTables());
         assertEquals(1, store.getLiveSSTables().size());
-        for(SSTableReader sstable : store.getLiveSSTables())
+        for (SSTableReader sstable : store.getLiveSSTables())
         {
-            assertEquals(sstable.getSSTableMetadata().maxLocalDeletionTime, ttltimestamp + 20000, 10);
+            assertEquals(sstable.getSSTableMetadata().maxLocalDeletionTime, ttltimestamp + 20000, DELTA);
         }
     }
 
@@ -141,18 +142,14 @@ public class SSTableMetadataTest
      * 4. flush, verify the new sstable (maxLocalDeletionTime = ~now)
      * 5. compact
      * 6. verify resulting sstable has maxLocalDeletionTime = time + 100.
-     *
-     * @throws ExecutionException
-     * @throws InterruptedException
      */
     @Test
-    public void testWithDeletes() throws ExecutionException, InterruptedException
+    public void testWithDeletes()
     {
         Keyspace keyspace = Keyspace.open(KEYSPACE1);
         ColumnFamilyStore store = keyspace.getColumnFamilyStore("Standard2");
         long timestamp = System.currentTimeMillis();
-        DecoratedKey key = Util.dk("deletetest");
-        for (int i = 0; i<5; i++)
+        for (int i = 0; i < 5; i++)
             new RowUpdateBuilder(store.metadata(), timestamp, 100, "deletetest")
                 .clustering("deletecolumn" + i)
                 .add("val", ByteBufferUtil.EMPTY_BYTE_BUFFER)
@@ -167,46 +164,46 @@ public class SSTableMetadataTest
         .applyUnsafe();
 
         store.forceBlockingFlush();
-        assertEquals(1,store.getLiveSSTables().size());
-        int ttltimestamp = (int) (System.currentTimeMillis()/1000);
+        assertEquals(1, store.getLiveSSTables().size());
+        int ttltimestamp = (int) (System.currentTimeMillis() / 1000);
         int firstMaxDelTime = 0;
-        for(SSTableReader sstable : store.getLiveSSTables())
+        for (SSTableReader sstable : store.getLiveSSTables())
         {
             firstMaxDelTime = sstable.getSSTableMetadata().maxLocalDeletionTime;
-            assertEquals(ttltimestamp + 1000, firstMaxDelTime, 10);
+            assertEquals(ttltimestamp + 1000, firstMaxDelTime, DELTA);
         }
 
         RowUpdateBuilder.deleteRow(store.metadata(), timestamp + 1, "deletetest", "todelete").applyUnsafe();
 
         store.forceBlockingFlush();
-        assertEquals(2,store.getLiveSSTables().size());
+        assertEquals(2, store.getLiveSSTables().size());
         boolean foundDelete = false;
-        for(SSTableReader sstable : store.getLiveSSTables())
+        for (SSTableReader sstable : store.getLiveSSTables())
         {
-            if(sstable.getSSTableMetadata().maxLocalDeletionTime != firstMaxDelTime)
+            if (sstable.getSSTableMetadata().maxLocalDeletionTime != firstMaxDelTime)
             {
-                assertEquals(sstable.getSSTableMetadata().maxLocalDeletionTime, ttltimestamp, 10);
+                assertEquals(sstable.getSSTableMetadata().maxLocalDeletionTime, ttltimestamp, DELTA);
                 foundDelete = true;
             }
         }
         assertTrue(foundDelete);
         Util.compact(store, store.getLiveSSTables());
-        assertEquals(1,store.getLiveSSTables().size());
-        for(SSTableReader sstable : store.getLiveSSTables())
+        assertEquals(1, store.getLiveSSTables().size());
+        for (SSTableReader sstable : store.getLiveSSTables())
         {
-            assertEquals(ttltimestamp + 100, sstable.getSSTableMetadata().maxLocalDeletionTime, 10);
+            assertEquals(ttltimestamp + 100, sstable.getSSTableMetadata().maxLocalDeletionTime, DELTA);
         }
     }
 
     @Test
-    public void trackMaxMinColNames() throws CharacterCodingException, ExecutionException, InterruptedException
+    public void trackMaxMinColNames() throws CharacterCodingException
     {
         Keyspace keyspace = Keyspace.open(KEYSPACE1);
         ColumnFamilyStore store = keyspace.getColumnFamilyStore("Standard3");
         for (int j = 0; j < 8; j++)
         {
             String key = "row" + j;
-            for (int i = 100; i<150; i++)
+            for (int i = 100; i < 150; i++)
             {
                 new RowUpdateBuilder(store.metadata(), System.currentTimeMillis(), key)
                     .clustering(j + "col" + i)
@@ -221,10 +218,13 @@ public class SSTableMetadataTest
         {
             assertEquals(ByteBufferUtil.string(sstable.getSSTableMetadata().minClusteringValues.get(0)), "0col100");
             assertEquals(ByteBufferUtil.string(sstable.getSSTableMetadata().maxClusteringValues.get(0)), "7col149");
+            // make sure the clustering values are minimised
+            assertTrue(sstable.getSSTableMetadata().minClusteringValues.get(0).capacity() < 50);
+            assertTrue(sstable.getSSTableMetadata().maxClusteringValues.get(0).capacity() < 50);
         }
         String key = "row2";
 
-        for (int i = 101; i<299; i++)
+        for (int i = 101; i < 299; i++)
         {
             new RowUpdateBuilder(store.metadata(), System.currentTimeMillis(), key)
             .clustering(9 + "col" + i)
@@ -240,55 +240,9 @@ public class SSTableMetadataTest
         {
             assertEquals(ByteBufferUtil.string(sstable.getSSTableMetadata().minClusteringValues.get(0)), "0col100");
             assertEquals(ByteBufferUtil.string(sstable.getSSTableMetadata().maxClusteringValues.get(0)), "9col298");
-        }
-    }
-
-    @Test
-    public void testMaxMinComposites() throws CharacterCodingException, ExecutionException, InterruptedException
-    {
-        /*
-        creates two sstables, columns like this:
-        ---------------------
-        k   |a0:9|a1:8|..|a9:0
-        ---------------------
-        and
-        ---------------------
-        k2  |b0:9|b1:8|..|b9:0
-        ---------------------
-        meaning max columns are b9 and 9, min is a0 and 0
-         */
-        Keyspace keyspace = Keyspace.open(KEYSPACE1);
-
-        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore("StandardComposite2");
-
-        for (int i = 0; i < 10; i++)
-        {
-            new RowUpdateBuilder(cfs.metadata(), 0, "k")
-                .clustering("a" + (9 - i), getBytes(i))
-                .add("val", ByteBufferUtil.EMPTY_BYTE_BUFFER)
-                .build()
-                .applyUnsafe();
-
-        }
-        cfs.forceBlockingFlush();
-
-        for (int i = 0; i < 10; i++)
-        {
-            new RowUpdateBuilder(cfs.metadata(), 0, "k2")
-            .clustering("b" + (9 - i), getBytes(i))
-            .add("val", ByteBufferUtil.EMPTY_BYTE_BUFFER)
-            .build()
-            .applyUnsafe();
-        }
-        cfs.forceBlockingFlush();
-        cfs.forceMajorCompaction();
-        assertEquals(cfs.getLiveSSTables().size(), 1);
-        for (SSTableReader sstable : cfs.getLiveSSTables())
-        {
-            assertEquals("b9", ByteBufferUtil.string(sstable.getSSTableMetadata().maxClusteringValues.get(0)));
-            assertEquals(9, ByteBufferUtil.toInt(sstable.getSSTableMetadata().maxClusteringValues.get(1)));
-            assertEquals("a0", ByteBufferUtil.string(sstable.getSSTableMetadata().minClusteringValues.get(0)));
-            assertEquals(0, ByteBufferUtil.toInt(sstable.getSSTableMetadata().minClusteringValues.get(1)));
+            // and make sure the clustering values are still minimised after compaction
+            assertTrue(sstable.getSSTableMetadata().minClusteringValues.get(0).capacity() < 50);
+            assertTrue(sstable.getSSTableMetadata().maxClusteringValues.get(0).capacity() < 50);
         }
     }
 

@@ -20,18 +20,21 @@ package org.apache.cassandra.utils.binlog;
 
 import java.io.File;
 import java.nio.file.Path;
-import java.nio.file.Paths;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Supplier;
 
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
 import net.openhft.chronicle.queue.ChronicleQueue;
-import net.openhft.chronicle.queue.ChronicleQueueBuilder;
+import net.openhft.chronicle.queue.impl.single.SingleChronicleQueueBuilder;
 import net.openhft.chronicle.queue.ExcerptTailer;
 import net.openhft.chronicle.queue.RollCycles;
 import net.openhft.chronicle.wire.WireOut;
@@ -39,6 +42,7 @@ import org.apache.cassandra.Util;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -46,10 +50,7 @@ public class BinLogTest
 {
     public static Path tempDir() throws Exception
     {
-        File f = File.createTempFile("foo", "bar");
-        f.delete();
-        f.mkdir();
-        return Paths.get(f.getPath());
+        return Files.createTempDirectory("binlogtest" + System.nanoTime());
     }
 
     private static final String testString = "ry@nlikestheyankees";
@@ -62,8 +63,12 @@ public class BinLogTest
     public void setUp() throws Exception
     {
         path = tempDir();
-        binLog = new BinLog(path, RollCycles.TEST_SECONDLY, 10, 1024 * 1024 * 128);
-        binLog.start();
+        binLog = new BinLog.Builder().path(path)
+                                     .rollCycle(RollCycles.TEST_SECONDLY.toString())
+                                     .maxQueueWeight(10)
+                                     .maxLogSize(1024 * 1024 * 128)
+                                     .blocking(false)
+                                     .build(false);
     }
 
     @After
@@ -82,25 +87,25 @@ public class BinLogTest
     @Test(expected = NullPointerException.class)
     public void testConstructorNullPath() throws Exception
     {
-        new BinLog(null, RollCycles.TEST_SECONDLY, 1, 1);
+        new BinLog.Builder().path(null).build(false);
     }
 
     @Test(expected = NullPointerException.class)
     public void testConstructorNullRollCycle() throws Exception
     {
-        new BinLog(tempDir(), null, 1, 1);
+        new BinLog.Builder().path(tempDir()).rollCycle(null).build(false);
     }
 
     @Test(expected = IllegalArgumentException.class)
     public void testConstructorZeroWeight() throws Exception
     {
-        new BinLog(tempDir(), RollCycles.TEST_SECONDLY, 0, 1);
+        new BinLog.Builder().path(tempDir()).rollCycle(RollCycles.TEST_SECONDLY.toString()).maxQueueWeight(0).build(false);
     }
 
     @Test(expected = IllegalArgumentException.class)
     public void testConstructorLogSize() throws Exception
     {
-        new BinLog(tempDir(), RollCycles.TEST_SECONDLY, 1, 0);
+        new BinLog.Builder().path(tempDir()).rollCycle(RollCycles.TEST_SECONDLY.toString()).maxLogSize(0).build(false);
     }
 
     /**
@@ -110,42 +115,35 @@ public class BinLogTest
     @Test
     public void testBinLogStartStop() throws Exception
     {
-        Semaphore blockBinLog = new Semaphore(1);
         AtomicInteger releaseCount = new AtomicInteger();
-        binLog.put(new BinLog.ReleaseableWriteMarshallable()
+        CountDownLatch ready = new CountDownLatch(2);
+        Supplier<BinLog.ReleaseableWriteMarshallable> recordSupplier =
+        () -> new BinLog.ReleaseableWriteMarshallable()
         {
-            protected void release()
+            public void release()
             {
                 releaseCount.incrementAndGet();
             }
 
-            public void writeMarshallable(WireOut wire)
+            protected long version()
             {
-                try
-                {
-                    blockBinLog.acquire();
-                }
-                catch (InterruptedException e)
-                {
-                    throw new RuntimeException(e);
-                }
-            }
-        });
-        binLog.put(new BinLog.ReleaseableWriteMarshallable()
-        {
-
-            public void writeMarshallable(WireOut wire)
-            {
-
+                return 0;
             }
 
-            protected void release()
+            protected String type()
             {
-                releaseCount.incrementAndGet();
+                return "test";
             }
-        });
-        Thread.sleep(1000);
-        assertEquals(2, releaseCount.get());
+
+            public void writeMarshallablePayload(WireOut wire)
+            {
+                ready.countDown();
+            }
+        };
+        binLog.put(recordSupplier.get());
+        binLog.put(recordSupplier.get());
+        ready.await(1, TimeUnit.MINUTES);
+        Util.spinAssertEquals("Both records should be released", 2, releaseCount::get, 10, TimeUnit.SECONDS);
         Thread t = new Thread(() -> {
             try
             {
@@ -158,7 +156,7 @@ public class BinLogTest
         });
         t.start();
         t.join(60 * 1000);
-        assertEquals(t.getState(), Thread.State.TERMINATED);
+        assertEquals("BinLog should not take more than 1 minute to stop", t.getState(), Thread.State.TERMINATED);
 
         Util.spinAssertEquals(2, releaseCount::get, 60);
         Util.spinAssertEquals(Thread.State.TERMINATED, binLog.binLogThread::getState, 60);
@@ -174,12 +172,22 @@ public class BinLogTest
         Semaphore released = new Semaphore(0);
         binLog.sampleQueue.put(new BinLog.ReleaseableWriteMarshallable()
         {
-            protected void release()
+            public void release()
             {
                 released.release();
             }
 
-            public void writeMarshallable(WireOut wire)
+            protected long version()
+            {
+                return 0;
+            }
+
+            protected String type()
+            {
+                return "test";
+            }
+
+            public void writeMarshallablePayload(WireOut wire)
             {
 
             }
@@ -220,11 +228,21 @@ public class BinLogTest
         {
             binLog.put(new BinLog.ReleaseableWriteMarshallable()
             {
-                protected void release()
+                public void release()
                 {
                 }
 
-                public void writeMarshallable(WireOut wire)
+                protected long version()
+                {
+                    return 0;
+                }
+
+                protected String type()
+                {
+                    return "test";
+                }
+
+                public void writeMarshallablePayload(WireOut wire)
                 {
                     //Notify the bing log thread is about to block
                     binLogBlocked.release();
@@ -296,11 +314,21 @@ public class BinLogTest
         {
             assertTrue(binLog.offer(new BinLog.ReleaseableWriteMarshallable()
             {
-                protected void release()
+                public void release()
                 {
                 }
 
-                public void writeMarshallable(WireOut wire)
+                protected long version()
+                {
+                    return 0;
+                }
+
+                protected String type()
+                {
+                    return "test";
+                }
+
+                public void writeMarshallablePayload(WireOut wire)
                 {
                     //Notify the bing log thread is about to block
                     binLogBlocked.release();
@@ -344,8 +372,7 @@ public class BinLogTest
     public void testCleanupOnOversize() throws Exception
     {
         tearDown();
-        binLog = new BinLog(path, RollCycles.TEST_SECONDLY, 10000, 1);
-        binLog.start();
+        binLog = new BinLog.Builder().path(path).rollCycle(RollCycles.TEST_SECONDLY.toString()).maxQueueWeight(1).maxLogSize(10000).blocking(false).build(false);
         for (int ii = 0; ii < 5; ii++)
         {
             binLog.put(record(String.valueOf(ii)));
@@ -373,36 +400,57 @@ public class BinLogTest
     @Test
     public void testPutAfterStop() throws Exception
     {
+        final BinLog.ReleaseableWriteMarshallable unexpected = record(testString);
         binLog.stop();
-        binLog.put(record(testString));
-        assertEquals(null, binLog.sampleQueue.poll());
+        binLog.put(unexpected);
+        BinLog.ReleaseableWriteMarshallable record;
+        while (null != (record = binLog.sampleQueue.poll()))
+        {
+            assertNotEquals("A stopped BinLog should no longer accept", unexpected, record);
+        }
     }
 
     /**
      * Test for a bug where files were deleted but the space was not reclaimed when tracking so
      * all log segemnts were incorrectly deleted when rolled.
+     *
+     * Due to some internal state in ChronicleQueue this test is occasionally
+     * flaky when run in the suite with testPut or testOffer.
      */
     @Test
-    public void testTrucationReleasesLogSpace() throws Exception
+    public void testTruncationReleasesLogSpace() throws Exception
+    {
+        Util.flakyTest(this::flakyTestTruncationReleasesLogSpace, 2, "Fails occasionally due to Chronicle internal state, see CASSANDRA-16526");
+    }
+
+
+    private void flakyTestTruncationReleasesLogSpace()
     {
         StringBuilder sb = new StringBuilder();
-        for (int ii = 0; ii < 1024 * 1024 * 2; ii++)
+        try
         {
-            sb.append('a');
+            for (int ii = 0; ii < 1024 * 1024 * 2; ii++)
+            {
+                sb.append('a');
+            }
+
+            String queryString = sb.toString();
+
+            //This should fill up the log so when it rolls in the future it will always delete the rolled segment;
+            for (int ii = 0; ii < 129; ii++)
+            {
+                binLog.put(record(queryString));
+            }
+
+            for (int ii = 0; ii < 2; ii++)
+            {
+                Thread.sleep(2000);
+                binLog.put(record(queryString));
+            }
         }
-
-        String queryString = sb.toString();
-
-        //This should fill up the log so when it rolls in the future it will always delete the rolled segment;
-        for (int ii = 0; ii < 129; ii++)
+        catch (InterruptedException e)
         {
-            binLog.put(record(queryString));
-        }
-
-        for (int ii = 0; ii < 2; ii++)
-        {
-            Thread.sleep(2000);
-            binLog.put(record(queryString));
+            throw new RuntimeException(e);
         }
 
         Util.spinAssertEquals(2, () -> readBinLogRecords(path).size(), 60);
@@ -412,12 +460,22 @@ public class BinLogTest
     {
         return new BinLog.ReleaseableWriteMarshallable()
         {
-            protected void release()
+            public void release()
             {
                 //Do nothing
             }
 
-            public void writeMarshallable(WireOut wire)
+            protected long version()
+            {
+                return 0;
+            }
+
+            protected String type()
+            {
+                return "test";
+            }
+
+            public void writeMarshallablePayload(WireOut wire)
             {
                 wire.write("text").text(text);
             }
@@ -427,7 +485,7 @@ public class BinLogTest
     List<String> readBinLogRecords(Path path)
     {
         List<String> records = new ArrayList<String>();
-        try (ChronicleQueue queue = ChronicleQueueBuilder.single(path.toFile()).rollCycle(RollCycles.TEST_SECONDLY).build())
+        try (ChronicleQueue queue = SingleChronicleQueueBuilder.single(path.toFile()).rollCycle(RollCycles.TEST_SECONDLY).build())
         {
             ExcerptTailer tailer = queue.createTailer();
             while (true)

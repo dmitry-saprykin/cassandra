@@ -37,6 +37,7 @@ public class ObjectSizes
                                              .ignoreKnownSingletons();
 
     private static final long BUFFER_EMPTY_SIZE = measure(ByteBufferUtil.EMPTY_BYTE_BUFFER);
+    private static final long BYTE_ARRAY_EMPTY_SIZE = measure(new byte[0]);
     private static final long STRING_EMPTY_SIZE = measure("");
 
     /**
@@ -128,9 +129,14 @@ public class ObjectSizes
         return BUFFER_EMPTY_SIZE + sizeOfArray(buffer.capacity(), 1);
     }
 
-    public static long sizeOnHeapExcludingData(ByteBuffer buffer)
+    public static long sizeOfEmptyHeapByteBuffer()
     {
         return BUFFER_EMPTY_SIZE;
+    }
+
+    public static long sizeOfEmptyByteArray()
+    {
+        return BYTE_ARRAY_EMPTY_SIZE;
     }
 
     /**
@@ -138,7 +144,7 @@ public class ObjectSizes
      * @param str String to calculate memory size of
      * @return Total in-memory size of the String
      */
-    //@TODO hard coding this to 2 isn't necessarily correct in Java 9
+    //@TODO hard coding this to 2 isn't necessarily correct in Java 11
     public static long sizeOf(String str)
     {
         return STRING_EMPTY_SIZE + sizeOfArray(str.length(), 2);

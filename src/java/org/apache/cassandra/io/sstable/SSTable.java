@@ -23,6 +23,7 @@ import java.nio.charset.Charset;
 import java.util.*;
 import java.util.concurrent.CopyOnWriteArraySet;
 
+import com.google.common.base.Preconditions;
 import com.google.common.base.Predicates;
 import com.google.common.collect.Collections2;
 import com.google.common.collect.Sets;
@@ -45,6 +46,9 @@ import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.memory.HeapAllocator;
+
+import static org.apache.cassandra.service.ActiveRepairService.NO_PENDING_REPAIR;
+import static org.apache.cassandra.service.ActiveRepairService.UNREPAIRED_SSTABLE;
 
 /**
  * This class is built on top of the SequenceFile. It stores
@@ -104,7 +108,7 @@ public abstract class SSTable
      */
     public static boolean delete(Descriptor desc, Set<Component> components)
     {
-        logger.debug("Deleting sstable: {}", desc);
+        logger.info("Deleting sstable: {}", desc);
         // remove the DATA component first if it exists
         if (components.contains(Component.DATA))
             FileUtils.deleteWithConfirm(desc.filenameFor(Component.DATA));
@@ -261,7 +265,7 @@ public abstract class SSTable
     }
 
     /** @return An estimate of the number of keys contained in the given index file. */
-    protected long estimateRowsFromIndex(RandomAccessReader ifile) throws IOException
+    public static long estimateRowsFromIndex(RandomAccessReader ifile, Descriptor descriptor) throws IOException
     {
         // collect sizes for the first 10000 keys, or first 10 megabytes of data
         final int SAMPLES_CAP = 10000, BYTES_CAP = (int)Math.min(10000000, ifile.length());
@@ -302,13 +306,23 @@ public abstract class SSTable
      */
     protected static Set<Component> readTOC(Descriptor descriptor) throws IOException
     {
+        return readTOC(descriptor, true);
+    }
+
+    /**
+     * Reads the list of components from the TOC component.
+     * @param skipMissing, skip adding the component to the returned set if the corresponding file is missing.
+     * @return set of components found in the TOC
+     */
+    protected static Set<Component> readTOC(Descriptor descriptor, boolean skipMissing) throws IOException
+    {
         File tocFile = new File(descriptor.filenameFor(Component.TOC));
         List<String> componentNames = Files.readLines(tocFile, Charset.defaultCharset());
         Set<Component> components = Sets.newHashSetWithExpectedSize(componentNames.size());
         for (String componentName : componentNames)
         {
             Component component = new Component(Component.Type.fromRepresentation(componentName), componentName);
-            if (!new File(descriptor.filenameFor(component)).exists())
+            if (skipMissing && !new File(descriptor.filenameFor(component)).exists())
                 logger.error("Missing component: {}", descriptor.filenameFor(component));
             else
                 components.add(component);
@@ -349,5 +363,14 @@ public abstract class SSTable
     public AbstractBounds<Token> getBounds()
     {
         return AbstractBounds.bounds(first.getToken(), true, last.getToken(), true);
+    }
+
+    public static void validateRepairedMetadata(long repairedAt, UUID pendingRepair, boolean isTransient)
+    {
+        Preconditions.checkArgument((pendingRepair == NO_PENDING_REPAIR) || (repairedAt == UNREPAIRED_SSTABLE),
+                                    "pendingRepair cannot be set on a repaired sstable");
+        Preconditions.checkArgument(!isTransient || (pendingRepair != NO_PENDING_REPAIR),
+                                    "isTransient can only be true for sstables pending repair");
+
     }
 }

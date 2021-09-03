@@ -15,12 +15,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.cassandra.auth;
 
-/**
- * Retained since CASSANDRA-7715 for backwards compatibility of MBean interface
- * classes. This should be removed in the next major version (4.0)
- */
 public interface PermissionsCacheMBean extends AuthCacheMBean
 {
+    public static final String CACHE_NAME = "PermissionsCache";
+
+    public void invalidatePermissions(String userName, String resourceName);
 }

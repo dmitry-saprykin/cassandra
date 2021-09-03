@@ -44,7 +44,7 @@ public class Client extends SimpleClient
 
     public Client(String host, int port, ProtocolVersion version, EncryptionOptions encryptionOptions)
     {
-        super(host, port, version, encryptionOptions);
+        super(host, port, version, version.isBeta(), new EncryptionOptions(encryptionOptions).applyConfig());
         setEventHandler(eventHandler);
     }
 
@@ -111,7 +111,17 @@ public class Client extends SimpleClient
                if (next.toLowerCase().equals("snappy"))
                {
                    options.put(StartupMessage.COMPRESSION, "snappy");
-                   connection.setCompressor(FrameCompressor.SnappyCompressor.instance);
+                   connection.setCompressor(Compressor.SnappyCompressor.instance);
+               }
+               if (next.toLowerCase().equals("lz4"))
+               {
+                   options.put(StartupMessage.COMPRESSION, "lz4");
+                   connection.setCompressor(Compressor.LZ4Compressor.instance);
+               }
+               if (next.toLowerCase().equals("throw_on_overload"))
+               {
+                   options.put(StartupMessage.THROW_ON_OVERLOAD, "1");
+                   connection.setThrowOnOverload(true);
                }
             }
             return new StartupMessage(options);
@@ -245,9 +255,9 @@ public class Client extends SimpleClient
         // Parse options.
         String host = args[0];
         int port = Integer.parseInt(args[1]);
-        ProtocolVersion version = args.length == 3 ? ProtocolVersion.decode(Integer.parseInt(args[2])) : ProtocolVersion.CURRENT;
+        ProtocolVersion version = args.length == 3 ? ProtocolVersion.decode(Integer.parseInt(args[2]), DatabaseDescriptor.getNativeTransportAllowOlderProtocols()) : ProtocolVersion.CURRENT;
 
-        EncryptionOptions encryptionOptions = new EncryptionOptions();
+        EncryptionOptions encryptionOptions = new EncryptionOptions().applyConfig();
         System.out.println("CQL binary protocol console " + host + "@" + port + " using native protocol version " + version);
 
         new Client(host, port, version, encryptionOptions).run();

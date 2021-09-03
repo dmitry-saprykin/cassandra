@@ -17,8 +17,8 @@
  */
 package org.apache.cassandra.db.rows;
 
-import com.google.common.hash.Hasher;
-
+import org.apache.cassandra.db.ClusteringPrefix;
+import org.apache.cassandra.db.Digest;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.db.Clusterable;
 
@@ -28,22 +28,29 @@ import org.apache.cassandra.db.Clusterable;
  * In practice, an Unfiltered is either a row or a range tombstone marker. Unfiltereds
  * are uniquely identified by their clustering information and can be sorted according
  * to those.
+ *
+ * We don't set the type parameter for Clusterable here because it doesn't make sense in
+ * the context of an Unfiltered. Merge iterators can produce rows containing clustering
+ * and cell values with multiple backing types. Also, by the time you're dealing with
+ * Unfiltered objects, the backing type should be considered opaque.
  */
 public interface Unfiltered extends Clusterable
 {
-    public enum Kind { ROW, RANGE_TOMBSTONE_MARKER };
+    public enum Kind { ROW, RANGE_TOMBSTONE_MARKER }
 
     /**
      * The kind of the atom: either row or range tombstone marker.
      */
     public Kind kind();
 
+    ClusteringPrefix<?> clustering();
+
     /**
-     * Digest the atom using the provided {@link Hasher}.
+     * Digest the atom using the provided {@link Digest}.
      *
-     * @param hasher the {@see Hasher} to use.
+     * @param digest the {@see Digest} to use.
      */
-    public void digest(Hasher hasher);
+    public void digest(Digest digest);
 
     /**
      * Validate the data of this atom.
@@ -55,6 +62,12 @@ public interface Unfiltered extends Clusterable
      */
     public void validateData(TableMetadata metadata);
 
+    /**
+     * Do a quick validation of the deletions of the unfiltered (if any)
+     *
+     * @return true if any deletion is invalid
+     */
+    public boolean hasInvalidDeletions();
     public boolean isEmpty();
 
     public String toString(TableMetadata metadata);

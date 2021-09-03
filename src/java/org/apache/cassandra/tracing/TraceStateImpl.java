@@ -31,7 +31,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.concurrent.Stage;
-import org.apache.cassandra.concurrent.StageManager;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.exceptions.OverloadedException;
@@ -108,7 +107,7 @@ public class TraceStateImpl extends TraceState
             {
                 mutateWithCatch(mutation);
             }
-        }, StageManager.getStage(Stage.TRACING));
+        }, Stage.TRACING.executor());
 
         boolean ret = pendingFutures.add(fut);
         if (!ret)

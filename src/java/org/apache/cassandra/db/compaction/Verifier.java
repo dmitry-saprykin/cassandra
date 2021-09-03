@@ -17,16 +17,20 @@
  */
 package org.apache.cassandra.db.compaction;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Throwables;
+import com.google.common.collect.ImmutableSet;
 
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 
+import org.apache.cassandra.dht.LocalPartitioner;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.CorruptSSTableException;
 import org.apache.cassandra.io.sstable.IndexSummary;
+import org.apache.cassandra.io.sstable.KeyIterator;
 import org.apache.cassandra.io.sstable.SSTableIdentityIterator;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.metadata.MetadataComponent;
@@ -54,10 +58,14 @@ import java.io.IOError;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Function;
 import java.util.function.LongPredicate;
-import java.util.function.Predicate;
 
 public class Verifier implements Closeable
 {
@@ -66,13 +74,19 @@ public class Verifier implements Closeable
 
     private final CompactionController controller;
 
-
+    private final ReadWriteLock fileAccessLock;
     private final RandomAccessReader dataFile;
     private final RandomAccessReader indexFile;
     private final VerifyInfo verifyInfo;
     private final RowIndexEntry.IndexSerializer rowIndexEntrySerializer;
     private final Options options;
     private final boolean isOffline;
+    /**
+     * Given a keyspace, return the set of local and pending token ranges.  By default {@link StorageService#getLocalAndPendingRanges(String)}
+     * is expected, but for the standalone verifier case we can't use that, so this is here to allow the CLI to provide
+     * the token ranges.
+     */
+    private final Function<String, ? extends Collection<Range<Token>>> tokenLookup;
 
     private int goodRows;
 
@@ -93,13 +107,15 @@ public class Verifier implements Closeable
 
         this.controller = new VerifyController(cfs);
 
+        this.fileAccessLock = new ReentrantReadWriteLock();
         this.dataFile = isOffline
                         ? sstable.openDataReader()
                         : sstable.openDataReader(CompactionManager.instance.getRateLimiter());
         this.indexFile = RandomAccessReader.open(new File(sstable.descriptor.filenameFor(Component.PRIMARY_INDEX)));
-        this.verifyInfo = new VerifyInfo(dataFile, sstable);
+        this.verifyInfo = new VerifyInfo(dataFile, sstable, fileAccessLock.readLock());
         this.options = options;
         this.isOffline = isOffline;
+        this.tokenLookup = options.tokenLookup;
     }
 
     public void verify()
@@ -127,48 +143,72 @@ public class Verifier implements Closeable
         }
         catch (Throwable t)
         {
-            outputHandler.debug(t.getMessage());
-            markAndThrow(false);
+            outputHandler.warn(t);
+            markAndThrow(t, false);
         }
-        outputHandler.output(String.format("Checking computed hash of %s ", sstable));
 
         try
         {
+            outputHandler.debug("Deserializing index for "+sstable);
             deserializeIndex(sstable);
         }
         catch (Throwable t)
         {
-            outputHandler.debug(t.getMessage());
-            markAndThrow();
+            outputHandler.warn(t);
+            markAndThrow(t);
         }
 
         try
         {
+            outputHandler.debug("Deserializing index summary for "+sstable);
             deserializeIndexSummary(sstable);
-
         }
         catch (Throwable t)
         {
             outputHandler.output("Index summary is corrupt - if it is removed it will get rebuilt on startup "+sstable.descriptor.filenameFor(Component.SUMMARY));
-            outputHandler.debug(t.getMessage());
-            markAndThrow(false);
+            outputHandler.warn(t);
+            markAndThrow(t, false);
         }
 
         try
         {
+            outputHandler.debug("Deserializing bloom filter for "+sstable);
             deserializeBloomFilter(sstable);
 
         }
         catch (Throwable t)
         {
-            outputHandler.debug(t.getMessage());
-            markAndThrow();
+            outputHandler.warn(t);
+            markAndThrow(t);
+        }
+
+        if (options.checkOwnsTokens && !isOffline && !(cfs.getPartitioner() instanceof LocalPartitioner))
+        {
+            outputHandler.debug("Checking that all tokens are owned by the current node");
+            try (KeyIterator iter = new KeyIterator(sstable.descriptor, sstable.metadata()))
+            {
+                List<Range<Token>> ownedRanges = Range.normalize(tokenLookup.apply(cfs.metadata.keyspace));
+                if (ownedRanges.isEmpty())
+                    return;
+                RangeOwnHelper rangeOwnHelper = new RangeOwnHelper(ownedRanges);
+                while (iter.hasNext())
+                {
+                    DecoratedKey key = iter.next();
+                    rangeOwnHelper.validate(key);
+                }
+            }
+            catch (Throwable t)
+            {
+                outputHandler.warn(t);
+                markAndThrow(t);
+            }
         }
 
         if (options.quick)
             return;
 
         // Verify will use the Digest files, which works for both compressed and uncompressed sstables
+        outputHandler.output(String.format("Checking computed hash of %s ", sstable));
         try
         {
             validator = null;
@@ -186,19 +226,18 @@ public class Verifier implements Closeable
         }
         catch (IOException e)
         {
-            outputHandler.debug(e.getMessage());
-            markAndThrow();
+            outputHandler.warn(e);
+            markAndThrow(e);
         }
         finally
         {
             FileUtils.closeQuietly(validator);
         }
 
-        if ( !extended )
+        if (!extended)
             return;
 
         outputHandler.output("Extended Verify requested, proceeding to inspect values");
-
 
         try
         {
@@ -206,11 +245,11 @@ public class Verifier implements Closeable
             {
                 long firstRowPositionFromIndex = rowIndexEntrySerializer.deserializePositionAndSkip(indexFile);
                 if (firstRowPositionFromIndex != 0)
-                    markAndThrow();
+                    markAndThrow(new RuntimeException("firstRowPositionFromIndex != 0: "+firstRowPositionFromIndex));
             }
 
-            List<Range<Token>> ownedRanges = isOffline ? Collections.emptyList() : Range.normalize(StorageService.instance.getLocalAndPendingRanges(cfs.metadata().keyspace));
-            int rangeIndex = -1;
+            List<Range<Token>> ownedRanges = isOffline ? Collections.emptyList() : Range.normalize(tokenLookup.apply(cfs.metadata().keyspace));
+            RangeOwnHelper rangeOwnHelper = new RangeOwnHelper(ownedRanges);
             DecoratedKey prevKey = null;
 
             while (!dataFile.isEOF())
@@ -233,13 +272,16 @@ public class Verifier implements Closeable
                     // check for null key below
                 }
 
-                if (options.checkOwnsTokens && ownedRanges.size() > 0)
+                if (options.checkOwnsTokens && ownedRanges.size() > 0 && !(cfs.getPartitioner() instanceof LocalPartitioner))
                 {
-                    while (rangeIndex == -1 || !ownedRanges.get(rangeIndex).contains(key.getToken()))
+                    try
                     {
-                        rangeIndex++;
-                        if (rangeIndex > ownedRanges.size() - 1)
-                            throw new RuntimeException(String.format("Key %s in sstable %s not owned by local ranges %s", key, sstable, ownedRanges));
+                        rangeOwnHelper.validate(key);
+                    }
+                    catch (Throwable t)
+                    {
+                        outputHandler.warn(String.format("Key %s in sstable %s not owned by local ranges %s", key, sstable, ownedRanges), t);
+                        markAndThrow(t);
                     }
                 }
 
@@ -254,7 +296,7 @@ public class Verifier implements Closeable
                 }
                 catch (Throwable th)
                 {
-                    markAndThrow();
+                    markAndThrow(th);
                 }
 
                 long dataStart = dataFile.getFilePointer();
@@ -272,7 +314,7 @@ public class Verifier implements Closeable
                 try
                 {
                     if (key == null || dataSize > dataFile.length())
-                        markAndThrow();
+                        markAndThrow(new RuntimeException(String.format("key = %s, dataSize=%d, dataFile.length() = %d", key, dataSize, dataFile.length())));
 
                     //mimic the scrub read path, intentionally unused
                     try (UnfilteredRowIterator iterator = SSTableIdentityIterator.create(sstable, dataFile, key))
@@ -280,7 +322,7 @@ public class Verifier implements Closeable
                     }
 
                     if ( (prevKey != null && prevKey.compareTo(key) > 0) || !key.getKey().equals(currentIndexKey) || dataStart != dataStartFromIndex )
-                        markAndThrow();
+                        markAndThrow(new RuntimeException("Key out of order: previous = "+prevKey + " : current = " + key));
                     
                     goodRows++;
                     prevKey = key;
@@ -291,7 +333,7 @@ public class Verifier implements Closeable
                 }
                 catch (Throwable th)
                 {
-                    markAndThrow();
+                    markAndThrow(th);
                 }
             }
         }
@@ -305,6 +347,68 @@ public class Verifier implements Closeable
         }
 
         outputHandler.output("Verify of " + sstable + " succeeded. All " + goodRows + " rows read successfully");
+    }
+
+    /**
+     * Use the fact that check(..) is called with sorted tokens - we keep a pointer in to the normalized ranges
+     * and only bump the pointer if the key given is out of range. This is done to avoid calling .contains(..) many
+     * times for each key (with vnodes for example)
+     */
+    @VisibleForTesting
+    public static class RangeOwnHelper
+    {
+        private final List<Range<Token>> normalizedRanges;
+        private int rangeIndex = 0;
+        private DecoratedKey lastKey;
+
+        public RangeOwnHelper(List<Range<Token>> normalizedRanges)
+        {
+            this.normalizedRanges = normalizedRanges;
+            Range.assertNormalized(normalizedRanges);
+        }
+
+        /**
+         * check if the given key is contained in any of the given ranges
+         *
+         * Must be called in sorted order - key should be increasing
+         *
+         * @param key the key
+         * @throws RuntimeException if the key is not contained
+         */
+        public void validate(DecoratedKey key)
+        {
+            if (!check(key))
+                throw new RuntimeException("Key " + key + " is not contained in the given ranges");
+        }
+
+        /**
+         * check if the given key is contained in any of the given ranges
+         *
+         * Must be called in sorted order - key should be increasing
+         *
+         * @param key the key
+         * @return boolean
+         */
+        public boolean check(DecoratedKey key)
+        {
+            assert lastKey == null || key.compareTo(lastKey) > 0;
+            lastKey = key;
+
+            if (normalizedRanges.isEmpty()) // handle tests etc where we don't have any ranges
+                return true;
+
+            if (rangeIndex > normalizedRanges.size() - 1)
+                throw new IllegalStateException("RangeOwnHelper can only be used to find the first out-of-range-token");
+
+            while (!normalizedRanges.get(rangeIndex).contains(key.getToken()))
+            {
+                rangeIndex++;
+                if (rangeIndex > normalizedRanges.size() - 1)
+                    return false;
+            }
+
+            return true;
+        }
     }
 
     private void deserializeIndex(SSTableReader sstable) throws IOException
@@ -340,15 +444,28 @@ public class Verifier implements Closeable
 
     private void deserializeBloomFilter(SSTableReader sstable) throws IOException
     {
-        try (DataInputStream stream = new DataInputStream(new BufferedInputStream(Files.newInputStream(Paths.get(sstable.descriptor.filenameFor(Component.FILTER)))));
-             IFilter bf = BloomFilterSerializer.deserialize(stream, sstable.descriptor.version.hasOldBfFormat()))
-        {}
+        Path bfPath = Paths.get(sstable.descriptor.filenameFor(Component.FILTER));
+        if (Files.exists(bfPath))
+        {
+            try (DataInputStream stream = new DataInputStream(new BufferedInputStream(Files.newInputStream(bfPath)));
+                 IFilter bf = BloomFilterSerializer.deserialize(stream, sstable.descriptor.version.hasOldBfFormat()))
+            {
+            }
+        }
     }
 
     public void close()
     {
-        FileUtils.closeQuietly(dataFile);
-        FileUtils.closeQuietly(indexFile);
+        fileAccessLock.writeLock().lock();
+        try
+        {
+            FileUtils.closeQuietly(dataFile);
+            FileUtils.closeQuietly(indexFile);
+        }
+        finally
+        {
+            fileAccessLock.writeLock().unlock();
+        }
     }
 
     private void throwIfFatal(Throwable th)
@@ -357,19 +474,18 @@ public class Verifier implements Closeable
             throw (Error) th;
     }
 
-    private void markAndThrow()
+    private void markAndThrow(Throwable cause)
     {
-        markAndThrow(true);
+        markAndThrow(cause, true);
     }
 
-    private void markAndThrow(boolean mutateRepaired)
+    private void markAndThrow(Throwable cause, boolean mutateRepaired)
     {
         if (mutateRepaired && options.mutateRepairStatus) // if we are able to mutate repaired flag, an incremental repair should be enough
         {
             try
             {
-                sstable.descriptor.getMetadataSerializer().mutateRepaired(sstable.descriptor, ActiveRepairService.UNREPAIRED_SSTABLE, sstable.getSSTableMetadata().pendingRepair);
-                sstable.reloadSSTableMetadata();
+                sstable.mutateRepairedAndReload(ActiveRepairService.UNREPAIRED_SSTABLE, sstable.getPendingRepair(), sstable.isTransient());
                 cfs.getTracker().notifySSTableRepairedStatusChanged(Collections.singleton(sstable));
             }
             catch(IOException ioe)
@@ -377,7 +493,7 @@ public class Verifier implements Closeable
                 outputHandler.output("Error mutating repairedAt for SSTable " +  sstable.getFilename() + ", as part of markAndThrow");
             }
         }
-        Exception e = new Exception(String.format("Invalid SSTable %s, please force %srepair", sstable.getFilename(), (mutateRepaired && options.mutateRepairStatus) ? "" : "a full "));
+        Exception e = new Exception(String.format("Invalid SSTable %s, please force %srepair", sstable.getFilename(), (mutateRepaired && options.mutateRepairStatus) ? "" : "a full "), cause);
         if (options.invokeDiskFailurePolicy)
             throw new CorruptSSTableException(e, sstable.getFilename());
         else
@@ -394,28 +510,41 @@ public class Verifier implements Closeable
         private final RandomAccessReader dataFile;
         private final SSTableReader sstable;
         private final UUID verificationCompactionId;
+        private final Lock fileReadLock;
 
-        public VerifyInfo(RandomAccessReader dataFile, SSTableReader sstable)
+        public VerifyInfo(RandomAccessReader dataFile, SSTableReader sstable, Lock fileReadLock)
         {
             this.dataFile = dataFile;
             this.sstable = sstable;
+            this.fileReadLock = fileReadLock;
             verificationCompactionId = UUIDGen.getTimeUUID();
         }
 
         public CompactionInfo getCompactionInfo()
         {
+            fileReadLock.lock();
             try
             {
                 return new CompactionInfo(sstable.metadata(),
                                           OperationType.VERIFY,
                                           dataFile.getFilePointer(),
                                           dataFile.length(),
-                                          verificationCompactionId);
+                                          verificationCompactionId,
+                                          ImmutableSet.of(sstable));
             }
             catch (Exception e)
             {
                 throw new RuntimeException();
             }
+            finally
+            {
+                fileReadLock.unlock();
+            }
+        }
+
+        public boolean isGlobal()
+        {
+            return false;
         }
     }
 
@@ -446,8 +575,9 @@ public class Verifier implements Closeable
         public final boolean mutateRepairStatus;
         public final boolean checkOwnsTokens;
         public final boolean quick;
+        public final Function<String, ? extends Collection<Range<Token>>> tokenLookup;
 
-        private Options(boolean invokeDiskFailurePolicy, boolean extendedVerification, boolean checkVersion, boolean mutateRepairStatus, boolean checkOwnsTokens, boolean quick)
+        private Options(boolean invokeDiskFailurePolicy, boolean extendedVerification, boolean checkVersion, boolean mutateRepairStatus, boolean checkOwnsTokens, boolean quick, Function<String, ? extends Collection<Range<Token>>> tokenLookup)
         {
             this.invokeDiskFailurePolicy = invokeDiskFailurePolicy;
             this.extendedVerification = extendedVerification;
@@ -455,6 +585,7 @@ public class Verifier implements Closeable
             this.mutateRepairStatus = mutateRepairStatus;
             this.checkOwnsTokens = checkOwnsTokens;
             this.quick = quick;
+            this.tokenLookup = tokenLookup;
         }
 
         @Override
@@ -478,6 +609,7 @@ public class Verifier implements Closeable
             private boolean mutateRepairStatus = false; // mutating repair status can be dangerous
             private boolean checkOwnsTokens = false;
             private boolean quick = false;
+            private Function<String, ? extends Collection<Range<Token>>> tokenLookup = StorageService.instance::getLocalAndPendingRanges;
 
             public Builder invokeDiskFailurePolicy(boolean param)
             {
@@ -515,9 +647,15 @@ public class Verifier implements Closeable
                 return this;
             }
 
+            public Builder tokenLookup(Function<String, ? extends Collection<Range<Token>>> tokenLookup)
+            {
+                this.tokenLookup = tokenLookup;
+                return this;
+            }
+
             public Options build()
             {
-                return new Options(invokeDiskFailurePolicy, extendedVerification, checkVersion, mutateRepairStatus, checkOwnsTokens, quick);
+                return new Options(invokeDiskFailurePolicy, extendedVerification, checkVersion, mutateRepairStatus, checkOwnsTokens, quick, tokenLookup);
             }
 
         }

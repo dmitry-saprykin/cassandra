@@ -50,7 +50,7 @@ public class Scrub extends NodeToolCmd
     private boolean noValidation = false;
 
     @Option(title = "reinsert_overflowed_ttl",
-    name = {"r", "--reinsert-overflowed-ttl"},
+    name = {"-r", "--reinsert-overflowed-ttl"},
     description = StandaloneScrubber.REINSERT_OVERFLOWED_TTL_OPTION_DESCRIPTION)
     private boolean reinsertOverflowedTTL = false;
 
@@ -69,7 +69,7 @@ public class Scrub extends NodeToolCmd
         {
             try
             {
-                probe.scrub(System.out, disableSnapshot, skipCorrupted, !noValidation, reinsertOverflowedTTL, jobs, keyspace, tableNames);
+                probe.scrub(probe.output().out, disableSnapshot, skipCorrupted, !noValidation, reinsertOverflowedTTL, jobs, keyspace, tableNames);
             }
             catch (IllegalArgumentException e)
             {

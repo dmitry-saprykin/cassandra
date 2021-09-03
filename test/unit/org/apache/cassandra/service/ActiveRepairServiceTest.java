@@ -18,37 +18,56 @@
 */
 package org.apache.cassandra.service;
 
-import java.util.*;
-
-import javax.xml.crypto.Data;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Condition;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Sets;
+import com.google.common.util.concurrent.Uninterruptibles;
+
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.SchemaLoader;
+import org.apache.cassandra.Util;
+import org.apache.cassandra.concurrent.DebuggableThreadPoolExecutor;
+import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.RowUpdateBuilder;
 import org.apache.cassandra.db.lifecycle.SSTableSet;
 import org.apache.cassandra.db.lifecycle.View;
-import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.locator.AbstractReplicationStrategy;
 import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.locator.Replica;
 import org.apache.cassandra.locator.TokenMetadata;
 import org.apache.cassandra.repair.messages.RepairOption;
-import org.apache.cassandra.streaming.PreviewKind;
 import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.streaming.PreviewKind;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.concurrent.Refs;
+import org.apache.cassandra.utils.concurrent.SimpleCondition;
 
 import static org.apache.cassandra.repair.messages.RepairOption.DATACENTERS_KEY;
 import static org.apache.cassandra.repair.messages.RepairOption.FORCE_REPAIR_KEY;
@@ -66,6 +85,7 @@ public class ActiveRepairServiceTest
     public static final String KEYSPACE5 = "Keyspace5";
     public static final String CF_STANDARD1 = "Standard1";
     public static final String CF_COUNTER = "Counter1";
+    public static final int TASK_SECONDS = 10;
 
     public String cfname;
     public ColumnFamilyStore store;
@@ -107,13 +127,13 @@ public class ActiveRepairServiceTest
     public void testGetNeighborsPlusOne() throws Throwable
     {
         // generate rf+1 nodes, and ensure that all nodes are returned
-        Set<InetAddressAndPort> expected = addTokens(1 + Keyspace.open(KEYSPACE5).getReplicationStrategy().getReplicationFactor());
+        Set<InetAddressAndPort> expected = addTokens(1 + Keyspace.open(KEYSPACE5).getReplicationStrategy().getReplicationFactor().allReplicas);
         expected.remove(FBUtilities.getBroadcastAddressAndPort());
-        Collection<Range<Token>> ranges = StorageService.instance.getLocalRanges(KEYSPACE5);
+        Iterable<Range<Token>> ranges = StorageService.instance.getLocalReplicas(KEYSPACE5).ranges();
         Set<InetAddressAndPort> neighbors = new HashSet<>();
         for (Range<Token> range : ranges)
         {
-            neighbors.addAll(ActiveRepairService.getNeighbors(KEYSPACE5, ranges, range, null, null));
+            neighbors.addAll(ActiveRepairService.getNeighbors(KEYSPACE5, ranges, range, null, null).endpoints());
         }
         assertEquals(expected, neighbors);
     }
@@ -124,19 +144,19 @@ public class ActiveRepairServiceTest
         TokenMetadata tmd = StorageService.instance.getTokenMetadata();
 
         // generate rf*2 nodes, and ensure that only neighbors specified by the ARS are returned
-        addTokens(2 * Keyspace.open(KEYSPACE5).getReplicationStrategy().getReplicationFactor());
+        addTokens(2 * Keyspace.open(KEYSPACE5).getReplicationStrategy().getReplicationFactor().allReplicas);
         AbstractReplicationStrategy ars = Keyspace.open(KEYSPACE5).getReplicationStrategy();
         Set<InetAddressAndPort> expected = new HashSet<>();
-        for (Range<Token> replicaRange : ars.getAddressRanges().get(FBUtilities.getBroadcastAddressAndPort()))
+        for (Replica replica : ars.getAddressReplicas().get(FBUtilities.getBroadcastAddressAndPort()))
         {
-            expected.addAll(ars.getRangeAddresses(tmd.cloneOnlyTokenMap()).get(replicaRange));
+            expected.addAll(ars.getRangeAddresses(tmd.cloneOnlyTokenMap()).get(replica.range()).endpoints());
         }
         expected.remove(FBUtilities.getBroadcastAddressAndPort());
-        Collection<Range<Token>> ranges = StorageService.instance.getLocalRanges(KEYSPACE5);
+        Iterable<Range<Token>> ranges = StorageService.instance.getLocalReplicas(KEYSPACE5).ranges();
         Set<InetAddressAndPort> neighbors = new HashSet<>();
         for (Range<Token> range : ranges)
         {
-            neighbors.addAll(ActiveRepairService.getNeighbors(KEYSPACE5, ranges, range, null, null));
+            neighbors.addAll(ActiveRepairService.getNeighbors(KEYSPACE5, ranges, range, null, null).endpoints());
         }
         assertEquals(expected, neighbors);
     }
@@ -147,18 +167,18 @@ public class ActiveRepairServiceTest
         TokenMetadata tmd = StorageService.instance.getTokenMetadata();
 
         // generate rf+1 nodes, and ensure that all nodes are returned
-        Set<InetAddressAndPort> expected = addTokens(1 + Keyspace.open(KEYSPACE5).getReplicationStrategy().getReplicationFactor());
+        Set<InetAddressAndPort> expected = addTokens(1 + Keyspace.open(KEYSPACE5).getReplicationStrategy().getReplicationFactor().allReplicas);
         expected.remove(FBUtilities.getBroadcastAddressAndPort());
         // remove remote endpoints
         TokenMetadata.Topology topology = tmd.cloneOnlyTokenMap().getTopology();
         HashSet<InetAddressAndPort> localEndpoints = Sets.newHashSet(topology.getDatacenterEndpoints().get(DatabaseDescriptor.getLocalDataCenter()));
         expected = Sets.intersection(expected, localEndpoints);
 
-        Collection<Range<Token>> ranges = StorageService.instance.getLocalRanges(KEYSPACE5);
+        Iterable<Range<Token>> ranges = StorageService.instance.getLocalReplicas(KEYSPACE5).ranges();
         Set<InetAddressAndPort> neighbors = new HashSet<>();
         for (Range<Token> range : ranges)
         {
-            neighbors.addAll(ActiveRepairService.getNeighbors(KEYSPACE5, ranges, range, Arrays.asList(DatabaseDescriptor.getLocalDataCenter()), null));
+            neighbors.addAll(ActiveRepairService.getNeighbors(KEYSPACE5, ranges, range, Arrays.asList(DatabaseDescriptor.getLocalDataCenter()), null).endpoints());
         }
         assertEquals(expected, neighbors);
     }
@@ -169,12 +189,12 @@ public class ActiveRepairServiceTest
         TokenMetadata tmd = StorageService.instance.getTokenMetadata();
 
         // generate rf*2 nodes, and ensure that only neighbors specified by the ARS are returned
-        addTokens(2 * Keyspace.open(KEYSPACE5).getReplicationStrategy().getReplicationFactor());
+        addTokens(2 * Keyspace.open(KEYSPACE5).getReplicationStrategy().getReplicationFactor().allReplicas);
         AbstractReplicationStrategy ars = Keyspace.open(KEYSPACE5).getReplicationStrategy();
         Set<InetAddressAndPort> expected = new HashSet<>();
-        for (Range<Token> replicaRange : ars.getAddressRanges().get(FBUtilities.getBroadcastAddressAndPort()))
+        for (Replica replica : ars.getAddressReplicas().get(FBUtilities.getBroadcastAddressAndPort()))
         {
-            expected.addAll(ars.getRangeAddresses(tmd.cloneOnlyTokenMap()).get(replicaRange));
+            expected.addAll(ars.getRangeAddresses(tmd.cloneOnlyTokenMap()).get(replica.range()).endpoints());
         }
         expected.remove(FBUtilities.getBroadcastAddressAndPort());
         // remove remote endpoints
@@ -182,11 +202,11 @@ public class ActiveRepairServiceTest
         HashSet<InetAddressAndPort> localEndpoints = Sets.newHashSet(topology.getDatacenterEndpoints().get(DatabaseDescriptor.getLocalDataCenter()));
         expected = Sets.intersection(expected, localEndpoints);
 
-        Collection<Range<Token>> ranges = StorageService.instance.getLocalRanges(KEYSPACE5);
+        Iterable<Range<Token>> ranges = StorageService.instance.getLocalReplicas(KEYSPACE5).ranges();
         Set<InetAddressAndPort> neighbors = new HashSet<>();
         for (Range<Token> range : ranges)
         {
-            neighbors.addAll(ActiveRepairService.getNeighbors(KEYSPACE5, ranges, range, Arrays.asList(DatabaseDescriptor.getLocalDataCenter()), null));
+            neighbors.addAll(ActiveRepairService.getNeighbors(KEYSPACE5, ranges, range, Arrays.asList(DatabaseDescriptor.getLocalDataCenter()), null).endpoints());
         }
         assertEquals(expected, neighbors);
     }
@@ -197,30 +217,30 @@ public class ActiveRepairServiceTest
         TokenMetadata tmd = StorageService.instance.getTokenMetadata();
 
         // generate rf*2 nodes, and ensure that only neighbors specified by the hosts are returned
-        addTokens(2 * Keyspace.open(KEYSPACE5).getReplicationStrategy().getReplicationFactor());
+        addTokens(2 * Keyspace.open(KEYSPACE5).getReplicationStrategy().getReplicationFactor().allReplicas);
         AbstractReplicationStrategy ars = Keyspace.open(KEYSPACE5).getReplicationStrategy();
         List<InetAddressAndPort> expected = new ArrayList<>();
-        for (Range<Token> replicaRange : ars.getAddressRanges().get(FBUtilities.getBroadcastAddressAndPort()))
+        for (Replica replicas : ars.getAddressReplicas().get(FBUtilities.getBroadcastAddressAndPort()))
         {
-            expected.addAll(ars.getRangeAddresses(tmd.cloneOnlyTokenMap()).get(replicaRange));
+            expected.addAll(ars.getRangeAddresses(tmd.cloneOnlyTokenMap()).get(replicas.range()).endpoints());
         }
 
         expected.remove(FBUtilities.getBroadcastAddressAndPort());
-        Collection<String> hosts = Arrays.asList(FBUtilities.getBroadcastAddressAndPort().toString(),expected.get(0).toString());
-        Collection<Range<Token>> ranges = StorageService.instance.getLocalRanges(KEYSPACE5);
+        Collection<String> hosts = Arrays.asList(FBUtilities.getBroadcastAddressAndPort().getHostAddressAndPort(),expected.get(0).getHostAddressAndPort());
+        Iterable<Range<Token>> ranges = StorageService.instance.getLocalReplicas(KEYSPACE5).ranges();
 
         assertEquals(expected.get(0), ActiveRepairService.getNeighbors(KEYSPACE5, ranges,
                                                                        ranges.iterator().next(),
-                                                                       null, hosts).iterator().next());
+                                                                       null, hosts).endpoints().iterator().next());
     }
 
     @Test(expected = IllegalArgumentException.class)
     public void testGetNeighborsSpecifiedHostsWithNoLocalHost() throws Throwable
     {
-        addTokens(2 * Keyspace.open(KEYSPACE5).getReplicationStrategy().getReplicationFactor());
+        addTokens(2 * Keyspace.open(KEYSPACE5).getReplicationStrategy().getReplicationFactor().allReplicas);
         //Dont give local endpoint
         Collection<String> hosts = Arrays.asList("127.0.0.3");
-        Collection<Range<Token>> ranges = StorageService.instance.getLocalRanges(KEYSPACE5);
+        Iterable<Range<Token>> ranges = StorageService.instance.getLocalReplicas(KEYSPACE5).ranges();
         ActiveRepairService.getNeighbors(KEYSPACE5, ranges, ranges.iterator().next(), null, hosts);
     }
 
@@ -264,21 +284,19 @@ public class ActiveRepairServiceTest
         ColumnFamilyStore store = prepareColumnFamilyStore();
         UUID prsId = UUID.randomUUID();
         Set<SSTableReader> original = Sets.newHashSet(store.select(View.select(SSTableSet.CANONICAL, (s) -> !s.isRepaired())).sstables);
+        Collection<Range<Token>> ranges = Collections.singleton(new Range<>(store.getPartitioner().getMinimumToken(), store.getPartitioner().getMinimumToken()));
         ActiveRepairService.instance.registerParentRepairSession(prsId, FBUtilities.getBroadcastAddressAndPort(), Collections.singletonList(store),
-                                                                 Collections.singleton(new Range<>(store.getPartitioner().getMinimumToken(),
-                                                                                                   store.getPartitioner().getMinimumToken())),
-                                                                 true, System.currentTimeMillis(), true, PreviewKind.NONE);
-        ActiveRepairService.instance.getParentRepairSession(prsId).maybeSnapshot(store.metadata.id, prsId);
+                                                                 ranges, true, System.currentTimeMillis(), true, PreviewKind.NONE);
+        store.getRepairManager().snapshot(prsId.toString(), ranges, false);
 
         UUID prsId2 = UUID.randomUUID();
         ActiveRepairService.instance.registerParentRepairSession(prsId2, FBUtilities.getBroadcastAddressAndPort(),
                                                                  Collections.singletonList(store),
-                                                                 Collections.singleton(new Range<>(store.getPartitioner().getMinimumToken(),
-                                                                                                   store.getPartitioner().getMinimumToken())),
+                                                                 ranges,
                                                                  true, System.currentTimeMillis(),
                                                                  true, PreviewKind.NONE);
         createSSTables(store, 2);
-        ActiveRepairService.instance.getParentRepairSession(prsId).maybeSnapshot(store.metadata.id, prsId);
+        store.getRepairManager().snapshot(prsId.toString(), ranges, false);
         try (Refs<SSTableReader> refs = store.getSnapshotSSTableReaders(prsId.toString()))
         {
             assertEquals(original, Sets.newHashSet(refs.iterator()));
@@ -355,5 +373,117 @@ public class ActiveRepairServiceTest
 
         // full repair
         Assert.assertEquals(UNREPAIRED_SSTABLE, getRepairedAt(opts(INCREMENTAL_KEY, b2s(false)), false));
+    }
+
+    @Test
+    public void testRejectWhenPoolFullStrategy() throws InterruptedException
+    {
+        // Using RepairCommandPoolFullStrategy.reject, new threads are spawned up to
+        // repair_command_pool_size, at which point futher submissions are rejected
+        ExecutorService validationExecutor = ActiveRepairService.initializeExecutor(2, Config.RepairCommandPoolFullStrategy.reject);
+        try
+        {
+            Condition blocked = new SimpleCondition();
+            CountDownLatch completed = new CountDownLatch(2);
+
+            /*
+             * CASSANDRA-16685 This is a Java bug. When the underlying executor's queue is a SynchronousQueue, there can
+             * be races just after the ThreadPool's initialization while juggling and spinning up threads internally
+             * leading to false rejections. That queue needs a thread ready to pick up the task immediately or it will
+             * produce a reject exception upon 'offer()' method call on the executor's code. If the executor is still
+             * initializing or threads are not ready to take work you can get false rejections.
+             *
+             * A sleep has been added to give time to the thread pool to be ready to get work.
+             */
+            Thread.sleep(250);
+            validationExecutor.submit(new Task(blocked, completed));
+            validationExecutor.submit(new Task(blocked, completed));
+
+            try
+            {
+                validationExecutor.submit(new Task(blocked, completed));
+                Assert.fail("Expected task submission to be rejected");
+            }
+            catch (RejectedExecutionException e)
+            {
+                // expected
+            }
+
+            // allow executing tests to complete
+            blocked.signalAll();
+            completed.await(TASK_SECONDS + 1, TimeUnit.SECONDS);
+
+            // Submission is unblocked
+            Thread.sleep(250);
+            validationExecutor.submit(() -> {});
+        }
+        finally
+        {
+            // necessary to unregister mbean
+            validationExecutor.shutdownNow();
+        }
+    }
+
+    @Test
+    public void testQueueWhenPoolFullStrategy() throws InterruptedException
+    {
+        // Using RepairCommandPoolFullStrategy.queue, the pool is initialized to
+        // repair_command_pool_size and any tasks which cannot immediately be
+        // serviced are queued
+        ExecutorService validationExecutor = ActiveRepairService.initializeExecutor(2, Config.RepairCommandPoolFullStrategy.queue);
+        try
+        {
+            Condition allSubmitted = new SimpleCondition();
+            Condition blocked = new SimpleCondition();
+            CountDownLatch completed = new CountDownLatch(5);
+            ExecutorService testExecutor = Executors.newSingleThreadExecutor();
+            for (int i = 0; i < 5; i++)
+            {
+                if (i < 4)
+                    testExecutor.submit(() -> validationExecutor.submit(new Task(blocked, completed)));
+                else
+                    testExecutor.submit(() -> {
+                        validationExecutor.submit(new Task(blocked, completed));
+                        allSubmitted.signalAll();
+                    });
+            }
+
+            // Make sure all tasks have been submitted to the validation executor
+            allSubmitted.await(TASK_SECONDS + 1, TimeUnit.SECONDS);
+
+            // Give the tasks we expect to execute immediately chance to be scheduled
+            Util.spinAssertEquals(2 , ((DebuggableThreadPoolExecutor) validationExecutor)::getActiveTaskCount, 1);
+            Util.spinAssertEquals(3 , ((DebuggableThreadPoolExecutor) validationExecutor)::getPendingTaskCount, 1);
+
+            // verify that we've reached a steady state with 2 threads actively processing and 3 queued tasks
+            Assert.assertEquals(2, ((DebuggableThreadPoolExecutor) validationExecutor).getActiveTaskCount());
+            Assert.assertEquals(3, ((DebuggableThreadPoolExecutor) validationExecutor).getPendingTaskCount());
+            // allow executing tests to complete
+            blocked.signalAll();
+            completed.await(TASK_SECONDS + 1, TimeUnit.SECONDS);
+        }
+        finally
+        {
+            // necessary to unregister mbean
+            validationExecutor.shutdownNow();
+        }
+    }
+
+    private static class Task implements Runnable
+    {
+        private final Condition blocked;
+        private final CountDownLatch complete;
+
+        Task(Condition blocked, CountDownLatch complete)
+        {
+            this.blocked = blocked;
+            this.complete = complete;
+        }
+
+        public void run()
+        {
+            Uninterruptibles.awaitUninterruptibly(blocked, TASK_SECONDS, TimeUnit.SECONDS);
+            complete.countDown();
+        }
     }
 }

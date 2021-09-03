@@ -19,6 +19,7 @@ package org.apache.cassandra.cql3;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.stream.Collectors;
 
 import org.apache.cassandra.schema.ColumnMetadata;
@@ -46,7 +47,7 @@ import static org.apache.cassandra.cql3.statements.RequestValidations.invalidReq
  */
 public class MultiColumnRelation extends Relation
 {
-    private final List<ColumnMetadata.Raw> entities;
+    private final List<ColumnIdentifier> entities;
 
     /** A Tuples.Literal or Tuples.Raw marker */
     private final Term.MultiColumnRaw valuesOrMarker;
@@ -56,7 +57,7 @@ public class MultiColumnRelation extends Relation
 
     private final Tuples.INRaw inMarker;
 
-    private MultiColumnRelation(List<ColumnMetadata.Raw> entities, Operator relationType, Term.MultiColumnRaw valuesOrMarker, List<? extends Term.MultiColumnRaw> inValues, Tuples.INRaw inMarker)
+    private MultiColumnRelation(List<ColumnIdentifier> entities, Operator relationType, Term.MultiColumnRaw valuesOrMarker, List<? extends Term.MultiColumnRaw> inValues, Tuples.INRaw inMarker)
     {
         this.entities = entities;
         this.relationType = relationType;
@@ -76,7 +77,7 @@ public class MultiColumnRelation extends Relation
      * @param valuesOrMarker a Tuples.Literal instance or a Tuples.Raw marker
      * @return a new <code>MultiColumnRelation</code> instance
      */
-    public static MultiColumnRelation createNonInRelation(List<ColumnMetadata.Raw> entities, Operator relationType, Term.MultiColumnRaw valuesOrMarker)
+    public static MultiColumnRelation createNonInRelation(List<ColumnIdentifier> entities, Operator relationType, Term.MultiColumnRaw valuesOrMarker)
     {
         assert relationType != Operator.IN;
         return new MultiColumnRelation(entities, relationType, valuesOrMarker, null, null);
@@ -89,7 +90,7 @@ public class MultiColumnRelation extends Relation
      * @param inValues a list of Tuples.Literal instances or a Tuples.Raw markers
      * @return a new <code>MultiColumnRelation</code> instance
      */
-    public static MultiColumnRelation createInRelation(List<ColumnMetadata.Raw> entities, List<? extends Term.MultiColumnRaw> inValues)
+    public static MultiColumnRelation createInRelation(List<ColumnIdentifier> entities, List<? extends Term.MultiColumnRaw> inValues)
     {
         return new MultiColumnRelation(entities, Operator.IN, null, inValues, null);
     }
@@ -101,12 +102,12 @@ public class MultiColumnRelation extends Relation
      * @param inMarker a single IN marker
      * @return a new <code>MultiColumnRelation</code> instance
      */
-    public static MultiColumnRelation createSingleMarkerInRelation(List<ColumnMetadata.Raw> entities, Tuples.INRaw inMarker)
+    public static MultiColumnRelation createSingleMarkerInRelation(List<ColumnIdentifier> entities, Tuples.INRaw inMarker)
     {
         return new MultiColumnRelation(entities, Operator.IN, null, null, inMarker);
     }
 
-    public List<ColumnMetadata.Raw> getEntities()
+    public List<ColumnIdentifier> getEntities()
     {
         return entities;
     }
@@ -199,9 +200,9 @@ public class MultiColumnRelation extends Relation
     {
         List<ColumnMetadata> names = new ArrayList<>(getEntities().size());
         int previousPosition = -1;
-        for (ColumnMetadata.Raw raw : getEntities())
+        for (ColumnIdentifier id : getEntities())
         {
-            ColumnMetadata def = raw.prepare(table);
+            ColumnMetadata def = table.getExistingColumn(id);
             checkTrue(def.isClusteringColumn(), "Multi-column relations can only be applied to clustering columns but was applied to: %s", def.name);
             checkFalse(names.contains(def), "Column \"%s\" appeared twice in a relation: %s", def.name, this);
 
@@ -215,19 +216,20 @@ public class MultiColumnRelation extends Relation
         return names;
     }
 
-    public Relation renameIdentifier(ColumnMetadata.Raw from, ColumnMetadata.Raw to)
+    @Override
+    public Relation renameIdentifier(ColumnIdentifier from, ColumnIdentifier to)
     {
         if (!entities.contains(from))
             return this;
 
-        List<ColumnMetadata.Raw> newEntities = entities.stream().map(e -> e.equals(from) ? to : e).collect(Collectors.toList());
+        List<ColumnIdentifier> newEntities = entities.stream().map(e -> e.equals(from) ? to : e).collect(Collectors.toList());
         return new MultiColumnRelation(newEntities, operator(), valuesOrMarker, inValues, inMarker);
     }
 
     @Override
-    public String toString()
+    public String toCQLString()
     {
-        StringBuilder builder = new StringBuilder(Tuples.tupleToString(entities));
+        StringBuilder builder = new StringBuilder(Tuples.tupleToString(entities, ColumnIdentifier::toCQLString));
         if (isIN())
         {
             return builder.append(" IN ")
@@ -239,5 +241,28 @@ public class MultiColumnRelation extends Relation
                       .append(" ")
                       .append(valuesOrMarker)
                       .toString();
+    }
+
+    @Override
+    public int hashCode()
+    {
+        return Objects.hash(relationType, entities, valuesOrMarker, inValues, inMarker);
+    }
+
+    @Override
+    public boolean equals(Object o)
+    {
+        if (this == o)
+            return true;
+
+        if (!(o instanceof MultiColumnRelation))
+            return false;
+
+        MultiColumnRelation mcr = (MultiColumnRelation) o;
+        return Objects.equals(entities, mcr.entities)
+            && Objects.equals(relationType, mcr.relationType)
+            && Objects.equals(valuesOrMarker, mcr.valuesOrMarker)
+            && Objects.equals(inValues, mcr.inValues)
+            && Objects.equals(inMarker, mcr.inMarker);
     }
 }

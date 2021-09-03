@@ -25,7 +25,7 @@ import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.utils.FBUtilities;
 import org.junit.Test;
 
-import junit.framework.Assert;
+import org.junit.Assert;
 
 public class PartitionUpdateTest extends CQLTester
 {
@@ -46,6 +46,29 @@ public class PartitionUpdateTest extends CQLTester
         builder.newRow().add("s", 1);
         builder.newRow(1).add("a", 1);
         Assert.assertEquals(2, builder.build().operationCount());
+    }
+
+    @Test
+    public void testMutationSize()
+    {
+        createTable("CREATE TABLE %s (key text, clustering int, a int, s int static, PRIMARY KEY(key, clustering))");
+        TableMetadata cfm = currentTableMetadata();
+
+        UpdateBuilder builder = UpdateBuilder.create(cfm, "key0");
+        builder.newRow().add("s", 1);
+        builder.newRow(1).add("a", 2);
+        int size1 = builder.build().dataSize();
+        Assert.assertEquals(44, size1);
+
+        builder = UpdateBuilder.create(cfm, "key0");
+        builder.newRow(1).add("a", 2);
+        int size2 = builder.build().dataSize();
+        Assert.assertTrue(size1 != size2);
+
+        builder = UpdateBuilder.create(cfm, "key0");
+        int size3 = builder.build().dataSize();
+        Assert.assertTrue(size2 != size3);
+
     }
 
     @Test

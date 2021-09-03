@@ -31,7 +31,7 @@ public class NoOpAnalyzer extends AbstractAnalyzer
     private ByteBuffer input;
     private boolean hasNext = false;
 
-    public void init(Map<String, String> options, AbstractType validator)
+    public void init(Map<String, String> options, AbstractType<?> validator)
     {}
 
     public boolean hasNext()
@@ -50,5 +50,11 @@ public class NoOpAnalyzer extends AbstractAnalyzer
         this.next = null;
         this.input = input;
         this.hasNext = true;
+    }
+
+    @Override
+    public boolean isCompatibleWith(AbstractType<?> validator)
+    {
+        return true;
     }
 }

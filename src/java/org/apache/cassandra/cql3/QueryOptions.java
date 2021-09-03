@@ -24,6 +24,7 @@ import com.google.common.collect.ImmutableList;
 
 import io.netty.buffer.ByteBuf;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.marshal.UTF8Type;
@@ -35,6 +36,8 @@ import org.apache.cassandra.transport.CBUtil;
 import org.apache.cassandra.transport.ProtocolException;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.Pair;
+import org.apache.commons.lang3.builder.ToStringBuilder;
+import org.apache.commons.lang3.builder.ToStringStyle;
 
 /**
  * Options for a query.
@@ -42,7 +45,7 @@ import org.apache.cassandra.utils.Pair;
 public abstract class QueryOptions
 {
     public static final QueryOptions DEFAULT = new DefaultQueryOptions(ConsistencyLevel.ONE,
-                                                                       Collections.<ByteBuffer>emptyList(),
+                                                                       Collections.emptyList(),
                                                                        false,
                                                                        SpecificOptions.DEFAULT,
                                                                        ProtocolVersion.CURRENT);
@@ -67,9 +70,34 @@ public abstract class QueryOptions
         return new DefaultQueryOptions(null, null, true, null, protocolVersion);
     }
 
-    public static QueryOptions create(ConsistencyLevel consistency, List<ByteBuffer> values, boolean skipMetadata, int pageSize, PagingState pagingState, ConsistencyLevel serialConsistency, ProtocolVersion version, String keyspace)
+    public static QueryOptions create(ConsistencyLevel consistency,
+                                      List<ByteBuffer> values,
+                                      boolean skipMetadata,
+                                      int pageSize,
+                                      PagingState pagingState,
+                                      ConsistencyLevel serialConsistency,
+                                      ProtocolVersion version,
+                                      String keyspace)
     {
-        return new DefaultQueryOptions(consistency, values, skipMetadata, new SpecificOptions(pageSize, pagingState, serialConsistency, -1L, keyspace), version);
+        return create(consistency, values, skipMetadata, pageSize, pagingState, serialConsistency, version, keyspace, Long.MIN_VALUE, Integer.MIN_VALUE);
+    }
+
+    public static QueryOptions create(ConsistencyLevel consistency,
+                                      List<ByteBuffer> values,
+                                      boolean skipMetadata,
+                                      int pageSize,
+                                      PagingState pagingState,
+                                      ConsistencyLevel serialConsistency,
+                                      ProtocolVersion version,
+                                      String keyspace,
+                                      long timestamp,
+                                      int nowInSeconds)
+    {
+        return new DefaultQueryOptions(consistency,
+                                       values,
+                                       skipMetadata,
+                                       new SpecificOptions(pageSize, pagingState, serialConsistency, timestamp, keyspace, nowInSeconds),
+                                       version);
     }
 
     public static QueryOptions addColumnSpecifications(QueryOptions options, List<ColumnSpecification> columnSpecs)
@@ -172,6 +200,12 @@ public abstract class QueryOptions
         return tstamp != Long.MIN_VALUE ? tstamp : state.getTimestamp();
     }
 
+    public int getNowInSeconds(QueryState state)
+    {
+        int nowInSeconds = getSpecificOptions().nowInSeconds;
+        return nowInSeconds != Integer.MIN_VALUE ? nowInSeconds : state.getNowInSeconds();
+    }
+
     /** The keyspace that this query is bound to, or null if not relevant. */
     public String getKeyspace() { return getSpecificOptions().keyspace; }
 
@@ -183,9 +217,101 @@ public abstract class QueryOptions
     // Mainly for the sake of BatchQueryOptions
     abstract SpecificOptions getSpecificOptions();
 
+    abstract TrackWarnings getTrackWarnings();
+
+    public boolean isClientTrackWarningsEnabled()
+    {
+        return getTrackWarnings().isEnabled();
+    }
+
+    public long getClientLargeReadWarnThresholdKb()
+    {
+        return getTrackWarnings().getClientLargeReadWarnThresholdKb();
+    }
+
+    public long getClientLargeReadAbortThresholdKB()
+    {
+        return getTrackWarnings().getClientLargeReadAbortThresholdKB();
+    }
+
     public QueryOptions prepare(List<ColumnSpecification> specs)
     {
         return this;
+    }
+
+    interface TrackWarnings
+    {
+        boolean isEnabled();
+
+        long getClientLargeReadWarnThresholdKb();
+
+        long getClientLargeReadAbortThresholdKB();
+
+        static TrackWarnings create()
+        {
+            // if daemon initialization hasn't happened yet (very common in tests) then ignore
+            if (!DatabaseDescriptor.isDaemonInitialized())
+                return DisabledTrackWarnings.INSTANCE;
+            boolean enabled = DatabaseDescriptor.getClientTrackWarningsEnabled();
+            if (!enabled)
+                return DisabledTrackWarnings.INSTANCE;
+            long clientLargeReadWarnThresholdKb = DatabaseDescriptor.getClientLargeReadWarnThresholdKB();
+            long clientLargeReadAbortThresholdKB = DatabaseDescriptor.getClientLargeReadAbortThresholdKB();
+            return new DefaultTrackWarnings(clientLargeReadWarnThresholdKb, clientLargeReadAbortThresholdKB);
+        }
+    }
+
+    private enum DisabledTrackWarnings implements TrackWarnings
+    {
+        INSTANCE;
+
+        @Override
+        public boolean isEnabled()
+        {
+            return false;
+        }
+
+        @Override
+        public long getClientLargeReadWarnThresholdKb()
+        {
+            return 0;
+        }
+
+        @Override
+        public long getClientLargeReadAbortThresholdKB()
+        {
+            return 0;
+        }
+    }
+
+    private static class DefaultTrackWarnings implements TrackWarnings
+    {
+        private final long clientLargeReadWarnThresholdKb;
+        private final long clientLargeReadAbortThresholdKB;
+
+        public DefaultTrackWarnings(long clientLargeReadWarnThresholdKb, long clientLargeReadAbortThresholdKB)
+        {
+            this.clientLargeReadWarnThresholdKb = clientLargeReadWarnThresholdKb;
+            this.clientLargeReadAbortThresholdKB = clientLargeReadAbortThresholdKB;
+        }
+
+        @Override
+        public boolean isEnabled()
+        {
+            return true;
+        }
+
+        @Override
+        public long getClientLargeReadWarnThresholdKb()
+        {
+            return clientLargeReadWarnThresholdKb;
+        }
+
+        @Override
+        public long getClientLargeReadAbortThresholdKB()
+        {
+            return clientLargeReadAbortThresholdKB;
+        }
     }
 
     static class DefaultQueryOptions extends QueryOptions
@@ -197,6 +323,7 @@ public abstract class QueryOptions
         private final SpecificOptions options;
 
         private final transient ProtocolVersion protocolVersion;
+        private final transient TrackWarnings trackWarnings = TrackWarnings.create();
 
         DefaultQueryOptions(ConsistencyLevel consistency, List<ByteBuffer> values, boolean skipMetadata, SpecificOptions options, ProtocolVersion protocolVersion)
         {
@@ -230,6 +357,12 @@ public abstract class QueryOptions
         SpecificOptions getSpecificOptions()
         {
             return options;
+        }
+
+        @Override
+        TrackWarnings getTrackWarnings()
+        {
+            return trackWarnings;
         }
     }
 
@@ -265,6 +398,12 @@ public abstract class QueryOptions
         SpecificOptions getSpecificOptions()
         {
             return wrapped.getSpecificOptions();
+        }
+
+        @Override
+        TrackWarnings getTrackWarnings()
+        {
+            return wrapped.getTrackWarnings();
         }
 
         @Override
@@ -344,21 +483,28 @@ public abstract class QueryOptions
     // Options that are likely to not be present in most queries
     static class SpecificOptions
     {
-        private static final SpecificOptions DEFAULT = new SpecificOptions(-1, null, null, Long.MIN_VALUE, null);
+        private static final SpecificOptions DEFAULT = new SpecificOptions(-1, null, null, Long.MIN_VALUE, null, Integer.MIN_VALUE);
 
         private final int pageSize;
         private final PagingState state;
         private final ConsistencyLevel serialConsistency;
         private final long timestamp;
         private final String keyspace;
+        private final int nowInSeconds;
 
-        private SpecificOptions(int pageSize, PagingState state, ConsistencyLevel serialConsistency, long timestamp, String keyspace)
+        private SpecificOptions(int pageSize,
+                                PagingState state,
+                                ConsistencyLevel serialConsistency,
+                                long timestamp,
+                                String keyspace,
+                                int nowInSeconds)
         {
             this.pageSize = pageSize;
             this.state = state;
             this.serialConsistency = serialConsistency == null ? ConsistencyLevel.SERIAL : serialConsistency;
             this.timestamp = timestamp;
             this.keyspace = keyspace;
+            this.nowInSeconds = nowInSeconds;
         }
     }
 
@@ -374,7 +520,8 @@ public abstract class QueryOptions
             SERIAL_CONSISTENCY,
             TIMESTAMP,
             NAMES_FOR_VALUES,
-            KEYSPACE;
+            KEYSPACE,
+            NOW_IN_SECONDS;
 
             private static final Flag[] ALL_VALUES = values();
 
@@ -440,8 +587,10 @@ public abstract class QueryOptions
                     timestamp = ts;
                 }
                 String keyspace = flags.contains(Flag.KEYSPACE) ? CBUtil.readString(body) : null;
-                options = new SpecificOptions(pageSize, pagingState, serialConsistency, timestamp, keyspace);
+                int nowInSeconds = flags.contains(Flag.NOW_IN_SECONDS) ? body.readInt() : Integer.MIN_VALUE;
+                options = new SpecificOptions(pageSize, pagingState, serialConsistency, timestamp, keyspace, nowInSeconds);
             }
+
             DefaultQueryOptions opts = new DefaultQueryOptions(consistency, values, skipMetadata, options, version);
             return names == null ? opts : new OptionsWithNames(opts, names);
         }
@@ -450,7 +599,7 @@ public abstract class QueryOptions
         {
             CBUtil.writeConsistencyLevel(options.getConsistency(), dest);
 
-            EnumSet<Flag> flags = gatherFlags(options);
+            EnumSet<Flag> flags = gatherFlags(options, version);
             if (version.isGreaterOrEqualTo(ProtocolVersion.V5))
                 dest.writeInt(Flag.serialize(flags));
             else
@@ -467,7 +616,9 @@ public abstract class QueryOptions
             if (flags.contains(Flag.TIMESTAMP))
                 dest.writeLong(options.getSpecificOptions().timestamp);
             if (flags.contains(Flag.KEYSPACE))
-                CBUtil.writeString(options.getSpecificOptions().keyspace, dest);
+                CBUtil.writeAsciiString(options.getSpecificOptions().keyspace, dest);
+            if (flags.contains(Flag.NOW_IN_SECONDS))
+                dest.writeInt(options.getSpecificOptions().nowInSeconds);
 
             // Note that we don't really have to bother with NAMES_FOR_VALUES server side,
             // and in fact we never really encode QueryOptions, only decode them, so we
@@ -480,7 +631,7 @@ public abstract class QueryOptions
 
             size += CBUtil.sizeOfConsistencyLevel(options.getConsistency());
 
-            EnumSet<Flag> flags = gatherFlags(options);
+            EnumSet<Flag> flags = gatherFlags(options, version);
             size += (version.isGreaterOrEqualTo(ProtocolVersion.V5) ? 4 : 1);
 
             if (flags.contains(Flag.VALUES))
@@ -494,11 +645,14 @@ public abstract class QueryOptions
             if (flags.contains(Flag.TIMESTAMP))
                 size += 8;
             if (flags.contains(Flag.KEYSPACE))
-                size += CBUtil.sizeOfString(options.getSpecificOptions().keyspace);
+                size += CBUtil.sizeOfAsciiString(options.getSpecificOptions().keyspace);
+            if (flags.contains(Flag.NOW_IN_SECONDS))
+                size += 4;
+
             return size;
         }
 
-        private EnumSet<Flag> gatherFlags(QueryOptions options)
+        private EnumSet<Flag> gatherFlags(QueryOptions options, ProtocolVersion version)
         {
             EnumSet<Flag> flags = EnumSet.noneOf(Flag.class);
             if (options.getValues().size() > 0)
@@ -513,9 +667,22 @@ public abstract class QueryOptions
                 flags.add(Flag.SERIAL_CONSISTENCY);
             if (options.getSpecificOptions().timestamp != Long.MIN_VALUE)
                 flags.add(Flag.TIMESTAMP);
-            if (options.getSpecificOptions().keyspace != null)
-                flags.add(Flag.KEYSPACE);
+
+            if (version.isGreaterOrEqualTo(ProtocolVersion.V5))
+            {
+                if (options.getSpecificOptions().keyspace != null)
+                    flags.add(Flag.KEYSPACE);
+                if (options.getSpecificOptions().nowInSeconds != Integer.MIN_VALUE)
+                    flags.add(Flag.NOW_IN_SECONDS);
+            }
+
             return flags;
         }
+    }
+    
+    @Override
+    public String toString()
+    {
+        return ToStringBuilder.reflectionToString(this, ToStringStyle.SHORT_PREFIX_STYLE);
     }
 }

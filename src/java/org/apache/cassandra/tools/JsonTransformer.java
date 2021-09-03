@@ -32,6 +32,12 @@ import java.util.stream.Stream;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import com.fasterxml.jackson.core.JsonFactory;
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.core.util.DefaultPrettyPrinter;
+import com.fasterxml.jackson.core.util.DefaultPrettyPrinter.Indenter;
+import com.fasterxml.jackson.core.util.MinimalPrettyPrinter;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.CollectionType;
@@ -51,12 +57,6 @@ import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.codehaus.jackson.JsonFactory;
-import org.codehaus.jackson.JsonGenerator;
-import org.codehaus.jackson.impl.Indenter;
-import org.codehaus.jackson.util.DefaultPrettyPrinter.NopIndenter;
-import org.codehaus.jackson.util.DefaultPrettyPrinter;
-import org.codehaus.jackson.util.MinimalPrettyPrinter;
 
 public final class JsonTransformer
 {
@@ -104,7 +104,7 @@ public final class JsonTransformer
     public static void toJson(ISSTableScanner currentScanner, Stream<UnfilteredRowIterator> partitions, boolean rawTime, TableMetadata metadata, OutputStream out)
             throws IOException
     {
-        try (JsonGenerator json = jsonFactory.createJsonGenerator(new OutputStreamWriter(out, StandardCharsets.UTF_8)))
+        try (JsonGenerator json = jsonFactory.createGenerator(new OutputStreamWriter(out, StandardCharsets.UTF_8)))
         {
             JsonTransformer transformer = new JsonTransformer(json, currentScanner, rawTime, metadata, false);
             json.writeStartArray();
@@ -116,7 +116,7 @@ public final class JsonTransformer
     public static void toJsonLines(ISSTableScanner currentScanner, Stream<UnfilteredRowIterator> partitions, boolean rawTime, TableMetadata metadata, OutputStream out)
             throws IOException
     {
-        try (JsonGenerator json = jsonFactory.createJsonGenerator(new OutputStreamWriter(out, StandardCharsets.UTF_8)))
+        try (JsonGenerator json = jsonFactory.createGenerator(new OutputStreamWriter(out, StandardCharsets.UTF_8)))
         {
             JsonTransformer transformer = new JsonTransformer(json, currentScanner, rawTime, metadata, true);
             partitions.forEach(transformer::serializePartition);
@@ -125,7 +125,7 @@ public final class JsonTransformer
 
     public static void keysToJson(ISSTableScanner currentScanner, Stream<DecoratedKey> keys, boolean rawTime, TableMetadata metadata, OutputStream out) throws IOException
     {
-        try (JsonGenerator json = jsonFactory.createJsonGenerator(new OutputStreamWriter(out, StandardCharsets.UTF_8)))
+        try (JsonGenerator json = jsonFactory.createGenerator(new OutputStreamWriter(out, StandardCharsets.UTF_8)))
         {
             JsonTransformer transformer = new JsonTransformer(json, currentScanner, rawTime, metadata, false);
             json.writeStartArray();
@@ -213,33 +213,35 @@ public final class JsonTransformer
 
             json.writeEndObject();
 
-            if (partition.hasNext() || partition.staticRow() != null)
+            json.writeFieldName("rows");
+            json.writeStartArray();
+            updatePosition();
+
+            if (partition.staticRow() != null)
             {
-                json.writeFieldName("rows");
-                json.writeStartArray();
-                updatePosition();
                 if (!partition.staticRow().isEmpty())
                     serializeRow(partition.staticRow());
-
-                Unfiltered unfiltered;
                 updatePosition();
-                while (partition.hasNext())
-                {
-                    unfiltered = partition.next();
-                    if (unfiltered instanceof Row)
-                    {
-                        serializeRow((Row) unfiltered);
-                    }
-                    else if (unfiltered instanceof RangeTombstoneMarker)
-                    {
-                        serializeTombstone((RangeTombstoneMarker) unfiltered);
-                    }
-                    updatePosition();
-                }
-                json.writeEndArray();
-
-                json.writeEndObject();
             }
+
+            Unfiltered unfiltered;
+            while (partition.hasNext())
+            {
+                unfiltered = partition.next();
+                if (unfiltered instanceof Row)
+                {
+                    serializeRow((Row) unfiltered);
+                }
+                else if (unfiltered instanceof RangeTombstoneMarker)
+                {
+                    serializeTombstone((RangeTombstoneMarker) unfiltered);
+                }
+                updatePosition();
+            }
+
+            json.writeEndArray();
+
+            json.writeEndObject();
         }
 
         catch (IOException e)
@@ -336,7 +338,7 @@ public final class JsonTransformer
         }
     }
 
-    private void serializeBound(ClusteringBound bound, DeletionTime deletionTime) throws IOException
+    private void serializeBound(ClusteringBound<?> bound, DeletionTime deletionTime) throws IOException
     {
         json.writeFieldName(bound.isStart() ? "start" : "end");
         json.writeStartObject();
@@ -347,7 +349,7 @@ public final class JsonTransformer
         json.writeEndObject();
     }
 
-    private void serializeClustering(ClusteringPrefix clustering) throws IOException
+    private <T> void serializeClustering(ClusteringPrefix<T> clustering) throws IOException
     {
         if (clustering.size() > 0)
         {
@@ -365,7 +367,7 @@ public final class JsonTransformer
                 }
                 else
                 {
-                    json.writeRawValue(column.cellValueType().toJSONString(clustering.get(i), ProtocolVersion.CURRENT));
+                    json.writeRawValue(column.cellValueType().toJSONString(clustering.get(i), clustering.accessor(), ProtocolVersion.CURRENT));
                 }
             }
             json.writeEndArray();
@@ -391,7 +393,7 @@ public final class JsonTransformer
     {
         if (cd.column().isSimple())
         {
-            serializeCell((Cell) cd, liveInfo);
+            serializeCell((Cell<?>) cd, liveInfo);
         }
         else
         {
@@ -414,13 +416,13 @@ public final class JsonTransformer
                     logger.error("Failure parsing ColumnData.", e);
                 }
             }
-            for (Cell cell : complexData){
+            for (Cell<?> cell : complexData){
                 serializeCell(cell, liveInfo);
             }
         }
     }
 
-    private void serializeCell(Cell cell, LivenessInfo liveInfo)
+    private <V> void serializeCell(Cell<V> cell, LivenessInfo liveInfo)
     {
         try
         {
@@ -481,7 +483,7 @@ public final class JsonTransformer
             else
             {
                 json.writeFieldName("value");
-                json.writeRawValue(cellType.toJSONString(cell.value(), ProtocolVersion.CURRENT));
+                json.writeRawValue(cellType.toJSONString(cell.value(), cell.accessor(), ProtocolVersion.CURRENT));
             }
             if (liveInfo.isEmpty() || cell.timestamp() != liveInfo.timestamp())
             {
@@ -522,7 +524,7 @@ public final class JsonTransformer
      * A specialized {@link Indenter} that enables a 'compact' mode which puts all subsequent json values on the same
      * line. This is manipulated via {@link CompactIndenter#setCompact(boolean)}
      */
-    private static final class CompactIndenter extends NopIndenter
+    private static final class CompactIndenter extends DefaultPrettyPrinter.NopIndenter
     {
 
         private static final int INDENT_LEVELS = 16;

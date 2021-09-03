@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -21,6 +21,10 @@ package org.apache.cassandra.db;
 import java.nio.ByteBuffer;
 import java.util.*;
 
+import org.assertj.core.api.Assertions;
+import org.junit.Test;
+import org.mockito.Mockito;
+
 import org.apache.cassandra.Util;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.ColumnIdentifier;
@@ -33,12 +37,11 @@ import org.apache.cassandra.db.filter.*;
 import org.apache.cassandra.db.partitions.PartitionIterator;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.metrics.ClearableHistogram;
+import org.apache.cassandra.schema.SchemaProvider;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
-import org.junit.Test;
 
 import static org.junit.Assert.*;
-
 
 public class KeyspaceTest extends CQLTester
 {
@@ -101,20 +104,20 @@ public class KeyspaceTest extends CQLTester
         {
             // slice with limit 1
             Row row = Util.getOnlyRow(Util.cmd(cfs, "0").columns("c").withLimit(1).build());
-            assertEquals(ByteBufferUtil.bytes(0), row.getCell(cfs.metadata().getColumn(new ColumnIdentifier("c", false))).value());
+            assertEquals(ByteBufferUtil.bytes(0), row.getCell(cfs.metadata().getColumn(new ColumnIdentifier("c", false))).buffer());
 
             // fetch each row by name
             for (int i = 0; i < 2; i++)
             {
                 row = Util.getOnlyRow(Util.cmd(cfs, "0").columns("c").includeRow(i).build());
-                assertEquals(ByteBufferUtil.bytes(i), row.getCell(cfs.metadata().getColumn(new ColumnIdentifier("c", false))).value());
+                assertEquals(ByteBufferUtil.bytes(i), row.getCell(cfs.metadata().getColumn(new ColumnIdentifier("c", false))).buffer());
             }
 
             // fetch each row by slice
             for (int i = 0; i < 2; i++)
             {
                 row = Util.getOnlyRow(Util.cmd(cfs, "0").columns("c").fromIncl(i).toIncl(i).build());
-                assertEquals(ByteBufferUtil.bytes(i), row.getCell(cfs.metadata().getColumn(new ColumnIdentifier("c", false))).value());
+                assertEquals(ByteBufferUtil.bytes(i), row.getCell(cfs.metadata().getColumn(new ColumnIdentifier("c", false))).buffer());
             }
 
             if (round == 0)
@@ -142,7 +145,7 @@ public class KeyspaceTest extends CQLTester
 
         Collection<SSTableReader> sstables = cfs.getLiveSSTables();
         assertEquals(1, sstables.size());
-        sstables.iterator().next().forceFilterFailures();
+        Util.disableBloomFilter(cfs);
 
         for (String key : new String[]{"0", "2"})
             Util.assertEmpty(Util.cmd(cfs, key).build());
@@ -150,8 +153,8 @@ public class KeyspaceTest extends CQLTester
 
     private static void assertRowsInSlice(ColumnFamilyStore cfs, String key, int sliceStart, int sliceEnd, int limit, boolean reversed, String columnValuePrefix)
     {
-        Clustering startClustering = Clustering.make(ByteBufferUtil.bytes(sliceStart));
-        Clustering endClustering = Clustering.make(ByteBufferUtil.bytes(sliceEnd));
+        Clustering<?> startClustering = Clustering.make(ByteBufferUtil.bytes(sliceStart));
+        Clustering<?> endClustering = Clustering.make(ByteBufferUtil.bytes(sliceEnd));
         Slices slices = Slices.with(cfs.getComparator(), Slice.make(startClustering, endClustering));
         ClusteringIndexSliceFilter filter = new ClusteringIndexSliceFilter(slices, reversed);
         SinglePartitionReadCommand command = singlePartitionSlice(cfs, key, filter, limit);
@@ -166,8 +169,8 @@ public class KeyspaceTest extends CQLTester
                     for (int i = sliceEnd; i >= sliceStart; i--)
                     {
                         Row row = rowIterator.next();
-                        Cell cell = row.getCell(cfs.metadata().getColumn(new ColumnIdentifier("c", false)));
-                        assertEquals(ByteBufferUtil.bytes(columnValuePrefix + i), cell.value());
+                        Cell<?> cell = row.getCell(cfs.metadata().getColumn(new ColumnIdentifier("c", false)));
+                        assertEquals(ByteBufferUtil.bytes(columnValuePrefix + i), cell.buffer());
                     }
                 }
                 else
@@ -175,8 +178,8 @@ public class KeyspaceTest extends CQLTester
                     for (int i = sliceStart; i <= sliceEnd; i++)
                     {
                         Row row = rowIterator.next();
-                        Cell cell = row.getCell(cfs.metadata().getColumn(new ColumnIdentifier("c", false)));
-                        assertEquals(ByteBufferUtil.bytes(columnValuePrefix + i), cell.value());
+                        Cell<?> cell = row.getCell(cfs.metadata().getColumn(new ColumnIdentifier("c", false)));
+                        assertEquals(ByteBufferUtil.bytes(columnValuePrefix + i), cell.buffer());
                     }
                 }
                 assertFalse(rowIterator.hasNext());
@@ -235,8 +238,8 @@ public class KeyspaceTest extends CQLTester
                 try (RowIterator rowIterator = iterator.next())
                 {
                     Row row = rowIterator.next();
-                    Cell cell = row.getCell(cfs.metadata().getColumn(new ColumnIdentifier("c", false)));
-                    assertEquals(ByteBufferUtil.bytes(i), cell.value());
+                    Cell<?> cell = row.getCell(cfs.metadata().getColumn(new ColumnIdentifier("c", false)));
+                    assertEquals(ByteBufferUtil.bytes(i), cell.buffer());
                 }
             }
         }
@@ -259,10 +262,10 @@ public class KeyspaceTest extends CQLTester
                 for (int expected : columnValues)
                 {
                     Row row = rowIterator.next();
-                    Cell cell = row.getCell(cfs.metadata().getColumn(new ColumnIdentifier("c", false)));
+                    Cell<?> cell = row.getCell(cfs.metadata().getColumn(new ColumnIdentifier("c", false)));
                     assertEquals(
-                            String.format("Expected %s, but got %s", ByteBufferUtil.bytesToHex(ByteBufferUtil.bytes(expected)), ByteBufferUtil.bytesToHex(cell.value())),
-                            ByteBufferUtil.bytes(expected), cell.value());
+                            String.format("Expected %s, but got %s", ByteBufferUtil.bytesToHex(ByteBufferUtil.bytes(expected)), ByteBufferUtil.bytesToHex(cell.buffer())),
+                            ByteBufferUtil.bytes(expected), cell.buffer());
                 }
                 assertFalse(rowIterator.hasNext());
             }
@@ -271,12 +274,12 @@ public class KeyspaceTest extends CQLTester
 
     private static ClusteringIndexSliceFilter slices(ColumnFamilyStore cfs, Integer sliceStart, Integer sliceEnd, boolean reversed)
     {
-        ClusteringBound startBound = sliceStart == null
-                                   ? ClusteringBound.BOTTOM
-                                   : ClusteringBound.create(ClusteringPrefix.Kind.INCL_START_BOUND, new ByteBuffer[]{ByteBufferUtil.bytes(sliceStart)});
-        ClusteringBound endBound = sliceEnd == null
-                                 ? ClusteringBound.TOP
-                                 : ClusteringBound.create(ClusteringPrefix.Kind.INCL_END_BOUND, new ByteBuffer[]{ByteBufferUtil.bytes(sliceEnd)});
+        ClusteringBound<ByteBuffer> startBound = sliceStart == null
+                                                 ? BufferClusteringBound.create(ClusteringPrefix.Kind.INCL_START_BOUND, ByteBufferUtil.EMPTY_ARRAY)
+                                                 : BufferClusteringBound.create(ClusteringPrefix.Kind.INCL_START_BOUND, new ByteBuffer[]{ByteBufferUtil.bytes(sliceStart)});
+        ClusteringBound<ByteBuffer> endBound = sliceEnd == null
+                                               ? BufferClusteringBound.create(ClusteringPrefix.Kind.INCL_END_BOUND, ByteBufferUtil.EMPTY_ARRAY)
+                                               : BufferClusteringBound.create(ClusteringPrefix.Kind.INCL_END_BOUND, new ByteBuffer[]{ByteBufferUtil.bytes(sliceEnd)});
         Slices slices = Slices.with(cfs.getComparator(), Slice.make(startBound, endBound));
         return new ClusteringIndexSliceFilter(slices, reversed);
     }
@@ -412,6 +415,20 @@ public class KeyspaceTest extends CQLTester
     }
 
     @Test
+    public void testSnapshotCreation() throws Throwable {
+        createTable("CREATE TABLE %s (a text, b int, c int, PRIMARY KEY (a, b))");
+
+        execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", "0", 0, 0);
+
+        Keyspace ks = Keyspace.open(KEYSPACE_PER_TEST);
+        String table = getCurrentColumnFamilyStore().name;
+        ks.snapshot("test", table);
+
+        assertTrue(ks.snapshotExists("test"));
+        assertEquals(1, ks.getAllSnapshots().count());
+    }
+
+    @Test
     public void testLimitSSTables() throws Throwable
     {
         createTable("CREATE TABLE %s (a text, b int, c int, PRIMARY KEY (a, b))");
@@ -450,40 +467,6 @@ public class KeyspaceTest extends CQLTester
         for (int i = 0; i < 500; i++)
             expectedValues[i] = 1999 - i;
         assertRowsInResult(cfs, command, expectedValues);
-    }
-
-    @Test
-    public void testLimitSSTablesComposites() throws Throwable
-    {
-        // creates 10 sstables, composite columns like this:
-        // ---------------------
-        // k   |a0:0|a1:1|..|a9:9
-        // ---------------------
-        // ---------------------
-        // k   |a0:10|a1:11|..|a9:19
-        // ---------------------
-        // ...
-        // ---------------------
-        // k   |a0:90|a1:91|..|a9:99
-        // ---------------------
-        // then we slice out col1 = a5 and col2 > 85 -> which should let us just check 2 sstables and get 2 columns
-        createTable("CREATE TABLE %s (a text, b text, c int, d int, PRIMARY KEY (a, b, c))");
-        final ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
-        cfs.disableAutoCompaction();
-
-        for (int j = 0; j < 10; j++)
-        {
-            for (int i = 0; i < 10; i++)
-                execute("INSERT INTO %s (a, b, c, d) VALUES (?, ?, ?, ?)", "0", "a" + i, j * 10 + i, 0);
-
-            cfs.forceBlockingFlush();
-        }
-
-        ((ClearableHistogram)cfs.metric.sstablesPerReadHistogram.cf).clear();
-        assertRows(execute("SELECT * FROM %s WHERE a = ? AND (b, c) >= (?, ?) AND (b) <= (?) LIMIT 1000", "0", "a5", 85, "a5"),
-                row("0", "a5", 85, 0),
-                row("0", "a5", 95, 0));
-        assertEquals(2, cfs.metric.sstablesPerReadHistogram.cf.getSnapshot().getMax(), 0.1);
     }
 
     private void validateSliceLarge(ColumnFamilyStore cfs)
@@ -525,5 +508,18 @@ public class KeyspaceTest extends CQLTester
         command = SinglePartitionReadCommand.create(
                 cfs.metadata(), FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata()), RowFilter.NONE, DataLimits.cqlLimits(3), Util.dk("0"), filter);
         assertRowsInResult(cfs, command);
+    }
+
+    @Test
+    public void shouldThrowOnMissingKeyspace()
+    {
+        SchemaProvider schema = Mockito.mock(SchemaProvider.class);
+        String ksName = "MissingKeyspace";
+        
+        Mockito.when(schema.getKeyspaceMetadata(ksName)).thenReturn(null);
+
+        Assertions.assertThatThrownBy(() -> Keyspace.open(ksName, schema, false))
+                  .isInstanceOf(AssertionError.class)
+                  .hasMessage("Unknown keyspace " + ksName);
     }
 }

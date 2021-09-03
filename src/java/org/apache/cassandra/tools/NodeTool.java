@@ -17,39 +17,82 @@
  */
 package org.apache.cassandra.tools;
 
-import java.io.*;
-import java.net.InetAddress;
-import java.net.UnknownHostException;
-import java.text.SimpleDateFormat;
-import java.util.*;
-import java.util.Map.Entry;
-
-import com.google.common.base.Joiner;
-import com.google.common.base.Throwables;
-import com.google.common.collect.*;
-
-import io.airlift.airline.*;
-
-import org.apache.cassandra.locator.EndpointSnitchInfoMBean;
-import org.apache.cassandra.tools.nodetool.*;
-import org.apache.cassandra.utils.FBUtilities;
-
 import static com.google.common.base.Throwables.getStackTraceAsString;
 import static com.google.common.collect.Iterables.toArray;
 import static com.google.common.collect.Lists.newArrayList;
 import static java.lang.Integer.parseInt;
 import static java.lang.String.format;
 import static org.apache.commons.lang3.ArrayUtils.EMPTY_STRING_ARRAY;
-import static org.apache.commons.lang3.StringUtils.*;
+import static org.apache.commons.lang3.StringUtils.EMPTY;
+import static org.apache.commons.lang3.StringUtils.isEmpty;
+import static org.apache.commons.lang3.StringUtils.isNotEmpty;
+
+import java.io.Console;
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.FileWriter;
+import java.io.IOError;
+import java.io.IOException;
+import java.net.UnknownHostException;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Date;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Scanner;
+import java.util.SortedMap;
+
+import com.google.common.base.Joiner;
+import com.google.common.base.Throwables;
+
+import org.apache.cassandra.locator.EndpointSnitchInfoMBean;
+import org.apache.cassandra.tools.nodetool.*;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.tools.nodetool.Sjk;
+
+import com.google.common.collect.Maps;
+
+import io.airlift.airline.Cli;
+import io.airlift.airline.Help;
+import io.airlift.airline.Option;
+import io.airlift.airline.OptionType;
+import io.airlift.airline.ParseArgumentsMissingException;
+import io.airlift.airline.ParseArgumentsUnexpectedException;
+import io.airlift.airline.ParseCommandMissingException;
+import io.airlift.airline.ParseCommandUnrecognizedException;
+import io.airlift.airline.ParseOptionConversionException;
+import io.airlift.airline.ParseOptionMissingException;
+import io.airlift.airline.ParseOptionMissingValueException;
 
 public class NodeTool
 {
+    static
+    {
+        FBUtilities.preventIllegalAccessWarnings();
+    }
+
     private static final String HISTORYFILE = "nodetool.history";
+
+    private final INodeProbeFactory nodeProbeFactory;
+    private final Output output;
 
     public static void main(String... args)
     {
-        List<Class<? extends Runnable>> commands = newArrayList(
-                Help.class,
+        System.exit(new NodeTool(new NodeProbeFactory(), Output.CONSOLE).execute(args));
+    }
+
+    public NodeTool(INodeProbeFactory nodeProbeFactory, Output output)
+    {
+        this.nodeProbeFactory = nodeProbeFactory;
+        this.output = output;
+    }
+
+    public int execute(String... args)
+    {
+        List<Class<? extends NodeToolCmdRunnable>> commands = newArrayList(
+                CassHelp.class,
                 Info.class,
                 Ring.class,
                 NetStats.class,
@@ -80,9 +123,12 @@ public class NodeTool
                 EnableFullQueryLog.class,
                 DisableFullQueryLog.class,
                 GcStats.class,
+                GetAuditLog.class,
                 GetBatchlogReplayTrottle.class,
                 GetCompactionThreshold.class,
                 GetCompactionThroughput.class,
+                GetConcurrency.class,
+                GetFullQueryLog.class,
                 GetTimeout.class,
                 GetStreamThroughput.class,
                 GetTraceProbability.class,
@@ -92,13 +138,20 @@ public class NodeTool
                 GetSSTables.class,
                 GetMaxHintWindow.class,
                 GossipInfo.class,
-                InvalidateKeyCache.class,
-                InvalidateRowCache.class,
+                Import.class,
                 InvalidateCounterCache.class,
+                InvalidateCredentialsCache.class,
+                InvalidateJmxPermissionsCache.class,
+                InvalidateKeyCache.class,
+                InvalidateNetworkPermissionsCache.class,
+                InvalidatePermissionsCache.class,
+                InvalidateRolesCache.class,
+                InvalidateRowCache.class,
                 Join.class,
                 Move.class,
                 PauseHandoff.class,
                 ResumeHandoff.class,
+                ProfileLoad.class,
                 ProxyHistograms.class,
                 Rebuild.class,
                 Refresh.class,
@@ -107,9 +160,9 @@ public class NodeTool
                 ReloadSeeds.class,
                 ResetFullQueryLog.class,
                 Repair.class,
-                RepairAdmin.class,
                 ReplayBatchlog.class,
                 SetCacheCapacity.class,
+                SetConcurrency.class,
                 SetHintedHandoffThrottleInKB.class,
                 SetBatchlogReplayThrottle.class,
                 SetCompactionThreshold.class,
@@ -118,6 +171,7 @@ public class NodeTool
                 SetConcurrentCompactors.class,
                 GetConcurrentViewBuilders.class,
                 SetConcurrentViewBuilders.class,
+                SetConcurrency.class,
                 SetTimeout.class,
                 SetStreamThroughput.class,
                 SetInterDCStreamThroughput.class,
@@ -125,6 +179,8 @@ public class NodeTool
                 SetMaxHintWindow.class,
                 Snapshot.class,
                 ListSnapshots.class,
+                GetSnapshotThrottle.class,
+                SetSnapshotThrottle.class,
                 Status.class,
                 StatusBinary.class,
                 StatusGossip.class,
@@ -150,36 +206,49 @@ public class NodeTool
                 TopPartitions.class,
                 SetLoggingLevel.class,
                 GetLoggingLevels.class,
+                Sjk.class,
                 DisableHintsForDC.class,
                 EnableHintsForDC.class,
                 FailureDetectorInfo.class,
                 RefreshSizeEstimates.class,
                 RelocateSSTables.class,
                 ViewBuildStatus.class,
-                HandoffWindow.class,
-                ReloadSslCertificates.class
+                ReloadSslCertificates.class,
+                EnableAuditLog.class,
+                DisableAuditLog.class,
+                EnableOldProtocolVersions.class,
+                DisableOldProtocolVersions.class
         );
 
-        Cli.CliBuilder<Runnable> builder = Cli.builder("nodetool");
+        Cli.CliBuilder<NodeToolCmdRunnable> builder = Cli.builder("nodetool");
 
         builder.withDescription("Manage your Cassandra cluster")
-                 .withDefaultCommand(Help.class)
+                 .withDefaultCommand(CassHelp.class)
                  .withCommands(commands);
 
         // bootstrap commands
         builder.withGroup("bootstrap")
                 .withDescription("Monitor/manage node's bootstrap process")
-                .withDefaultCommand(Help.class)
+                .withDefaultCommand(CassHelp.class)
                 .withCommand(BootstrapResume.class);
 
-        Cli<Runnable> parser = builder.build();
+        builder.withGroup("repair_admin")
+               .withDescription("list and fail incremental repair sessions")
+               .withDefaultCommand(RepairAdmin.ListCmd.class)
+               .withCommand(RepairAdmin.ListCmd.class)
+               .withCommand(RepairAdmin.CancelCmd.class)
+               .withCommand(RepairAdmin.CleanupDataCmd.class)
+               .withCommand(RepairAdmin.SummarizePendingCmd.class)
+               .withCommand(RepairAdmin.SummarizeRepairedCmd.class);
+
+        Cli<NodeToolCmdRunnable> parser = builder.build();
 
         int status = 0;
         try
         {
-            Runnable parse = parser.parse(args);
+            NodeToolCmdRunnable parse = parser.parse(args);
             printHistory(args);
-            parse.run();
+            parse.run(nodeProbeFactory, output);
         } catch (IllegalArgumentException |
                 IllegalStateException |
                 ParseArgumentsMissingException |
@@ -198,7 +267,7 @@ public class NodeTool
             status = 2;
         }
 
-        System.exit(status);
+        return status;
     }
 
     private static void printHistory(String... args)
@@ -221,20 +290,33 @@ public class NodeTool
         }
     }
 
-    private static void badUse(Exception e)
+    protected void badUse(Exception e)
     {
-        System.out.println("nodetool: " + e.getMessage());
-        System.out.println("See 'nodetool help' or 'nodetool help <command>'.");
+        output.out.println("nodetool: " + e.getMessage());
+        output.out.println("See 'nodetool help' or 'nodetool help <command>'.");
     }
 
-    private static void err(Throwable e)
+    protected void err(Throwable e)
     {
-        System.err.println("error: " + e.getMessage());
-        System.err.println("-- StackTrace --");
-        System.err.println(getStackTraceAsString(e));
+        output.err.println("error: " + e.getMessage());
+        output.err.println("-- StackTrace --");
+        output.err.println(getStackTraceAsString(e));
     }
 
-    public static abstract class NodeToolCmd implements Runnable
+    public static class CassHelp extends Help implements NodeToolCmdRunnable
+    {
+        public void run(INodeProbeFactory nodeProbeFactory, Output output)
+        {
+            run();
+        }
+    }
+
+    interface NodeToolCmdRunnable
+    {
+        void run(INodeProbeFactory nodeProbeFactory, Output output);
+    }
+
+    public static abstract class NodeToolCmd implements NodeToolCmdRunnable
     {
 
         @Option(type = OptionType.GLOBAL, name = {"-h", "--host"}, description = "Node hostname or ip address")
@@ -252,11 +334,21 @@ public class NodeTool
         @Option(type = OptionType.GLOBAL, name = {"-pwf", "--password-file"}, description = "Path to the JMX password file")
         private String passwordFilePath = EMPTY;
 
-        @Option(type = OptionType.GLOBAL, name = { "-wp", "--with-port"}, description = "Operate in 4.0 mode with hosts disambiguated by port number", arity = 0)
-        protected boolean withPort = false;
+		@Option(type = OptionType.GLOBAL, name = { "-pp", "--print-port"}, description = "Operate in 4.0 mode with hosts disambiguated by port number", arity = 0)
+        protected boolean printPort = false;
+
+        private INodeProbeFactory nodeProbeFactory;
+        protected Output output;
 
         @Override
-        public void run()
+        public void run(INodeProbeFactory nodeProbeFactory, Output output)
+        {
+            this.nodeProbeFactory = nodeProbeFactory;
+            this.output = output;
+            runInternal();
+        }
+
+        public void runInternal()
         {
             if (isNotEmpty(username)) {
                 if (isNotEmpty(passwordFilePath))
@@ -326,13 +418,15 @@ public class NodeTool
             try
             {
                 if (username.isEmpty())
-                    nodeClient = new NodeProbe(host, parseInt(port));
+                    nodeClient = nodeProbeFactory.create(host, parseInt(port));
                 else
-                    nodeClient = new NodeProbe(host, parseInt(port), username, password);
+                    nodeClient = nodeProbeFactory.create(host, parseInt(port), username, password);
+
+                nodeClient.setOutput(output);
             } catch (IOException | SecurityException e)
             {
                 Throwable rootCause = Throwables.getRootCause(e);
-                System.err.println(format("nodetool: Failed to connect to '%s:%s' - %s: '%s'.", host, port, rootCause.getClass().getSimpleName(), rootCause.getMessage()));
+                output.err.println(format("nodetool: Failed to connect to '%s:%s' - %s: '%s'.", host, port, rootCause.getClass().getSimpleName(), rootCause.getMessage()));
                 System.exit(1);
             }
 
@@ -381,29 +475,6 @@ public class NodeTool
         {
             return cmdArgs.size() <= 1 ? EMPTY_STRING_ARRAY : toArray(cmdArgs.subList(1, cmdArgs.size()), String.class);
         }
-    }
-
-    public static SortedMap<String, SetHostStat> getOwnershipByDc(NodeProbe probe, boolean resolveIp,
-                                                                  Map<String, String> tokenToEndpoint,
-                                                                  Map<InetAddress, Float> ownerships)
-    {
-        SortedMap<String, SetHostStat> ownershipByDc = Maps.newTreeMap();
-        EndpointSnitchInfoMBean epSnitchInfo = probe.getEndpointSnitchInfoProxy();
-        try
-        {
-            for (Entry<String, String> tokenAndEndPoint : tokenToEndpoint.entrySet())
-            {
-                String dc = epSnitchInfo.getDatacenter(tokenAndEndPoint.getValue());
-                if (!ownershipByDc.containsKey(dc))
-                    ownershipByDc.put(dc, new SetHostStat(resolveIp));
-                ownershipByDc.get(dc).add(tokenAndEndPoint.getKey(), tokenAndEndPoint.getValue(), ownerships);
-            }
-        }
-        catch (UnknownHostException e)
-        {
-            throw new RuntimeException(e);
-        }
-        return ownershipByDc;
     }
 
     public static SortedMap<String, SetHostStatWithPort> getOwnershipByDcWithPort(NodeProbe probe, boolean resolveIp,

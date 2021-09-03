@@ -30,7 +30,9 @@ import java.util.UUID;
 import java.util.stream.Collectors;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Iterables;
 import com.google.common.collect.Maps;
 
 import org.slf4j.Logger;
@@ -44,6 +46,7 @@ import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.io.sstable.ISSTableScanner;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.repair.consistent.admin.CleanupSummary;
 import org.apache.cassandra.schema.CompactionParams;
 import org.apache.cassandra.service.ActiveRepairService;
 import org.apache.cassandra.utils.Pair;
@@ -62,6 +65,7 @@ class PendingRepairManager
 
     private final ColumnFamilyStore cfs;
     private final CompactionParams params;
+    private final boolean isTransient;
     private volatile ImmutableMap<UUID, AbstractCompactionStrategy> strategies = ImmutableMap.of();
 
     /**
@@ -75,10 +79,11 @@ class PendingRepairManager
         }
     }
 
-    PendingRepairManager(ColumnFamilyStore cfs, CompactionParams params)
+    PendingRepairManager(ColumnFamilyStore cfs, CompactionParams params, boolean isTransient)
     {
         this.cfs = cfs;
         this.params = params;
+        this.isTransient = isTransient;
     }
 
     private ImmutableMap.Builder<UUID, AbstractCompactionStrategy> mapBuilder()
@@ -132,7 +137,7 @@ class PendingRepairManager
         return getOrCreate(sstable.getSSTableMetadata().pendingRepair);
     }
 
-    private synchronized void removeSession(UUID sessionID)
+    private synchronized void removeSessionIfEmpty(UUID sessionID)
     {
         if (!strategies.containsKey(sessionID) || !strategies.get(sessionID).getSSTables().isEmpty())
             return;
@@ -143,13 +148,30 @@ class PendingRepairManager
 
     synchronized void removeSSTable(SSTableReader sstable)
     {
-        for (AbstractCompactionStrategy strategy : strategies.values())
-            strategy.removeSSTable(sstable);
+        for (Map.Entry<UUID, AbstractCompactionStrategy> entry : strategies.entrySet())
+        {
+            entry.getValue().removeSSTable(sstable);
+            removeSessionIfEmpty(entry.getKey());
+        }
+    }
+
+
+    void removeSSTables(Iterable<SSTableReader> removed)
+    {
+        for (SSTableReader sstable : removed)
+            removeSSTable(sstable);
     }
 
     synchronized void addSSTable(SSTableReader sstable)
     {
+        Preconditions.checkArgument(sstable.isTransient() == isTransient);
         getOrCreate(sstable).addSSTable(sstable);
+    }
+
+    void addSSTables(Iterable<SSTableReader> added)
+    {
+        for (SSTableReader sstable : added)
+            addSSTable(sstable);
     }
 
     synchronized void replaceSSTables(Set<SSTableReader> removed, Set<SSTableReader> added)
@@ -189,6 +211,8 @@ class PendingRepairManager
                 strategy.replaceSSTables(groupRemoved, groupAdded);
             else
                 strategy.addSSTables(groupAdded);
+
+            removeSessionIfEmpty(entry.getKey());
         }
     }
 
@@ -240,10 +264,77 @@ class PendingRepairManager
     @SuppressWarnings("resource")
     private RepairFinishedCompactionTask getRepairFinishedCompactionTask(UUID sessionID)
     {
-        Set<SSTableReader> sstables = get(sessionID).getSSTables();
+        Preconditions.checkState(canCleanup(sessionID));
+        AbstractCompactionStrategy compactionStrategy = get(sessionID);
+        if (compactionStrategy == null)
+            return null;
+        Set<SSTableReader> sstables = compactionStrategy.getSSTables();
         long repairedAt = ActiveRepairService.instance.consistent.local.getFinalSessionRepairedAt(sessionID);
         LifecycleTransaction txn = cfs.getTracker().tryModify(sstables, OperationType.COMPACTION);
         return txn == null ? null : new RepairFinishedCompactionTask(cfs, txn, sessionID, repairedAt);
+    }
+
+    public static class CleanupTask
+    {
+        private final ColumnFamilyStore cfs;
+        private final List<Pair<UUID, RepairFinishedCompactionTask>> tasks;
+
+        public CleanupTask(ColumnFamilyStore cfs, List<Pair<UUID, RepairFinishedCompactionTask>> tasks)
+        {
+            this.cfs = cfs;
+            this.tasks = tasks;
+        }
+
+        public CleanupSummary cleanup()
+        {
+            Set<UUID> successful = new HashSet<>();
+            Set<UUID> unsuccessful = new HashSet<>();
+            for (Pair<UUID, RepairFinishedCompactionTask> pair : tasks)
+            {
+                UUID session = pair.left;
+                RepairFinishedCompactionTask task = pair.right;
+
+                if (task != null)
+                {
+                    try
+                    {
+                        task.run();
+                        successful.add(session);
+                    }
+                    catch (Throwable t)
+                    {
+                        t = task.transaction.abort(t);
+                        logger.error("Failed cleaning up " + session, t);
+                        unsuccessful.add(session);
+                    }
+                }
+                else
+                {
+                    unsuccessful.add(session);
+                }
+            }
+            return new CleanupSummary(cfs, successful, unsuccessful);
+        }
+
+        public Throwable abort(Throwable accumulate)
+        {
+            for (Pair<UUID, RepairFinishedCompactionTask> pair : tasks)
+                accumulate = pair.right.transaction.abort(accumulate);
+            return accumulate;
+        }
+    }
+
+    public CleanupTask releaseSessionData(Collection<UUID> sessionIDs)
+    {
+        List<Pair<UUID, RepairFinishedCompactionTask>> tasks = new ArrayList<>(sessionIDs.size());
+        for (UUID session : sessionIDs)
+        {
+            if (hasDataForSession(session))
+            {
+                tasks.add(Pair.create(session, getRepairFinishedCompactionTask(session)));
+            }
+        }
+        return new CleanupTask(cfs, tasks);
     }
 
     synchronized int getNumPendingRepairFinishedTasks()
@@ -335,21 +426,6 @@ class PendingRepairManager
         return !ActiveRepairService.instance.consistent.local.isSessionInProgress(sessionID);
     }
 
-    /**
-     * calling this when underlying strategy is not LeveledCompactionStrategy is an error
-     */
-    synchronized int[] getSSTableCountPerLevel()
-    {
-        int [] res = new int[LeveledManifest.MAX_LEVEL_COUNT];
-        for (AbstractCompactionStrategy strategy : strategies.values())
-        {
-            assert strategy instanceof LeveledCompactionStrategy;
-            int[] counts = ((LeveledCompactionStrategy) strategy).getAllLevelSize();
-            res = CompactionStrategyManager.sumArrays(res, counts);
-        }
-        return res;
-    }
-
     @SuppressWarnings("resource")
     synchronized Set<ISSTableScanner> getScanners(Collection<SSTableReader> sstables, Collection<Range<Token>> ranges)
     {
@@ -391,7 +467,16 @@ class PendingRepairManager
         return strategies.keySet().contains(sessionID);
     }
 
-    public Collection<AbstractCompactionTask> createUserDefinedTasks(List<SSTableReader> sstables, int gcBefore)
+    boolean containsSSTable(SSTableReader sstable)
+    {
+        if (!sstable.isPendingRepair())
+            return false;
+
+        AbstractCompactionStrategy strategy = strategies.get(sstable.getPendingRepair());
+        return strategy != null && strategy.getSSTables().contains(sstable);
+    }
+
+    public Collection<AbstractCompactionTask> createUserDefinedTasks(Collection<SSTableReader> sstables, int gcBefore)
     {
         Map<UUID, List<SSTableReader>> group = sstables.stream().collect(Collectors.groupingBy(s -> s.getSSTableMetadata().pendingRepair));
         return group.entrySet().stream().map(g -> strategies.get(g.getKey()).getUserDefinedTask(g.getValue(), gcBefore)).collect(Collectors.toList());
@@ -421,21 +506,38 @@ class PendingRepairManager
         protected void runMayThrow() throws Exception
         {
             boolean completed = false;
+            boolean obsoleteSSTables = isTransient && repairedAt > 0;
             try
             {
-                logger.debug("Setting repairedAt to {} on {} for {}", repairedAt, transaction.originals(), sessionID);
-                cfs.getCompactionStrategyManager().mutateRepaired(transaction.originals(), repairedAt, ActiveRepairService.NO_PENDING_REPAIR);
+                if (obsoleteSSTables)
+                {
+                    logger.info("Obsoleting transient repaired sstables for {}", sessionID);
+                    Preconditions.checkState(Iterables.all(transaction.originals(), SSTableReader::isTransient));
+                    transaction.obsoleteOriginals();
+                }
+                else
+                {
+                    logger.info("Moving {} from pending to repaired with repaired at = {} and session id = {}", transaction.originals(), repairedAt, sessionID);
+                    cfs.getCompactionStrategyManager().mutateRepaired(transaction.originals(), repairedAt, ActiveRepairService.NO_PENDING_REPAIR, false);
+                }
                 completed = true;
             }
             finally
             {
-                // we always abort because mutating metadata isn't guarded by LifecycleTransaction, so this won't roll
-                // anything back. Also, we don't want to obsolete the originals. We're only using it to prevent other
-                // compactions from marking these sstables compacting, and unmarking them when we're done
-                transaction.abort();
+                if (obsoleteSSTables)
+                {
+                    transaction.finish();
+                }
+                else
+                {
+                    // we abort here because mutating metadata isn't guarded by LifecycleTransaction, so this won't roll
+                    // anything back. Also, we don't want to obsolete the originals. We're only using it to prevent other
+                    // compactions from marking these sstables compacting, and unmarking them when we're done
+                    transaction.abort();
+                }
                 if (completed)
                 {
-                    removeSession(sessionID);
+                    removeSessionIfEmpty(sessionID);
                 }
             }
         }
@@ -445,7 +547,7 @@ class PendingRepairManager
             throw new UnsupportedOperationException();
         }
 
-        protected int executeInternal(CompactionManager.CompactionExecutorStatsCollector collector)
+        protected int executeInternal(ActiveCompactionsTracker activeCompactions)
         {
             run();
             return transaction.originals().size();

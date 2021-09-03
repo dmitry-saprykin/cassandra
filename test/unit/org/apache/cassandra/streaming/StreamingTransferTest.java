@@ -24,16 +24,20 @@ import java.util.concurrent.TimeUnit;
 import com.google.common.collect.Iterables;
 import com.google.common.util.concurrent.FutureCallback;
 import com.google.common.util.concurrent.Futures;
+import com.google.common.util.concurrent.MoreExecutors;
+
+import org.apache.cassandra.locator.RangesAtEndpoint;
 import org.junit.BeforeClass;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import junit.framework.Assert;
+import org.junit.Assert;
 import org.apache.cassandra.OrderedJUnit4ClassRunner;
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
+import org.apache.cassandra.db.streaming.CassandraOutgoingFile;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.config.DatabaseDescriptor;
@@ -128,7 +132,7 @@ public class StreamingTransferTest
             {
                 fail();
             }
-        });
+        }, MoreExecutors.directExecutor());
         // should be complete immediately
         futureResult.get(100, TimeUnit.MILLISECONDS);
     }
@@ -143,7 +147,7 @@ public class StreamingTransferTest
         ranges.add(new Range<>(p.getToken(ByteBufferUtil.bytes("key2")), p.getMinimumToken()));
 
         StreamResultFuture futureResult = new StreamPlan(StreamOperation.OTHER)
-                                                  .requestRanges(LOCAL, LOCAL, KEYSPACE2, ranges)
+                                                  .requestRanges(LOCAL, KEYSPACE2, RangesAtEndpoint.toDummyList(ranges), RangesAtEndpoint.toDummyList(Collections.emptyList()))
                                                   .execute();
 
         UUID planId = futureResult.planId;
@@ -208,7 +212,7 @@ public class StreamingTransferTest
             assert !Util.getAll(Util.cmd(cfs, key).build()).isEmpty();
             ImmutableBTreePartition partition = partitions.get(i);
             assert ByteBufferUtil.compareUnsigned(partition.partitionKey().getKey(), ByteBufferUtil.bytes(key)) == 0;
-            assert ByteBufferUtil.compareUnsigned(partition.iterator().next().clustering().get(0), ByteBufferUtil.bytes(col)) == 0;
+            assert ByteBufferUtil.compareUnsigned(partition.iterator().next().clustering().bufferAt(0), ByteBufferUtil.bytes(col)) == 0;
         }
 
         // and that the max timestamp for the file was rediscovered
@@ -237,13 +241,13 @@ public class StreamingTransferTest
         List<Range<Token>> ranges = new ArrayList<>();
         // wrapped range
         ranges.add(new Range<Token>(p.getToken(ByteBufferUtil.bytes("key1")), p.getToken(ByteBufferUtil.bytes("key0"))));
-        StreamPlan streamPlan = new StreamPlan(StreamOperation.OTHER).transferRanges(LOCAL, cfs.keyspace.getName(), ranges, cfs.getTableName());
+        StreamPlan streamPlan = new StreamPlan(StreamOperation.OTHER).transferRanges(LOCAL, cfs.keyspace.getName(), RangesAtEndpoint.toDummyList(ranges), cfs.getTableName());
         streamPlan.execute().get();
 
         //cannot add ranges after stream session is finished
         try
         {
-            streamPlan.transferRanges(LOCAL, cfs.keyspace.getName(), ranges, cfs.getTableName());
+            streamPlan.transferRanges(LOCAL, cfs.keyspace.getName(), RangesAtEndpoint.toDummyList(ranges), cfs.getTableName());
             fail("Should have thrown exception");
         }
         catch (RuntimeException e)
@@ -254,13 +258,13 @@ public class StreamingTransferTest
 
     private void transfer(SSTableReader sstable, List<Range<Token>> ranges) throws Exception
     {
-        StreamPlan streamPlan = new StreamPlan(StreamOperation.OTHER).transferFiles(LOCAL, makeStreamingDetails(ranges, Refs.tryRef(Arrays.asList(sstable))));
+        StreamPlan streamPlan = new StreamPlan(StreamOperation.OTHER).transferStreams(LOCAL, makeOutgoingStreams(ranges, Refs.tryRef(Arrays.asList(sstable))));
         streamPlan.execute().get();
 
         //cannot add files after stream session is finished
         try
         {
-            streamPlan.transferFiles(LOCAL, makeStreamingDetails(ranges, Refs.tryRef(Arrays.asList(sstable))));
+            streamPlan.transferStreams(LOCAL, makeOutgoingStreams(ranges, Refs.tryRef(Arrays.asList(sstable))));
             fail("Should have thrown exception");
         }
         catch (RuntimeException e)
@@ -269,16 +273,23 @@ public class StreamingTransferTest
         }
     }
 
-    private Collection<StreamSession.SSTableStreamingSections> makeStreamingDetails(List<Range<Token>> ranges, Refs<SSTableReader> sstables)
+    private Collection<OutgoingStream> makeOutgoingStreams(StreamOperation operation, List<Range<Token>> ranges, Refs<SSTableReader> sstables)
     {
-        ArrayList<StreamSession.SSTableStreamingSections> details = new ArrayList<>();
+        ArrayList<OutgoingStream> streams = new ArrayList<>();
         for (SSTableReader sstable : sstables)
         {
-            details.add(new StreamSession.SSTableStreamingSections(sstables.get(sstable),
-                                                                   sstable.getPositionsForRanges(ranges),
-                                                                   sstable.estimatedKeysForRanges(ranges)));
+            streams.add(new CassandraOutgoingFile(operation,
+                                                  sstables.get(sstable),
+                                                  sstable.getPositionsForRanges(ranges),
+                                                  ranges,
+                                                  sstable.estimatedKeysForRanges(ranges)));
         }
-        return details;
+        return streams;
+    }
+
+    private Collection<OutgoingStream> makeOutgoingStreams(List<Range<Token>> ranges, Refs<SSTableReader> sstables)
+    {
+        return makeOutgoingStreams(StreamOperation.OTHER, ranges, sstables);
     }
 
     private void doTransferTable(boolean transferSSTables) throws Exception
@@ -364,7 +375,7 @@ public class StreamingTransferTest
 
         Row r = Util.getOnlyRow(Util.cmd(cfs).build());
         Assert.assertFalse(r.isEmpty());
-        Assert.assertTrue(1 == Int32Type.instance.compose(r.clustering().get(0)));
+        Assert.assertTrue(1 == Int32Type.instance.compose(r.clustering().bufferAt(0)));
     }
 
     @Test
@@ -458,7 +469,7 @@ public class StreamingTransferTest
         // Acquiring references, transferSSTables needs it
         Refs<SSTableReader> refs = Refs.tryRef(Arrays.asList(sstable, sstable2));
         assert refs != null;
-        new StreamPlan("StreamingTransferTest").transferFiles(LOCAL, makeStreamingDetails(ranges, refs)).execute().get();
+        new StreamPlan("StreamingTransferTest").transferStreams(LOCAL, makeOutgoingStreams(ranges, refs)).execute().get();
 
         // confirm that the sstables were transferred and registered and that 2 keys arrived
         ColumnFamilyStore cfstore = Keyspace.open(keyspaceName).getColumnFamilyStore(cfname);
@@ -513,7 +524,7 @@ public class StreamingTransferTest
         if (refs == null)
             throw new AssertionError();
 
-        new StreamPlan("StreamingTransferTest").transferFiles(LOCAL, makeStreamingDetails(ranges, refs)).execute().get();
+        new StreamPlan("StreamingTransferTest").transferStreams(LOCAL, makeOutgoingStreams(ranges, refs)).execute().get();
 
         // check that only two keys were transferred
         for (Map.Entry<DecoratedKey,String> entry : Arrays.asList(first, last))

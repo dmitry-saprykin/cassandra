@@ -118,6 +118,11 @@ public class ColumnIdentifier implements IMeasurableMemory, Comparable<ColumnIde
         this(bytes, type.getString(bytes), false);
     }
 
+    public ColumnIdentifier(ByteBuffer bytes, String text)
+    {
+        this(bytes, text, false);
+    }
+
     private ColumnIdentifier(ByteBuffer bytes, String text, boolean interned)
     {
         this.bytes = bytes;
@@ -200,7 +205,7 @@ public class ColumnIdentifier implements IMeasurableMemory, Comparable<ColumnIde
     public long unsharedHeapSizeExcludingData()
     {
         return EMPTY_SIZE
-             + ObjectSizes.sizeOnHeapExcludingData(bytes)
+             + ObjectSizes.sizeOfEmptyHeapByteBuffer()
              + ObjectSizes.sizeOf(text);
     }
 

@@ -51,18 +51,6 @@ public class MajorLeveledCompactionWriter extends CompactionAwareWriter
         this(cfs, directories, txn, nonExpiredSSTables, maxSSTableSize, false);
     }
 
-    @Deprecated
-    public MajorLeveledCompactionWriter(ColumnFamilyStore cfs,
-                                        Directories directories,
-                                        LifecycleTransaction txn,
-                                        Set<SSTableReader> nonExpiredSSTables,
-                                        long maxSSTableSize,
-                                        boolean offline,
-                                        boolean keepOriginals)
-    {
-        this(cfs, directories, txn, nonExpiredSSTables, maxSSTableSize, keepOriginals);
-    }
-
     @SuppressWarnings("resource")
     public MajorLeveledCompactionWriter(ColumnFamilyStore cfs,
                                         Directories directories,
@@ -108,6 +96,7 @@ public class MajorLeveledCompactionWriter extends CompactionAwareWriter
                 keysPerSSTable,
                 minRepairedAt,
                 pendingRepair,
+                isTransient,
                 cfs.metadata,
                 new MetadataCollector(txn.originals(), cfs.metadata().comparator, currentLevel),
                 SerializationHeader.make(cfs.metadata(), txn.originals()),

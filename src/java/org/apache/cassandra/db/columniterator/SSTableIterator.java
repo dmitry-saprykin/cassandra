@@ -75,9 +75,9 @@ public class SSTableIterator extends AbstractSSTableIterator
     private class ForwardReader extends Reader
     {
         // The start of the current slice. This will be null as soon as we know we've passed that bound.
-        protected ClusteringBound start;
+        protected ClusteringBound<?> start;
         // The end of the current slice. Will never be null.
-        protected ClusteringBound end = ClusteringBound.TOP;
+        protected ClusteringBound<?> end = BufferClusteringBound.TOP;
 
         protected Unfiltered next; // the next element to return: this is computed by hasNextInternal().
 
@@ -91,7 +91,7 @@ public class SSTableIterator extends AbstractSSTableIterator
 
         public void setForSlice(Slice slice) throws IOException
         {
-            start = slice.start() == ClusteringBound.BOTTOM ? null : slice.start();
+            start = slice.start().isBottom() ? null : slice.start();
             end = slice.end();
 
             sliceDone = false;
@@ -119,7 +119,7 @@ public class SSTableIterator extends AbstractSSTableIterator
                     updateOpenMarker((RangeTombstoneMarker)deserializer.readNext());
             }
 
-            ClusteringBound sliceStart = start;
+            ClusteringBound<?> sliceStart = start;
             start = null;
 
             // We've reached the beginning of our queried slice. If we have an open marker
@@ -150,6 +150,7 @@ public class SSTableIterator extends AbstractSSTableIterator
                     return null;
 
                 Unfiltered next = deserializer.readNext();
+                UnfilteredValidation.maybeValidateUnfiltered(next, metadata(), key, sstable);
                 // We may get empty row for the same reason expressed on UnfilteredSerializer.deserializeOne.
                 if (next.isEmpty())
                     continue;
@@ -299,6 +300,7 @@ public class SSTableIterator extends AbstractSSTableIterator
 
 
                 Unfiltered next = deserializer.readNext();
+                UnfilteredValidation.maybeValidateUnfiltered(next, metadata(), key, sstable);
                 // We may get empty row for the same reason expressed on UnfilteredSerializer.deserializeOne.
                 if (next.isEmpty())
                     continue;

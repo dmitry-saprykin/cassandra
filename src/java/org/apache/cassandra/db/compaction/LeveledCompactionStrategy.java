@@ -21,13 +21,17 @@ import java.util.*;
 
 
 import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Joiner;
 import com.google.common.collect.*;
 import com.google.common.primitives.Doubles;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import org.apache.cassandra.io.sstable.metadata.StatsMetadata;
+import org.apache.cassandra.schema.CompactionParams;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.config.Config;
 import org.apache.cassandra.db.ColumnFamilyStore;
@@ -38,9 +42,6 @@ import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.sstable.ISSTableScanner;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
-import org.codehaus.jackson.JsonNode;
-import org.codehaus.jackson.node.JsonNodeFactory;
-import org.codehaus.jackson.node.ObjectNode;
 
 public class LeveledCompactionStrategy extends AbstractCompactionStrategy
 {
@@ -48,18 +49,21 @@ public class LeveledCompactionStrategy extends AbstractCompactionStrategy
     private static final String SSTABLE_SIZE_OPTION = "sstable_size_in_mb";
     private static final boolean tolerateSstableSize = Boolean.getBoolean(Config.PROPERTY_PREFIX + "tolerate_sstable_size");
     private static final String LEVEL_FANOUT_SIZE_OPTION = "fanout_size";
+    private static final String SINGLE_SSTABLE_UPLEVEL_OPTION = "single_sstable_uplevel";
     public static final int DEFAULT_LEVEL_FANOUT_SIZE = 10;
 
     @VisibleForTesting
     final LeveledManifest manifest;
     private final int maxSSTableSizeInMB;
     private final int levelFanoutSize;
+    private final boolean singleSSTableUplevel;
 
     public LeveledCompactionStrategy(ColumnFamilyStore cfs, Map<String, String> options)
     {
         super(cfs, options);
         int configuredMaxSSTableSize = 160;
         int configuredLevelFanoutSize = DEFAULT_LEVEL_FANOUT_SIZE;
+        boolean configuredSingleSSTableUplevel = false;
         SizeTieredCompactionStrategyOptions localOptions = new SizeTieredCompactionStrategyOptions(options);
         if (options != null)
         {
@@ -81,9 +85,15 @@ public class LeveledCompactionStrategy extends AbstractCompactionStrategy
             {
                 configuredLevelFanoutSize = Integer.parseInt(options.get(LEVEL_FANOUT_SIZE_OPTION));
             }
+
+            if (options.containsKey(SINGLE_SSTABLE_UPLEVEL_OPTION))
+            {
+                configuredSingleSSTableUplevel = Boolean.parseBoolean(options.get(SINGLE_SSTABLE_UPLEVEL_OPTION));
+            }
         }
         maxSSTableSizeInMB = configuredMaxSSTableSize;
         levelFanoutSize = configuredLevelFanoutSize;
+        singleSSTableUplevel = configuredSingleSSTableUplevel;
 
         manifest = new LeveledManifest(cfs, this.maxSSTableSizeInMB, this.levelFanoutSize, localOptions);
         logger.trace("Created {}", manifest);
@@ -97,6 +107,11 @@ public class LeveledCompactionStrategy extends AbstractCompactionStrategy
     public int[] getAllLevelSize()
     {
         return manifest.getAllLevelSize();
+    }
+
+    public long[] getAllLevelSizeBytes()
+    {
+        return manifest.getAllLevelSizeBytes();
     }
 
     @Override
@@ -150,7 +165,12 @@ public class LeveledCompactionStrategy extends AbstractCompactionStrategy
             LifecycleTransaction txn = cfs.getTracker().tryModify(candidate.sstables, OperationType.COMPACTION);
             if (txn != null)
             {
-                LeveledCompactionTask newTask = new LeveledCompactionTask(cfs, txn, candidate.level, gcBefore, candidate.maxSSTableBytes, false);
+                AbstractCompactionTask newTask;
+                if (!singleSSTableUplevel || op == OperationType.TOMBSTONE_COMPACTION || txn.originals().size() > 1)
+                    newTask = new LeveledCompactionTask(cfs, txn, candidate.level, gcBefore, candidate.maxSSTableBytes, false);
+                else
+                    newTask = new SingleSSTableLCSTask(cfs, txn, candidate.level);
+
                 newTask.setCompactionType(op);
                 return newTask;
             }
@@ -161,7 +181,7 @@ public class LeveledCompactionStrategy extends AbstractCompactionStrategy
     @SuppressWarnings("resource") // transaction is closed by AbstractCompactionTask::execute
     public synchronized Collection<AbstractCompactionTask> getMaximalTask(int gcBefore, boolean splitOutput)
     {
-        Iterable<SSTableReader> sstables = manifest.getAllSSTables();
+        Iterable<SSTableReader> sstables = manifest.getSSTables();
 
         Iterable<SSTableReader> filteredSSTables = filterSuspectSSTables(sstables);
         if (Iterables.isEmpty(sstables))
@@ -332,9 +352,22 @@ public class LeveledCompactionStrategy extends AbstractCompactionStrategy
     }
 
     @Override
+    public void metadataChanged(StatsMetadata oldMetadata, SSTableReader sstable)
+    {
+        if (sstable.getSSTableLevel() != oldMetadata.sstableLevel)
+            manifest.newLevel(sstable, oldMetadata.sstableLevel);
+    }
+
+    @Override
+    public void addSSTables(Iterable<SSTableReader> sstables)
+    {
+        manifest.addSSTables(sstables);
+    }
+
+    @Override
     public void addSSTable(SSTableReader added)
     {
-        manifest.add(added);
+        manifest.addSSTables(Collections.singleton(added));
     }
 
     @Override
@@ -470,9 +503,9 @@ public class LeveledCompactionStrategy extends AbstractCompactionStrategy
             return currentScanner == null ? totalBytesScanned : totalBytesScanned + currentScanner.getBytesScanned();
         }
 
-        public String getBackingFiles()
+        public Set<SSTableReader> getBackingSSTables()
         {
-            return Joiner.on(", ").join(sstables);
+            return ImmutableSet.copyOf(sstables);
         }
     }
 
@@ -487,21 +520,17 @@ public class LeveledCompactionStrategy extends AbstractCompactionStrategy
         level:
         for (int i = manifest.getLevelCount(); i >= 0; i--)
         {
-            // sort sstables by droppable ratio in descending order
-            SortedSet<SSTableReader> sstables = manifest.getLevelSorted(i, new Comparator<SSTableReader>()
-            {
-                public int compare(SSTableReader o1, SSTableReader o2)
-                {
-                    double r1 = o1.getEstimatedDroppableTombstoneRatio(gcBefore);
-                    double r2 = o2.getEstimatedDroppableTombstoneRatio(gcBefore);
-                    return -1 * Doubles.compare(r1, r2);
-                }
-            });
-            if (sstables.isEmpty())
+            if (manifest.getLevelSize(i) == 0)
                 continue;
+            // sort sstables by droppable ratio in descending order
+            List<SSTableReader> tombstoneSortedSSTables = manifest.getLevelSorted(i, (o1, o2) -> {
+                double r1 = o1.getEstimatedDroppableTombstoneRatio(gcBefore);
+                double r2 = o2.getEstimatedDroppableTombstoneRatio(gcBefore);
+                return -1 * Doubles.compare(r1, r2);
+            });
 
             Set<SSTableReader> compacting = cfs.getTracker().getCompacting();
-            for (SSTableReader sstable : sstables)
+            for (SSTableReader sstable : tombstoneSortedSSTables)
             {
                 if (sstable.getEstimatedDroppableTombstoneRatio(gcBefore) <= tombstoneThreshold)
                     continue level;
@@ -568,6 +597,10 @@ public class LeveledCompactionStrategy extends AbstractCompactionStrategy
         }
 
         uncheckedOptions.remove(LEVEL_FANOUT_SIZE_OPTION);
+        uncheckedOptions.remove(SINGLE_SSTABLE_UPLEVEL_OPTION);
+
+        uncheckedOptions.remove(CompactionParams.Option.MIN_THRESHOLD.toString());
+        uncheckedOptions.remove(CompactionParams.Option.MAX_THRESHOLD.toString());
 
         uncheckedOptions = SizeTieredCompactionStrategyOptions.validateOptions(options, uncheckedOptions);
 

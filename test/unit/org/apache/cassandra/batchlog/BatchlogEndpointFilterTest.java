@@ -20,24 +20,24 @@ package org.apache.cassandra.batchlog;
 import java.net.UnknownHostException;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.List;
 
 import com.google.common.collect.ImmutableMultimap;
 import com.google.common.collect.Multimap;
 import org.junit.Test;
-import org.junit.matchers.JUnitMatchers;
 
 import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.locator.ReplicaPlans;
 
 import static org.hamcrest.CoreMatchers.is;
 import static org.junit.Assert.assertThat;
+import static org.junit.Assert.assertTrue;
 
 public class BatchlogEndpointFilterTest
 {
     private static final String LOCAL = "local";
 
     @Test
-    public void shouldSelect2hostsFromNonLocalRacks() throws UnknownHostException
+    public void shouldSelect2HostsFromNonLocalRacks() throws UnknownHostException
     {
         Multimap<String, InetAddressAndPort> endpoints = ImmutableMultimap.<String, InetAddressAndPort> builder()
                 .put(LOCAL, InetAddressAndPort.getByName("0"))
@@ -47,10 +47,31 @@ public class BatchlogEndpointFilterTest
                 .put("2", InetAddressAndPort.getByName("2"))
                 .put("2", InetAddressAndPort.getByName("22"))
                 .build();
-        Collection<InetAddressAndPort> result = new TestEndpointFilter(LOCAL, endpoints).filter();
+        Collection<InetAddressAndPort> result = filterBatchlogEndpoints(endpoints);
         assertThat(result.size(), is(2));
-        assertThat(result, JUnitMatchers.hasItem(InetAddressAndPort.getByName("11")));
-        assertThat(result, JUnitMatchers.hasItem(InetAddressAndPort.getByName("22")));
+        assertTrue(result.contains(InetAddressAndPort.getByName("11")));
+        assertTrue(result.contains(InetAddressAndPort.getByName("22")));
+    }
+
+    @Test
+    public void shouldSelectLastHostsFromLastNonLocalRacks() throws UnknownHostException
+    {
+        Multimap<String, InetAddressAndPort> endpoints = ImmutableMultimap.<String, InetAddressAndPort> builder()
+                                                         .put(LOCAL, InetAddressAndPort.getByName("00"))
+                                                         .put("1", InetAddressAndPort.getByName("11"))
+                                                         .put("2", InetAddressAndPort.getByName("2"))
+                                                         .put("2", InetAddressAndPort.getByName("22"))
+                                                         .put("3", InetAddressAndPort.getByName("3"))
+                                                         .put("3", InetAddressAndPort.getByName("33"))
+                                                         .build();
+        
+        Collection<InetAddressAndPort> result = filterBatchlogEndpoints(endpoints);
+        assertThat(result.size(), is(2));
+
+        // result should be the last replicas of the last two racks
+        // (Collections.shuffle has been replaced with Collections.reverse for testing)
+        assertTrue(result.contains(InetAddressAndPort.getByName("22")));
+        assertTrue(result.contains(InetAddressAndPort.getByName("33")));
     }
 
     @Test
@@ -61,21 +82,21 @@ public class BatchlogEndpointFilterTest
                 .put(LOCAL, InetAddressAndPort.getByName("00"))
                 .put("1", InetAddressAndPort.getByName("1"))
                 .build();
-        Collection<InetAddressAndPort> result = new TestEndpointFilter(LOCAL, endpoints).filter();
+        Collection<InetAddressAndPort> result = filterBatchlogEndpoints(endpoints);
         assertThat(result.size(), is(2));
-        assertThat(result, JUnitMatchers.hasItem(InetAddressAndPort.getByName("1")));
-        assertThat(result, JUnitMatchers.hasItem(InetAddressAndPort.getByName("0")));
+        assertTrue(result.contains(InetAddressAndPort.getByName("1")));
+        assertTrue(result.contains(InetAddressAndPort.getByName("0")));
     }
 
     @Test
-    public void shouldReturnAsIsIfNoEnoughEndpoints() throws UnknownHostException
+    public void shouldReturnPassedEndpointForSingleNodeDC() throws UnknownHostException
     {
         Multimap<String, InetAddressAndPort> endpoints = ImmutableMultimap.<String, InetAddressAndPort> builder()
                 .put(LOCAL, InetAddressAndPort.getByName("0"))
                 .build();
-        Collection<InetAddressAndPort> result = new TestEndpointFilter(LOCAL, endpoints).filter();
+        Collection<InetAddressAndPort> result = filterBatchlogEndpoints(endpoints);
         assertThat(result.size(), is(1));
-        assertThat(result, JUnitMatchers.hasItem(InetAddressAndPort.getByName("0")));
+        assertTrue(result.contains(InetAddressAndPort.getByName("0")));
     }
 
     @Test
@@ -88,12 +109,12 @@ public class BatchlogEndpointFilterTest
                 .put("1", InetAddressAndPort.getByName("11"))
                 .put("1", InetAddressAndPort.getByName("111"))
                 .build();
-        Collection<InetAddressAndPort> result = new TestEndpointFilter(LOCAL, endpoints).filter();
+        Collection<InetAddressAndPort> result = filterBatchlogEndpoints(endpoints);
         // result should be the last two non-local replicas
         // (Collections.shuffle has been replaced with Collections.reverse for testing)
         assertThat(result.size(), is(2));
-        assertThat(result, JUnitMatchers.hasItem(InetAddressAndPort.getByName("11")));
-        assertThat(result, JUnitMatchers.hasItem(InetAddressAndPort.getByName("111")));
+        assertTrue(result.contains(InetAddressAndPort.getByName("11")));
+        assertTrue(result.contains(InetAddressAndPort.getByName("111")));
     }
 
     @Test
@@ -105,40 +126,35 @@ public class BatchlogEndpointFilterTest
                 .put(LOCAL, InetAddressAndPort.getByName("111"))
                 .put(LOCAL, InetAddressAndPort.getByName("1111"))
                 .build();
-        Collection<InetAddressAndPort> result = new TestEndpointFilter(LOCAL, endpoints).filter();
+        Collection<InetAddressAndPort> result = filterBatchlogEndpoints(endpoints);
         // result should be the last two non-local replicas
         // (Collections.shuffle has been replaced with Collections.reverse for testing)
         assertThat(result.size(), is(2));
-        assertThat(result, JUnitMatchers.hasItem(InetAddressAndPort.getByName("111")));
-        assertThat(result, JUnitMatchers.hasItem(InetAddressAndPort.getByName("1111")));
+        assertTrue(result.contains(InetAddressAndPort.getByName("111")));
+        assertTrue(result.contains(InetAddressAndPort.getByName("1111")));
     }
 
-    private static class TestEndpointFilter extends BatchlogManager.EndpointFilter
+    @Test
+    public void shouldSelectOnlyTwoHostsEvenIfLocal() throws UnknownHostException
     {
-        TestEndpointFilter(String localRack, Multimap<String, InetAddressAndPort> endpoints)
-        {
-            super(localRack, endpoints);
-        }
+        Multimap<String, InetAddressAndPort> endpoints = ImmutableMultimap.<String, InetAddressAndPort> builder()
+                                                         .put(LOCAL, InetAddressAndPort.getByName("1"))
+                                                         .put(LOCAL, InetAddressAndPort.getByName("11"))
+                                                         .build();
+        Collection<InetAddressAndPort> result = filterBatchlogEndpoints(endpoints);
+        assertThat(result.size(), is(2));
+        assertTrue(result.contains(InetAddressAndPort.getByName("1")));
+        assertTrue(result.contains(InetAddressAndPort.getByName("11")));
+    }
 
-        @Override
-        protected boolean isValid(InetAddressAndPort input)
-        {
-            // We will use always alive non-localhost endpoints
-            return true;
-        }
-
-        @Override
-        protected int getRandomInt(int bound)
-        {
-            // We don't need random behavior here
-            return bound - 1;
-        }
-
-        @Override
-        protected void shuffle(List<?> list)
-        {
-            // We don't need random behavior here
-            Collections.reverse(list);
-        }
+    private Collection<InetAddressAndPort> filterBatchlogEndpoints(Multimap<String, InetAddressAndPort> endpoints)
+    {
+        return ReplicaPlans.filterBatchlogEndpoints(LOCAL, endpoints,
+                                                    // Reverse instead of shuffle
+                                                    Collections::reverse,
+                                                    // Always alive
+                                                    (addr) -> true,
+                                                    // Always pick the last
+                                                    (size) -> size - 1);
     }
 }

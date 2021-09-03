@@ -22,6 +22,8 @@ import java.lang.reflect.Field;
 import java.math.BigInteger;
 import java.net.*;
 import java.nio.ByteBuffer;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.zip.CRC32;
@@ -34,13 +36,17 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Joiner;
 import com.google.common.base.Strings;
 import com.google.common.util.concurrent.Uninterruptibles;
-
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.fasterxml.jackson.core.JsonFactory;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.cassandra.auth.AllowAllNetworkAuthorizer;
+import org.apache.cassandra.audit.IAuditLogger;
 import org.apache.cassandra.auth.IAuthenticator;
 import org.apache.cassandra.auth.IAuthorizer;
+import org.apache.cassandra.auth.INetworkAuthorizer;
 import org.apache.cassandra.auth.IRoleManager;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.DecoratedKey;
@@ -60,16 +66,23 @@ import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.io.util.DataOutputBufferFixed;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.locator.InetAddressAndPort;
-import org.apache.cassandra.net.AsyncOneResponse;
 
-import org.codehaus.jackson.JsonFactory;
-import org.codehaus.jackson.map.ObjectMapper;
+import static org.apache.cassandra.config.CassandraRelevantProperties.LINE_SEPARATOR;
+import static org.apache.cassandra.config.CassandraRelevantProperties.USER_HOME;
+
 
 public class FBUtilities
 {
+    static
+    {
+        preventIllegalAccessWarnings();
+    }
+
     private static final Logger logger = LoggerFactory.getLogger(FBUtilities.class);
 
     private static final ObjectMapper jsonMapper = new ObjectMapper(new JsonFactory());
+
+    public static final String UNKNOWN_RELEASE_VERSION = "Unknown";
 
     public static final BigInteger TWO = new BigInteger("2");
     private static final String DEFAULT_TRIGGER_DIR = "triggers";
@@ -85,6 +98,8 @@ public class FBUtilities
     private static volatile InetAddressAndPort broadcastInetAddressAndPort;
     private static volatile InetAddressAndPort localInetAddressAndPort;
 
+    private static volatile String previousReleaseVersionString;
+
     public static int getAvailableProcessors()
     {
         String availableProcessors = System.getProperty("cassandra.available_processors");
@@ -96,6 +111,18 @@ public class FBUtilities
 
     public static final int MAX_UNSIGNED_SHORT = 0xFFFF;
 
+    public static MessageDigest newMessageDigest(String algorithm)
+    {
+        try
+        {
+            return MessageDigest.getInstance(algorithm);
+        }
+        catch (NoSuchAlgorithmException nsae)
+        {
+            throw new RuntimeException("the requested digest algorithm (" + algorithm + ") is not available", nsae);
+        }
+    }
+
     /**
      * Please use getJustBroadcastAddress instead. You need this only when you have to listen/connect. It's also missing
      * the port you should be using. 99% of code doesn't want this.
@@ -103,16 +130,29 @@ public class FBUtilities
     public static InetAddress getJustLocalAddress()
     {
         if (localInetAddress == null)
-            try
+        {
+            if (DatabaseDescriptor.getListenAddress() == null)
             {
-                localInetAddress = DatabaseDescriptor.getListenAddress() == null
-                                    ? InetAddress.getLocalHost()
-                                    : DatabaseDescriptor.getListenAddress();
+                try
+                {
+                    localInetAddress = InetAddress.getLocalHost();
+                    logger.info("InetAddress.getLocalHost() was used to resolve listen_address to {}, double check this is "
+                                + "correct. Please check your node's config and set the listen_address in cassandra.yaml accordingly if applicable.",
+                                localInetAddress);
+                }
+                catch(UnknownHostException e)
+                {
+                    logger.info("InetAddress.getLocalHost() could not resolve the address for the hostname ({}), please "
+                                + "check your node's config and set the listen_address in cassandra.yaml. Falling back to {}",
+                                e,
+                                InetAddress.getLoopbackAddress());
+                    // CASSANDRA-15901 fallback for misconfigured nodes
+                    localInetAddress = InetAddress.getLoopbackAddress();
+                }
             }
-            catch (UnknownHostException e)
-            {
-                throw new RuntimeException(e);
-            }
+            else
+                localInetAddress = DatabaseDescriptor.getListenAddress();
+        }
         return localInetAddress;
     }
 
@@ -124,7 +164,15 @@ public class FBUtilities
     {
         if (localInetAddressAndPort == null)
         {
-            localInetAddressAndPort = InetAddressAndPort.getByAddress(getJustLocalAddress());
+            if(DatabaseDescriptor.getRawConfig() == null)
+            {
+                localInetAddressAndPort = InetAddressAndPort.getByAddress(getJustLocalAddress());
+            }
+            else
+            {
+                localInetAddressAndPort = InetAddressAndPort.getByAddressOverrideDefaults(getJustLocalAddress(),
+                                                                                          DatabaseDescriptor.getStoragePort());
+            }
         }
         return localInetAddressAndPort;
     }
@@ -151,7 +199,15 @@ public class FBUtilities
     {
         if (broadcastInetAddressAndPort == null)
         {
-            broadcastInetAddressAndPort = InetAddressAndPort.getByAddress(getJustBroadcastAddress());
+            if(DatabaseDescriptor.getRawConfig() == null)
+            {
+                broadcastInetAddressAndPort = InetAddressAndPort.getByAddress(getJustBroadcastAddress());
+            }
+            else
+            {
+                broadcastInetAddressAndPort = InetAddressAndPort.getByAddressOverrideDefaults(getJustBroadcastAddress(),
+                                                                                              DatabaseDescriptor.getStoragePort());
+            }
         }
         return broadcastInetAddressAndPort;
     }
@@ -163,6 +219,15 @@ public class FBUtilities
     {
         broadcastInetAddress = addr;
         broadcastInetAddressAndPort = InetAddressAndPort.getByAddress(broadcastInetAddress);
+    }
+
+    /**
+     * <b>THIS IS FOR TESTING ONLY!!</b>
+     */
+    public static void setBroadcastInetAddressAndPort(InetAddressAndPort addr)
+    {
+        broadcastInetAddress = addr.address;
+        broadcastInetAddressAndPort = addr;
     }
 
     /**
@@ -185,8 +250,15 @@ public class FBUtilities
     public static InetAddressAndPort getBroadcastNativeAddressAndPort()
     {
         if (broadcastNativeAddressAndPort == null)
-            broadcastNativeAddressAndPort = InetAddressAndPort.getByAddressOverrideDefaults(getJustBroadcastNativeAddress(),
-                                                                                             DatabaseDescriptor.getNativeTransportPort());
+            if(DatabaseDescriptor.getRawConfig() == null)
+            {
+                broadcastNativeAddressAndPort = InetAddressAndPort.getByAddress(getJustBroadcastNativeAddress());
+            }
+            else
+            {
+                broadcastNativeAddressAndPort = InetAddressAndPort.getByAddressOverrideDefaults(getJustBroadcastNativeAddress(),
+                                                                                                DatabaseDescriptor.getNativeTransportPort());
+            }
         return broadcastNativeAddressAndPort;
     }
 
@@ -251,30 +323,6 @@ public class FBUtilities
         return compareUnsigned(bytes1, bytes2, 0, 0, bytes1.length, bytes2.length);
     }
 
-    /**
-     * @return The bitwise XOR of the inputs. The output will be the same length as the
-     * longer input, but if either input is null, the output will be null.
-     */
-    public static byte[] xor(byte[] left, byte[] right)
-    {
-        if (left == null || right == null)
-            return null;
-        if (left.length > right.length)
-        {
-            byte[] swap = left;
-            left = right;
-            right = swap;
-        }
-
-        // left.length is now <= right.length
-        byte[] out = Arrays.copyOf(right, right.length);
-        for (int i = 0; i < left.length; i++)
-        {
-            out[i] = (byte)((left[i] & 0xFF) ^ (right[i] & 0xFF));
-        }
-        return out;
-    }
-
     public static void sortSampledKeys(List<DecoratedKey> keys, Range<Token> range)
     {
         if (range.left.compareTo(range.right) >= 0)
@@ -334,13 +382,23 @@ public class FBUtilities
         return triggerDir;
     }
 
+    public static void setPreviousReleaseVersionString(String previousReleaseVersionString)
+    {
+        FBUtilities.previousReleaseVersionString = previousReleaseVersionString;
+    }
+
+    public static String getPreviousReleaseVersionString()
+    {
+        return previousReleaseVersionString;
+    }
+
     public static String getReleaseVersionString()
     {
         try (InputStream in = FBUtilities.class.getClassLoader().getResourceAsStream("org/apache/cassandra/config/version.properties"))
         {
             if (in == null)
             {
-                return System.getProperty("cassandra.releaseVersion", "Unknown");
+                return System.getProperty("cassandra.releaseVersion", UNKNOWN_RELEASE_VERSION);
             }
             Properties props = new Properties();
             props.load(in);
@@ -352,6 +410,16 @@ public class FBUtilities
             logger.warn("Unable to load version.properties", e);
             return "debug version";
         }
+    }
+
+    public static String getReleaseVersionMajor()
+    {
+        String releaseVersion = FBUtilities.getReleaseVersionString();
+        if (FBUtilities.UNKNOWN_RELEASE_VERSION.equals(releaseVersion))
+        {
+            throw new AssertionError("Release version is unknown");
+        }
+        return releaseVersion.substring(0, releaseVersion.indexOf('.'));
     }
 
     public static long timestampMicros()
@@ -368,28 +436,37 @@ public class FBUtilities
 
     public static <T> List<T> waitOnFutures(Iterable<? extends Future<? extends T>> futures)
     {
-        return waitOnFutures(futures, -1);
+        return waitOnFutures(futures, -1, null);
     }
 
     /**
-     * Block for a collection of futures, with an optional timeout for each future.
+     * Block for a collection of futures, with optional timeout.
      *
      * @param futures
-     * @param ms The number of milliseconds to wait on each future. If this value is less than or equal to zero,
+     * @param timeout The number of units to wait in total. If this value is less than or equal to zero,
      *           no tiemout value will be passed to {@link Future#get()}.
+     * @param units The units of timeout.
      */
-    public static <T> List<T> waitOnFutures(Iterable<? extends Future<? extends T>> futures, long ms)
+    public static <T> List<T> waitOnFutures(Iterable<? extends Future<? extends T>> futures, long timeout, TimeUnit units)
     {
+        long endNanos = 0;
+        if (timeout > 0)
+            endNanos = System.nanoTime() + units.toNanos(timeout);
         List<T> results = new ArrayList<>();
         Throwable fail = null;
         for (Future<? extends T> f : futures)
         {
             try
             {
-                if (ms <= 0)
+                if (endNanos == 0)
+                {
                     results.add(f.get());
+                }
                 else
-                    results.add(f.get(ms, TimeUnit.MILLISECONDS));
+                {
+                    long waitFor = Math.max(1, endNanos - System.nanoTime());
+                    results.add(f.get(waitFor, TimeUnit.NANOSECONDS));
+                }
             }
             catch (Throwable t)
             {
@@ -414,12 +491,6 @@ public class FBUtilities
         {
             throw new AssertionError(ie);
         }
-    }
-
-    public static void waitOnFutures(List<AsyncOneResponse> results, long ms) throws TimeoutException
-    {
-        for (AsyncOneResponse result : results)
-            result.get(ms, TimeUnit.MILLISECONDS);
     }
 
     public static <T> Future<? extends T> waitOnFirstFuture(Iterable<? extends Future<? extends T>> futures)
@@ -457,6 +528,81 @@ public class FBUtilities
             Uninterruptibles.sleepUninterruptibly(delay, TimeUnit.MILLISECONDS);
         }
     }
+
+    /**
+     * Returns a new {@link Future} wrapping the given list of futures and returning a list of their results.
+     */
+    public static Future<List> allOf(Collection<Future> futures)
+    {
+        if (futures.isEmpty())
+            return CompletableFuture.completedFuture(null);
+
+        return new Future<List>()
+        {
+            @Override
+            @SuppressWarnings("unchecked")
+            public List get() throws InterruptedException, ExecutionException
+            {
+                List result = new ArrayList<>(futures.size());
+                for (Future current : futures)
+                {
+                    result.add(current.get());
+                }
+                return result;
+            }
+
+            @Override
+            @SuppressWarnings("unchecked")
+            public List get(long timeout, TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException
+            {
+                List result = new ArrayList<>(futures.size());
+                long deadline = System.nanoTime() + TimeUnit.NANOSECONDS.convert(timeout, unit);
+                for (Future current : futures)
+                {
+                    long remaining = deadline - System.nanoTime();
+                    if (remaining <= 0)
+                        throw new TimeoutException();
+
+                    result.add(current.get(remaining, TimeUnit.NANOSECONDS));
+                }
+                return result;
+            }
+
+            @Override
+            public boolean cancel(boolean mayInterruptIfRunning)
+            {
+                for (Future current : futures)
+                {
+                    if (!current.cancel(mayInterruptIfRunning))
+                        return false;
+                }
+                return true;
+            }
+
+            @Override
+            public boolean isCancelled()
+            {
+                for (Future current : futures)
+                {
+                    if (!current.isCancelled())
+                        return false;
+                }
+                return true;
+            }
+
+            @Override
+            public boolean isDone()
+            {
+                for (Future current : futures)
+                {
+                    if (!current.isDone())
+                        return false;
+                }
+                return true;
+            }
+        };
+    }
+
     /**
      * Create a new instance of a partitioner defined in an SSTable Descriptor
      * @param desc Descriptor of an sstable
@@ -510,6 +656,35 @@ public class FBUtilities
         if (!className.contains("."))
             className = "org.apache.cassandra.auth." + className;
         return FBUtilities.construct(className, "role manager");
+    }
+
+    public static INetworkAuthorizer newNetworkAuthorizer(String className)
+    {
+        if (className == null)
+        {
+            return new AllowAllNetworkAuthorizer();
+        }
+        if (!className.contains("."))
+        {
+            className = "org.apache.cassandra.auth." + className;
+        }
+        return FBUtilities.construct(className, "network authorizer");
+    }
+    
+    public static IAuditLogger newAuditLogger(String className, Map<String, String> parameters) throws ConfigurationException
+    {
+        if (!className.contains("."))
+            className = "org.apache.cassandra.audit." + className;
+
+        try
+        {
+            Class<?> auditLoggerClass = FBUtilities.classForName(className, "Audit logger");
+            return (IAuditLogger) auditLoggerClass.getConstructor(Map.class).newInstance(parameters);
+        }
+        catch (Exception ex)
+        {
+            throw new ConfigurationException("Unable to create instance of IAuditLogger.", ex);
+        }
     }
 
     /**
@@ -721,19 +896,19 @@ public class FBUtilities
             int errCode = p.waitFor();
             if (errCode != 0)
             {
-            	try (BufferedReader in = new BufferedReader(new InputStreamReader(p.getInputStream()));
+                try (BufferedReader in = new BufferedReader(new InputStreamReader(p.getInputStream()));
                      BufferedReader err = new BufferedReader(new InputStreamReader(p.getErrorStream())))
                 {
-            		String lineSep = System.getProperty("line.separator");
-	                StringBuilder sb = new StringBuilder();
-	                String str;
-	                while ((str = in.readLine()) != null)
-	                    sb.append(str).append(lineSep);
-	                while ((str = err.readLine()) != null)
-	                    sb.append(str).append(lineSep);
-	                throw new IOException("Exception while executing the command: "+ StringUtils.join(pb.command(), " ") +
-	                                      ", command error Code: " + errCode +
-	                                      ", command output: "+ sb.toString());
+                    String lineSep = LINE_SEPARATOR.getString();
+                    StringBuilder sb = new StringBuilder();
+                    String str;
+                    while ((str = in.readLine()) != null)
+                        sb.append(str).append(lineSep);
+                    while ((str = err.readLine()) != null)
+                        sb.append(str).append(lineSep);
+                    throw new IOException("Exception while executing the command: "+ StringUtils.join(pb.command(), " ") +
+                                          ", command error Code: " + errCode +
+                                          ", command output: "+ sb.toString());
                 }
             }
         }
@@ -845,12 +1020,12 @@ public class FBUtilities
 
     public static File getToolsOutputDirectory()
     {
-        File historyDir = new File(System.getProperty("user.home"), ".cassandra");
+        File historyDir = new File(USER_HOME.getString(), ".cassandra");
         FileUtils.createDirectory(historyDir);
         return historyDir;
     }
 
-    public static void closeAll(List<? extends AutoCloseable> l) throws Exception
+    public static void closeAll(Collection<? extends AutoCloseable> l) throws Exception
     {
         Exception toThrow = null;
         for (AutoCloseable c : l)
@@ -912,5 +1087,29 @@ public class FBUtilities
         broadcastInetAddress = null;
         broadcastInetAddressAndPort = null;
         broadcastNativeAddress = null;
+    }
+
+    /**
+     * Hack to prevent the ugly "illegal access" warnings in Java 11+ like the following.
+     */
+    public static void preventIllegalAccessWarnings()
+    {
+        // Example "annoying" trace:
+        //        WARNING: An illegal reflective access operation has occurred
+        //        WARNING: Illegal reflective access by io.netty.util.internal.ReflectionUtil (file:...)
+        //        WARNING: Please consider reporting this to the maintainers of io.netty.util.internal.ReflectionUtil
+        //        WARNING: Use --illegal-access=warn to enable warnings of further illegal reflective access operations
+        //        WARNING: All illegal access operations will be denied in a future release
+        try
+        {
+            Class<?> c = Class.forName("jdk.internal.module.IllegalAccessLogger");
+            Field f = c.getDeclaredField("logger");
+            f.setAccessible(true);
+            f.set(null, null);
+        }
+        catch (Exception e)
+        {
+            // ignore
+        }
     }
 }

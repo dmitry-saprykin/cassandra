@@ -20,19 +20,23 @@ package org.apache.cassandra.hints;
 import java.io.DataInput;
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Collections;
 import java.util.UUID;
 
 import com.google.common.collect.ImmutableMap;
 import com.google.common.io.ByteStreams;
-import com.google.common.io.Files;
 import org.junit.Test;
 
 import org.apache.cassandra.io.compress.LZ4Compressor;
 import org.apache.cassandra.io.util.DataOutputBuffer;
+import org.apache.cassandra.net.MessagingService;
 
 import static junit.framework.Assert.assertEquals;
 import static junit.framework.Assert.assertNotSame;
 import static junit.framework.Assert.fail;
+import static org.assertj.core.api.Assertions.assertThat;
 
 public class HintsDescriptorTest
 {
@@ -100,19 +104,50 @@ public class HintsDescriptorTest
         ImmutableMap<String, Object> parameters = ImmutableMap.of();
         HintsDescriptor expected = new HintsDescriptor(hostId, version, timestamp, parameters);
 
-        File directory = Files.createTempDir();
+        Path directory = Files.createTempDirectory("hints");
         try
         {
-            try (HintsWriter ignored = HintsWriter.create(directory, expected))
+            try (HintsWriter ignored = HintsWriter.create(directory.toFile(), expected))
             {
             }
-            HintsDescriptor actual = HintsDescriptor.readFromFile(new File(directory, expected.fileName()).toPath());
+            HintsDescriptor actual = HintsDescriptor.readFromFile(directory.resolve(expected.fileName()));
             assertEquals(expected, actual);
         }
         finally
         {
-            directory.deleteOnExit();
+            directory.toFile().deleteOnExit();
         }
+    }
+
+    @Test
+    public void testMessagingVersion()
+    {
+        String errorMsg = "Please update the current Hints messaging version to match the current messaging version";
+        int messageVersion = HintsDescriptor.messagingVersion(HintsDescriptor.CURRENT_VERSION);
+        assertEquals(errorMsg, messageVersion, MessagingService.current_version);
+
+        HintsDescriptor descriptor = new HintsDescriptor(UUID.randomUUID(), HintsDescriptor.CURRENT_VERSION, System.currentTimeMillis(), ImmutableMap.of());
+        assertEquals(errorMsg, descriptor.messagingVersion(), MessagingService.current_version);
+    }
+
+    @Test
+    public void testHandleIOE() throws IOException
+    {
+        Path p = Files.createTempFile("testing", ".hints");
+        // empty file;
+        assertThat(p).exists();
+        assertThat(Files.size(p)).isEqualTo(0);
+        HintsDescriptor.handleDescriptorIOE(new IOException("test"), p);
+        assertThat(p).doesNotExist();
+
+        // non-empty
+        p = Files.createTempFile("testing", ".hints");
+        Files.write(p, Collections.singleton("hello"));
+        HintsDescriptor.handleDescriptorIOE(new IOException("test"), p);
+        File newFile = new File(p.getParent().toFile(), p.getFileName().toString().replace(".hints", ".corrupt.hints"));
+        assertThat(p).doesNotExist();
+        assertThat(newFile).exists();
+        newFile.deleteOnExit();
     }
 
     private static void testSerializeDeserializeLoop(HintsDescriptor descriptor) throws IOException

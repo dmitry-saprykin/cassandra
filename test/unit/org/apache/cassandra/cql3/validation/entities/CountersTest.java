@@ -21,6 +21,7 @@ package org.apache.cassandra.cql3.validation.entities;
 import org.junit.Test;
 
 import org.apache.cassandra.cql3.CQLTester;
+import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 
 public class CountersTest extends CQLTester
@@ -35,6 +36,17 @@ public class CountersTest extends CQLTester
         assertInvalidThrowMessage("Cannot mix counter and non counter columns in the same table",
                                   InvalidRequestException.class,
                                   String.format("CREATE TABLE %s.%s (id bigint PRIMARY KEY, count counter, things set<text>)", KEYSPACE, createTableName()));
+    }
+
+    @Test
+    public void testCannotAlterWithNonCounterColumn() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, c counter)");
+        assertInvalidThrowMessage("Cannot have a non counter column (\"t\") in a counter table",
+                ConfigurationException.class, formatQuery("ALTER TABLE %s ADD t text"));
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, t text)");
+        assertInvalidThrowMessage("Cannot have a counter column (\"c\") in a non counter table",
+                                  ConfigurationException.class, formatQuery("ALTER TABLE %s ADD c counter"));
     }
 
     /**
@@ -160,7 +172,74 @@ public class CountersTest extends CQLTester
     @Test
     public void testProhibitReversedCounterAsPartOfPrimaryKey() throws Throwable
     {
-        assertInvalidThrowMessage("counter type is not supported for PRIMARY KEY part a",
+        assertInvalidThrowMessage("counter type is not supported for PRIMARY KEY column 'a'",
                                   InvalidRequestException.class, String.format("CREATE TABLE %s.%s (a counter, b int, PRIMARY KEY (b, a)) WITH CLUSTERING ORDER BY (a desc);", KEYSPACE, createTableName()));
+    }
+
+    /**
+     * Check that a counter batch works as intended
+     */
+    @Test
+    public void testCounterBatch() throws Throwable
+    {
+        createTable("CREATE TABLE %s (userid int, url text, total counter, PRIMARY KEY (userid, url))");
+
+        // Ensure we handle updates to the same CQL row in the same partition properly
+        execute("BEGIN UNLOGGED BATCH " +
+                "UPDATE %1$s SET total = total + 1 WHERE userid = 1 AND url = 'http://foo.com'; " +
+                "UPDATE %1$s SET total = total + 1 WHERE userid = 1 AND url = 'http://foo.com'; " +
+                "UPDATE %1$s SET total = total + 1 WHERE userid = 1 AND url = 'http://foo.com'; " +
+                "APPLY BATCH; ");
+        assertRows(execute("SELECT total FROM %s WHERE userid = 1 AND url = 'http://foo.com'"),
+                row(3L));
+
+        // Ensure we handle different CQL rows in the same partition properly
+        execute("BEGIN UNLOGGED BATCH " +
+                "UPDATE %1$s SET total = total + 1 WHERE userid = 1 AND url = 'http://bar.com'; " +
+                "UPDATE %1$s SET total = total + 1 WHERE userid = 1 AND url = 'http://baz.com'; " +
+                "UPDATE %1$s SET total = total + 1 WHERE userid = 1 AND url = 'http://bad.com'; " +
+                "APPLY BATCH; ");
+        assertRows(execute("SELECT url, total FROM %s WHERE userid = 1"),
+                row("http://bad.com", 1L),
+                row("http://bar.com", 1L),
+                row("http://baz.com", 1L),
+                row("http://foo.com", 3L)); // from previous batch
+
+        // Different counters in the same CQL Row
+        createTable("CREATE TABLE %s (userid int, url text, first counter, second counter, third counter, PRIMARY KEY (userid, url))");
+        execute("BEGIN UNLOGGED BATCH " +
+                "UPDATE %1$s SET first = first + 1 WHERE userid = 1 AND url = 'http://foo.com'; " +
+                "UPDATE %1$s SET first = first + 1 WHERE userid = 1 AND url = 'http://foo.com'; " +
+                "UPDATE %1$s SET second = second + 1 WHERE userid = 1 AND url = 'http://foo.com'; " +
+                "APPLY BATCH; ");
+        assertRows(execute("SELECT first, second, third FROM %s WHERE userid = 1 AND url = 'http://foo.com'"),
+                row(2L, 1L, null));
+
+        // Different counters in different CQL Rows
+        execute("BEGIN UNLOGGED BATCH " +
+                "UPDATE %1$s SET first = first + 1 WHERE userid = 1 AND url = 'http://bad.com'; " +
+                "UPDATE %1$s SET first = first + 1, second = second + 1 WHERE userid = 1 AND url = 'http://bar.com'; " +
+                "UPDATE %1$s SET first = first - 1, second = second - 1 WHERE userid = 1 AND url = 'http://bar.com'; " +
+                "UPDATE %1$s SET second = second + 1 WHERE userid = 1 AND url = 'http://baz.com'; " +
+                "APPLY BATCH; ");
+        assertRows(execute("SELECT url, first, second, third FROM %s WHERE userid = 1"),
+                row("http://bad.com", 1L, null, null),
+                row("http://bar.com", 0L, 0L, null),
+                row("http://baz.com", null, 1L, null),
+                row("http://foo.com", 2L, 1L, null)); // from previous batch
+
+
+        // Different counters in different partitions
+        execute("BEGIN UNLOGGED BATCH " +
+                "UPDATE %1$s SET first = first + 1 WHERE userid = 2 AND url = 'http://bad.com'; " +
+                "UPDATE %1$s SET first = first + 1, second = second + 1 WHERE userid = 3 AND url = 'http://bar.com'; " +
+                "UPDATE %1$s SET first = first - 1, second = second - 1 WHERE userid = 4 AND url = 'http://bar.com'; " +
+                "UPDATE %1$s SET second = second + 1 WHERE userid = 5 AND url = 'http://baz.com'; " +
+                "APPLY BATCH; ");
+        assertRowsIgnoringOrder(execute("SELECT userid, url, first, second, third FROM %s WHERE userid IN (2, 3, 4, 5)"),
+                row(2, "http://bad.com", 1L, null, null),
+                row(3, "http://bar.com", 1L, 1L, null),
+                row(4, "http://bar.com", -1L, -1L, null),
+                row(5, "http://baz.com", null, 1L, null));
     }
 }

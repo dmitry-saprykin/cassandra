@@ -17,25 +17,31 @@
  */
 package org.apache.cassandra.gms;
 
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.locator.InetAddressAndPort;
-import org.apache.cassandra.net.IVerbHandler;
-import org.apache.cassandra.net.MessageIn;
-import org.apache.cassandra.net.MessageOut;
+import org.apache.cassandra.net.Message;
 import org.apache.cassandra.net.MessagingService;
 
-public class GossipDigestSynVerbHandler implements IVerbHandler<GossipDigestSyn>
+import static org.apache.cassandra.net.Verb.GOSSIP_DIGEST_ACK;
+
+public class GossipDigestSynVerbHandler extends GossipVerbHandler<GossipDigestSyn>
 {
+    public static final GossipDigestSynVerbHandler instance = new GossipDigestSynVerbHandler();
+
     private static final Logger logger = LoggerFactory.getLogger(GossipDigestSynVerbHandler.class);
 
-    public void doVerb(MessageIn<GossipDigestSyn> message, int id)
+    public void doVerb(Message<GossipDigestSyn> message)
     {
-        InetAddressAndPort from = message.from;
+        InetAddressAndPort from = message.from();
         if (logger.isTraceEnabled())
             logger.trace("Received a GossipDigestSynMessage from {}", from);
         if (!Gossiper.instance.isEnabled() && !Gossiper.instance.isInShadowRound())
@@ -79,10 +85,8 @@ public class GossipDigestSynVerbHandler implements IVerbHandler<GossipDigestSyn>
             logger.debug("Received a shadow round syn from {}. Gossip is disabled but " +
                          "currently also in shadow round, responding with a minimal ack", from);
             MessagingService.instance()
-                            .sendOneWay(new MessageOut<>(MessagingService.Verb.GOSSIP_DIGEST_ACK,
-                                                         new GossipDigestAck(new ArrayList<>(), new HashMap<>()),
-                                                         GossipDigestAck.serializer),
-                                        from);
+                            .send(Message.out(GOSSIP_DIGEST_ACK, new GossipDigestAck(Collections.emptyList(), Collections.emptyMap())),
+                                  from);
             return;
         }
 
@@ -97,15 +101,31 @@ public class GossipDigestSynVerbHandler implements IVerbHandler<GossipDigestSyn>
             logger.trace("Gossip syn digests are : {}", sb);
         }
 
-        List<GossipDigest> deltaGossipDigestList = new ArrayList<GossipDigest>();
-        Map<InetAddressAndPort, EndpointState> deltaEpStateMap = new HashMap<InetAddressAndPort, EndpointState>();
-        Gossiper.instance.examineGossiper(gDigestList, deltaGossipDigestList, deltaEpStateMap);
-        logger.trace("sending {} digests and {} deltas", deltaGossipDigestList.size(), deltaEpStateMap.size());
-        MessageOut<GossipDigestAck> gDigestAckMessage = new MessageOut<GossipDigestAck>(MessagingService.Verb.GOSSIP_DIGEST_ACK,
-                                                                                        new GossipDigestAck(deltaGossipDigestList, deltaEpStateMap),
-                                                                                        GossipDigestAck.serializer);
+        Message<GossipDigestAck> gDigestAckMessage = gDigestList.isEmpty() ?
+                                                     createShadowReply() :
+                                                     createNormalReply(gDigestList);
+
         if (logger.isTraceEnabled())
             logger.trace("Sending a GossipDigestAckMessage to {}", from);
-        MessagingService.instance().sendOneWay(gDigestAckMessage, from);
+        MessagingService.instance().send(gDigestAckMessage, from);
+
+        super.doVerb(message);
+    }
+
+    private static Message<GossipDigestAck> createNormalReply(List<GossipDigest> gDigestList)
+    {
+        List<GossipDigest> deltaGossipDigestList = new ArrayList<>();
+        Map<InetAddressAndPort, EndpointState> deltaEpStateMap = new HashMap<>();
+        Gossiper.instance.examineGossiper(gDigestList, deltaGossipDigestList, deltaEpStateMap);
+        logger.trace("sending {} digests and {} deltas", deltaGossipDigestList.size(), deltaEpStateMap.size());
+
+        return Message.out(GOSSIP_DIGEST_ACK, new GossipDigestAck(deltaGossipDigestList, deltaEpStateMap));
+    }
+
+    private static Message<GossipDigestAck> createShadowReply()
+    {
+        Map<InetAddressAndPort, EndpointState> stateMap = Gossiper.instance.examineShadowState();
+        logger.trace("sending 0 digests and {} deltas", stateMap.size());
+        return Message.out(GOSSIP_DIGEST_ACK, new GossipDigestAck(Collections.emptyList(), stateMap));
     }
 }

@@ -32,7 +32,7 @@ import com.google.common.collect.Iterables;
 import com.google.common.collect.Sets;
 import org.junit.BeforeClass;
 import org.junit.Test;
-import junit.framework.Assert;
+import org.junit.Assert;
 
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Directories;
@@ -1106,6 +1106,59 @@ public class LogTransactionTest extends AbstractTransactionalTest
     }
 
     @Test
+    public void testTruncateFileUpdateTime() throws IOException
+    {
+        // Idea is that we truncate the actual modification time on disk after creating the log file.
+        // On java11 this would fail since we would have millisecond resolution in the log file, but
+        // then the file gives second resolution.
+        testTruncatedModificationTimesHelper(sstable ->
+                                  {
+                                      // increase the modification time of the Data file
+                                      for (String filePath : sstable.getAllFilePaths())
+                                      {
+                                          File f = new File(filePath);
+                                          long lastModified = f.lastModified();
+                                          f.setLastModified(lastModified - (lastModified % 1000));
+                                      }
+                                  });
+    }
+
+    private static void testTruncatedModificationTimesHelper(Consumer<SSTableReader> modifier) throws IOException
+    {
+        ColumnFamilyStore cfs = MockSchema.newCFS(KEYSPACE);
+        File dataFolder = new Directories(cfs.metadata()).getDirectoryForNewSSTables();
+        SSTableReader sstableOld = sstable(dataFolder, cfs, 0, 128);
+        SSTableReader sstableNew = sstable(dataFolder, cfs, 1, 128);
+
+        // simulate tracking sstables with a committed transaction except the checksum will be wrong
+        LogTransaction log = new LogTransaction(OperationType.COMPACTION);
+        assertNotNull(log);
+
+        log.trackNew(sstableNew);
+        LogTransaction.SSTableTidier tidier = log.obsoleted(sstableOld);
+
+        //modify the old sstable files
+        modifier.accept(sstableOld);
+
+        //Fake a commit
+        log.txnFile().commit();
+
+        LogTransaction.removeUnfinishedLeftovers(cfs.metadata());
+
+        // only the new files should be there
+        assertFiles(dataFolder.getPath(), Sets.newHashSet(sstableNew.getAllFilePaths()));
+        sstableNew.selfRef().release();
+
+        // complete the transaction to avoid LEAK errors
+        assertNull(log.complete(null));
+
+        assertFiles(dataFolder.getPath(), Sets.newHashSet(sstableNew.getAllFilePaths()));
+
+        // make sure to run the tidier to avoid any leaks in the logs
+        tidier.run();
+    }
+
+    @Test
     public void testGetTemporaryFilesSafeAfterObsoletion() throws Throwable
     {
         ColumnFamilyStore cfs = MockSchema.newCFS(KEYSPACE);
@@ -1183,13 +1236,13 @@ public class LogTransactionTest extends AbstractTransactionalTest
 
         SerializationHeader header = SerializationHeader.make(cfs.metadata(), Collections.emptyList());
         StatsMetadata metadata = (StatsMetadata) new MetadataCollector(cfs.metadata().comparator)
-                                                 .finalizeMetadata(cfs.metadata().partitioner.getClass().getCanonicalName(), 0.01f, -1, null, header)
+                                                 .finalizeMetadata(cfs.metadata().partitioner.getClass().getCanonicalName(), 0.01f, -1, null, false, header)
                                                  .get(MetadataType.STATS);
         SSTableReader reader = SSTableReader.internalOpen(descriptor,
                                                           components,
                                                           cfs.metadata,
-                                                          dFile,
                                                           iFile,
+                                                          dFile,
                                                           MockSchema.indexSummary.sharedCopy(),
                                                           new AlwaysPresentFilter(),
                                                           1L,

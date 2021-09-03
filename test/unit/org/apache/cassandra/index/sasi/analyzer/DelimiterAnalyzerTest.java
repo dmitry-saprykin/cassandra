@@ -19,11 +19,15 @@ package org.apache.cassandra.index.sasi.analyzer;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 
 import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.db.marshal.SetType;
 import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.commons.io.IOUtils;
 
@@ -54,14 +58,45 @@ public class DelimiterAnalyzerTest
         while (analyzer.hasNext())
             output.append(ByteBufferUtil.string(analyzer.next()) + (analyzer.hasNext() ? ' ' : ""));
 
-        Assert.assertTrue(testString.equals(output.toString()));
+        Assert.assertEquals(testString, output.toString());
         Assert.assertFalse(testString.toLowerCase().equals(output.toString()));
     }
 
-    @Test(expected = IllegalArgumentException.class)
-    public void ensureIncompatibleInputSkipped() throws Exception
+    @Test
+    public void testBlankEntries() throws Exception
     {
-        new DelimiterAnalyzer().init(new HashMap(), Int32Type.instance);
+        DelimiterAnalyzer analyzer = new DelimiterAnalyzer();
+
+        analyzer.init(
+            new HashMap()
+                {{
+                    put(DelimiterTokenizingOptions.DELIMITER, ",");
+                }},
+            UTF8Type.instance);
+
+        String testString = ",Nip,,,,it,,,in,,the,bud,,,";
+        ByteBuffer toAnalyze = ByteBuffer.wrap(testString.getBytes());
+        analyzer.reset(toAnalyze);
+        StringBuilder output = new StringBuilder();
+        while (analyzer.hasNext())
+            output.append(ByteBufferUtil.string(analyzer.next()) + (analyzer.hasNext() ? ',' : ""));
+
+        Assert.assertEquals("Nip,it,in,the,bud", output.toString());
+        Assert.assertFalse(testString.toLowerCase().equals(output.toString()));
+    }
+
+    @Test(expected = ConfigurationException.class)
+    public void ensureIncompatibleInputOnCollectionTypeSkipped()
+    {
+        new DelimiterAnalyzer().validate(Collections.emptyMap(),
+                                         ColumnMetadata.regularColumn("a", "b", "c", SetType.getInstance(UTF8Type.instance, true)));
+    }
+
+    @Test(expected = ConfigurationException.class)
+    public void ensureIncompatibleInputSkipped()
+    {
+        new DelimiterAnalyzer().validate(Collections.emptyMap(),
+                                         ColumnMetadata.regularColumn("a", "b", "c", Int32Type.instance));
     }
 
     @Test

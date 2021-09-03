@@ -29,14 +29,18 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.UUID;
 
-import junit.framework.Assert;
+import org.junit.Assert;
 
+import com.datastax.driver.core.exceptions.OperationTimedOutException;
 import org.apache.cassandra.concurrent.SEPExecutor;
 import org.apache.cassandra.concurrent.Stage;
-import org.apache.cassandra.concurrent.StageManager;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.SchemaCQLHelper;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.serializers.SimpleDateSerializer;
 import org.apache.cassandra.serializers.TimeSerializer;
@@ -48,6 +52,8 @@ import org.junit.BeforeClass;
 import org.junit.Test;
 
 import com.datastax.driver.core.exceptions.InvalidQueryException;
+
+import static org.junit.Assert.assertTrue;
 
 
 public class ViewSchemaTest extends CQLTester
@@ -75,17 +81,26 @@ public class ViewSchemaTest extends CQLTester
 
     private void createView(String name, String query) throws Throwable
     {
-        executeNet(protocolVersion, String.format(query, name));
-        // If exception is thrown, the view will not be added to the list; since it shouldn't have been created, this is
-        // the desired behavior
-        views.add(name);
+        try
+        {
+            executeNet(protocolVersion, String.format(query, name));
+            // If exception is thrown, the view will not be added to the list; since it shouldn't have been created, this is
+            // the desired behavior
+            views.add(name);
+        }
+        catch (OperationTimedOutException ex)
+        {
+            // ... except for timeout, when we actually do not know whether the view was created or not
+            views.add(name);
+            throw ex;
+        }
     }
 
     private void updateView(String query, Object... params) throws Throwable
     {
         executeNet(protocolVersion, query, params);
-        while (!(((SEPExecutor) StageManager.getStage(Stage.VIEW_MUTATION)).getPendingTasks() == 0
-                 && ((SEPExecutor) StageManager.getStage(Stage.VIEW_MUTATION)).getActiveCount() == 0))
+        while (!(((SEPExecutor) Stage.VIEW_MUTATION.executor()).getPendingTaskCount() == 0
+                 && ((SEPExecutor) Stage.VIEW_MUTATION.executor()).getActiveTaskCount() == 0))
         {
             Thread.sleep(1);
         }
@@ -672,7 +687,7 @@ public class ViewSchemaTest extends CQLTester
         executeNet(protocolVersion, "USE " + keyspace());
 
         createView(keyspace() + ".mv1",
-                   "CREATE MATERIALIZED VIEW %s AS SELECT * FROM %%s WHERE b IS NOT NULL AND c IS NOT NULL PRIMARY KEY (a, b, c)");
+                   "CREATE MATERIALIZED VIEW %s AS SELECT * FROM %%s WHERE a IS NOT NULL AND b IS NOT NULL AND c IS NOT NULL PRIMARY KEY (a, b, c)");
 
         try
         {
@@ -681,7 +696,7 @@ public class ViewSchemaTest extends CQLTester
         }
         catch (InvalidQueryException e)
         {
-            Assert.assertEquals("Cannot use DROP TABLE on Materialized View", e.getMessage());
+            Assert.assertEquals("Cannot use DROP TABLE on a materialized view. Please use DROP MATERIALIZED VIEW instead.", e.getMessage());
         }
     }
 
@@ -694,9 +709,238 @@ public class ViewSchemaTest extends CQLTester
 
         executeNet(protocolVersion, "USE " + keyspace());
 
-        assertInvalidMessage("Non-primary key columns cannot be restricted in the SELECT statement used for materialized view creation",
+        assertInvalidMessage("Non-primary key columns can only be restricted with 'IS NOT NULL'",
                              "CREATE MATERIALIZED VIEW " + keyspace() + ".mv AS SELECT * FROM %s "
                                      + "WHERE b IS NOT NULL AND c IS NOT NULL AND a IS NOT NULL "
                                      + "AND d = 1 PRIMARY KEY (c, b, a)");
+    }
+
+    @Test
+    public void testViewTokenRestrictions() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b int, c int, d int, PRIMARY KEY(a))");
+
+        execute("USE " + keyspace());
+        executeNet(protocolVersion, "USE " + keyspace());
+
+        execute("INSERT into %s (a,b,c,d) VALUES (?,?,?,?)", 1, 2, 3, 4);
+
+        assertInvalidThrowMessage("Cannot use token relation when defining a materialized view", InvalidRequestException.class,
+                                  "CREATE MATERIALIZED VIEW mv_test AS SELECT a,b,c FROM %s WHERE a IS NOT NULL and b IS NOT NULL and token(a) = token(1) PRIMARY KEY(b,a)");
+    }
+
+    @Test
+    public void testCreateViewWithClusteringOrderOnMvOnly() throws Throwable
+    {
+        createTable("CREATE TABLE %s (" +
+                    "pk int, " +
+                    "c1 int," +
+                    "c2 int," +
+                    "c3 int," +
+                    "v int, " +
+                    "PRIMARY KEY (pk, c1, c2, c3))");
+
+        execute("USE " + keyspace());
+        executeNet(protocolVersion, "USE " + keyspace());
+
+        createView("mv1", "CREATE MATERIALIZED VIEW %s AS SELECT * FROM %%s WHERE pk IS NOT NULL AND c1 IS NOT NULL AND c2 IS NOT NULL and c3 IS NOT NULL PRIMARY KEY (pk, c2, c1, c3) WITH CLUSTERING ORDER BY (c2 DESC, c1 ASC, c3 ASC)");
+        createView("mv2", "CREATE MATERIALIZED VIEW %s AS SELECT * FROM %%s WHERE pk IS NOT NULL AND c1 IS NOT NULL AND c2 IS NOT NULL and c3 IS NOT NULL PRIMARY KEY (pk, c2, c1, c3) WITH CLUSTERING ORDER BY (c2 ASC, c1 DESC, c3 DESC)");
+
+        updateView("INSERT INTO %s (pk, c1, c2, c3, v) VALUES (?, ?, ?, ?, ?)", 0, 0, 0, 0, 0);
+        updateView("INSERT INTO %s (pk, c1, c2, c3, v) VALUES (?, ?, ?, ?, ?)", 0, 0, 0, 1, 1);
+        updateView("INSERT INTO %s (pk, c1, c2, c3, v) VALUES (?, ?, ?, ?, ?)", 0, 0, 0, 2, 2);
+        updateView("INSERT INTO %s (pk, c1, c2, c3, v) VALUES (?, ?, ?, ?, ?)", 0, 0, 1, 0, 3);
+        updateView("INSERT INTO %s (pk, c1, c2, c3, v) VALUES (?, ?, ?, ?, ?)", 0, 0, 1, 1, 4);
+        updateView("INSERT INTO %s (pk, c1, c2, c3, v) VALUES (?, ?, ?, ?, ?)", 0, 0, 1, 2, 5);
+        updateView("INSERT INTO %s (pk, c1, c2, c3, v) VALUES (?, ?, ?, ?, ?)", 0, 1, 1, 1, 6);
+        updateView("INSERT INTO %s (pk, c1, c2, c3, v) VALUES (?, ?, ?, ?, ?)", 0, 1, 2, 1, 7);
+        updateView("INSERT INTO %s (pk, c1, c2, c3, v) VALUES (?, ?, ?, ?, ?)", 0, 2, 1, 1, 8);
+
+        assertRows(execute("SELECT * FROM %s WHERE pk = ?", 0),
+                   row(0, 0, 0, 0, 0),
+                   row(0, 0, 0, 1, 1),
+                   row(0, 0, 0, 2, 2),
+                   row(0, 0, 1, 0, 3),
+                   row(0, 0, 1, 1, 4),
+                   row(0, 0, 1, 2, 5),
+                   row(0, 1, 1, 1, 6),
+                   row(0, 1, 2, 1, 7),
+                   row(0, 2, 1, 1, 8));
+
+        assertRows(execute("SELECT * FROM mv1 WHERE pk = ?", 0),
+                   row(0, 2, 1, 1, 7),
+                   row(0, 1, 0, 0, 3),
+                   row(0, 1, 0, 1, 4),
+                   row(0, 1, 0, 2, 5),
+                   row(0, 1, 1, 1, 6),
+                   row(0, 1, 2, 1, 8),
+                   row(0, 0, 0, 0, 0),
+                   row(0, 0, 0, 1, 1),
+                   row(0, 0, 0, 2, 2));
+
+        assertRows(execute("SELECT * FROM mv2 WHERE pk = ?", 0),
+                   row(0, 0, 0, 2, 2),
+                   row(0, 0, 0, 1, 1),
+                   row(0, 0, 0, 0, 0),
+                   row(0, 1, 2, 1, 8),
+                   row(0, 1, 1, 1, 6),
+                   row(0, 1, 0, 2, 5),
+                   row(0, 1, 0, 1, 4),
+                   row(0, 1, 0, 0, 3),
+                   row(0, 2, 1, 1, 7));
+    }
+
+    @Test
+    public void testCreateViewWithClusteringOrderOnBaseTableAndMv() throws Throwable
+    {
+        createTable("CREATE TABLE %s (" +
+                    "pk int, " +
+                    "c1 int," +
+                    "c2 int," +
+                    "c3 int," +
+                    "v int, " +
+                    "PRIMARY KEY (pk, c1, c2, c3)) WITH CLUSTERING ORDER BY (c1 DESC, c2 ASC, c3 DESC)");
+
+        execute("USE " + keyspace());
+        executeNet(protocolVersion, "USE " + keyspace());
+
+        createView("mv1", "CREATE MATERIALIZED VIEW %s AS SELECT * FROM %%s WHERE pk IS NOT NULL AND c1 IS NOT NULL AND c2 IS NOT NULL and c3 IS NOT NULL PRIMARY KEY (pk, c2, c1, c3)");
+        createView("mv2", "CREATE MATERIALIZED VIEW %s AS SELECT * FROM %%s WHERE pk IS NOT NULL AND c1 IS NOT NULL AND c2 IS NOT NULL and c3 IS NOT NULL PRIMARY KEY (pk, c2, c1, c3) WITH CLUSTERING ORDER BY (c2 DESC, c1 ASC, c3 ASC)");
+        createView("mv3", "CREATE MATERIALIZED VIEW %s AS SELECT * FROM %%s WHERE pk IS NOT NULL AND c1 IS NOT NULL AND c2 IS NOT NULL and c3 IS NOT NULL PRIMARY KEY (pk, c2, c1, c3) WITH CLUSTERING ORDER BY (c2 ASC, c1 DESC, c3 DESC)");
+
+        updateView("INSERT INTO %s (pk, c1, c2, c3, v) VALUES (?, ?, ?, ?, ?)", 0, 0, 0, 0, 0);
+        updateView("INSERT INTO %s (pk, c1, c2, c3, v) VALUES (?, ?, ?, ?, ?)", 0, 0, 0, 1, 1);
+        updateView("INSERT INTO %s (pk, c1, c2, c3, v) VALUES (?, ?, ?, ?, ?)", 0, 0, 0, 2, 2);
+        updateView("INSERT INTO %s (pk, c1, c2, c3, v) VALUES (?, ?, ?, ?, ?)", 0, 0, 1, 0, 3);
+        updateView("INSERT INTO %s (pk, c1, c2, c3, v) VALUES (?, ?, ?, ?, ?)", 0, 0, 1, 1, 4);
+        updateView("INSERT INTO %s (pk, c1, c2, c3, v) VALUES (?, ?, ?, ?, ?)", 0, 0, 1, 2, 5);
+        updateView("INSERT INTO %s (pk, c1, c2, c3, v) VALUES (?, ?, ?, ?, ?)", 0, 1, 1, 1, 6);
+        updateView("INSERT INTO %s (pk, c1, c2, c3, v) VALUES (?, ?, ?, ?, ?)", 0, 1, 2, 1, 7);
+        updateView("INSERT INTO %s (pk, c1, c2, c3, v) VALUES (?, ?, ?, ?, ?)", 0, 2, 1, 1, 8);
+
+        assertRows(execute("SELECT * FROM %s WHERE pk = ?", 0),
+                   row(0, 2, 1, 1, 8),
+                   row(0, 1, 1, 1, 6),
+                   row(0, 1, 2, 1, 7),
+                   row(0, 0, 0, 2, 2),
+                   row(0, 0, 0, 1, 1),
+                   row(0, 0, 0, 0, 0),
+                   row(0, 0, 1, 2, 5),
+                   row(0, 0, 1, 1, 4),
+                  row(0, 0, 1, 0, 3));
+
+        assertRows(execute("SELECT * FROM mv1 WHERE pk = ?", 0),
+                   row(0, 0, 0, 2, 2),
+                   row(0, 0, 0, 1, 1),
+                   row(0, 0, 0, 0, 0),
+                   row(0, 1, 2, 1, 8),
+                   row(0, 1, 1, 1, 6),
+                   row(0, 1, 0, 2, 5),
+                   row(0, 1, 0, 1, 4),
+                   row(0, 1, 0, 0, 3),
+                   row(0, 2, 1, 1, 7));
+
+        assertRows(execute("SELECT * FROM mv2 WHERE pk = ?", 0),
+                   row(0, 2, 1, 1, 7),
+                   row(0, 1, 0, 0, 3),
+                   row(0, 1, 0, 1, 4),
+                   row(0, 1, 0, 2, 5),
+                   row(0, 1, 1, 1, 6),
+                   row(0, 1, 2, 1, 8),
+                   row(0, 0, 0, 0, 0),
+                   row(0, 0, 0, 1, 1),
+                   row(0, 0, 0, 2, 2));
+
+        assertRows(execute("SELECT * FROM mv3 WHERE pk = ?", 0),
+                   row(0, 0, 0, 2, 2),
+                   row(0, 0, 0, 1, 1),
+                   row(0, 0, 0, 0, 0),
+                   row(0, 1, 2, 1, 8),
+                   row(0, 1, 1, 1, 6),
+                   row(0, 1, 0, 2, 5),
+                   row(0, 1, 0, 1, 4),
+                   row(0, 1, 0, 0, 3),
+                   row(0, 2, 1, 1, 7));
+    }
+
+    @Test
+    public void testViewMetadataCQLNotIncludeAllColumn() throws Throwable
+    {
+        String createBase = "CREATE TABLE IF NOT EXISTS %s (" +
+                            "pk1 int," +
+                            "pk2 int," +
+                            "ck1 int," +
+                            "ck2 int," +
+                            "reg1 int," +
+                            "reg2 list<int>," +
+                            "reg3 int," +
+                            "PRIMARY KEY ((pk1, pk2), ck1, ck2)) WITH " +
+                            "CLUSTERING ORDER BY (ck1 ASC, ck2 ASC);";
+
+        String createView = "CREATE MATERIALIZED VIEW IF NOT EXISTS %s AS SELECT pk1, pk2, ck1, ck2, reg1, reg2 FROM %%s "
+                            + "WHERE pk2 IS NOT NULL AND pk1 IS NOT NULL AND ck2 IS NOT NULL AND ck1 IS NOT NULL PRIMARY KEY((pk2, pk1), ck2, ck1)";
+
+        String expectedViewSnapshot = "CREATE MATERIALIZED VIEW IF NOT EXISTS %s.%s AS\n" +
+                                      "    SELECT pk2, pk1, ck2, ck1, reg1, reg2\n" +
+                                      "    FROM %s.%s\n" +
+                                      "    WHERE pk2 IS NOT NULL AND pk1 IS NOT NULL AND ck2 IS NOT NULL AND ck1 IS NOT NULL\n" +
+                                      "    PRIMARY KEY ((pk2, pk1), ck2, ck1)\n" +
+                                      " WITH ID = %s\n" +
+                                      "    AND CLUSTERING ORDER BY (ck2 ASC, ck1 ASC)";
+
+        testViewMetadataCQL(createBase,
+                            createView,
+                            expectedViewSnapshot);
+    }
+
+    @Test
+    public void testViewMetadataCQLIncludeAllColumn() throws Throwable
+    {
+        String createBase = "CREATE TABLE IF NOT EXISTS %s (" +
+                            "pk1 int," +
+                            "pk2 int," +
+                            "ck1 int," +
+                            "ck2 int," +
+                            "reg1 int," +
+                            "reg2 list<int>," +
+                            "reg3 int," +
+                            "PRIMARY KEY ((pk1, pk2), ck1, ck2)) WITH " +
+                            "CLUSTERING ORDER BY (ck1 ASC, ck2 DESC);";
+
+        String createView = "CREATE MATERIALIZED VIEW IF NOT EXISTS %s AS SELECT * FROM %%s "
+                            + "WHERE pk2 IS NOT NULL AND pk1 IS NOT NULL AND ck2 IS NOT NULL AND ck1 IS NOT NULL PRIMARY KEY((pk2, pk1), ck2, ck1)";
+
+        String expectedViewSnapshot = "CREATE MATERIALIZED VIEW IF NOT EXISTS %s.%s AS\n" +
+                                      "    SELECT *\n" +
+                                      "    FROM %s.%s\n" +
+                                      "    WHERE pk2 IS NOT NULL AND pk1 IS NOT NULL AND ck2 IS NOT NULL AND ck1 IS NOT NULL\n" +
+                                      "    PRIMARY KEY ((pk2, pk1), ck2, ck1)\n" +
+                                      " WITH ID = %s\n" +
+                                      "    AND CLUSTERING ORDER BY (ck2 DESC, ck1 ASC)";
+
+        testViewMetadataCQL(createBase,
+                            createView,
+                            expectedViewSnapshot);
+    }
+
+    private void testViewMetadataCQL(String createBase, String createView, String viewSnapshotSchema) throws Throwable
+    {
+        execute("USE " + keyspace());
+        executeNet(protocolVersion, "USE " + keyspace());
+
+        String base = createTable(createBase);
+
+        String view = "mv";
+        createView(view, createView);
+
+        ColumnFamilyStore mv = Keyspace.open(keyspace()).getColumnFamilyStore(view);
+        
+        assertTrue(SchemaCQLHelper.getTableMetadataAsCQL(mv.metadata(), true, true, true)
+                                  .startsWith(String.format(viewSnapshotSchema,
+                                                            keyspace(),
+                                                            view,
+                                                            keyspace(),
+                                                            base,
+                                                            mv.metadata().id)));
     }
 }

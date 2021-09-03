@@ -23,6 +23,7 @@ import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.partitions.CachedPartition;
 import org.apache.cassandra.db.partitions.Partition;
 import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.index.Index;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
@@ -37,7 +38,7 @@ import org.apache.cassandra.schema.TableMetadata;
  */
 public interface ClusteringIndexFilter
 {
-    public static Serializer serializer = AbstractClusteringIndexFilter.serializer;
+    public static final Serializer serializer = AbstractClusteringIndexFilter.serializer;
 
     public enum Kind
     {
@@ -64,6 +65,8 @@ public interface ClusteringIndexFilter
      */
     public boolean isReversed();
 
+    public boolean isEmpty(ClusteringComparator comparator);
+
     /**
      * Returns a filter for continuing the paging of this filter given the last returned clustering prefix.
      *
@@ -77,7 +80,7 @@ public interface ClusteringIndexFilter
      *
      * @return a new filter that selects results coming after {@code lastReturned}.
      */
-    public ClusteringIndexFilter forPaging(ClusteringComparator comparator, Clustering lastReturned, boolean inclusive);
+    public ClusteringIndexFilter forPaging(ClusteringComparator comparator, Clustering<?> lastReturned, boolean inclusive);
 
     /**
      * Returns whether we can guarantee that a given cached partition contains all the data selected by this filter.
@@ -109,7 +112,7 @@ public interface ClusteringIndexFilter
      *
      * @return whether the row with clustering {@code clustering} is selected by this filter.
      */
-    public boolean selects(Clustering clustering);
+    public boolean selects(Clustering<?> clustering);
 
     /**
      * Returns an iterator that only returns the rows of the provided iterator that this filter selects.
@@ -151,7 +154,7 @@ public interface ClusteringIndexFilter
     public Kind kind();
 
     public String toString(TableMetadata metadata);
-    public String toCQLString(TableMetadata metadata);
+    public String toCQLString(TableMetadata metadata, RowFilter rowFilter);
 
     public interface Serializer
     {

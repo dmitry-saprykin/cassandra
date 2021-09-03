@@ -33,27 +33,27 @@ import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.db.transform.MoreRows;
 import org.apache.cassandra.db.transform.Transformation;
-import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.locator.Replica;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.tracing.Tracing;
 
 class ShortReadRowsProtection extends Transformation implements MoreRows<UnfilteredRowIterator>
 {
     private final ReadCommand command;
-    private final InetAddressAndPort source;
+    private final Replica source;
     private final DataLimits.Counter singleResultCounter; // unmerged per-source counter
     private final DataLimits.Counter mergedResultCounter; // merged end-result counter
     private final Function<ReadCommand, UnfilteredPartitionIterator> commandExecutor;
     private final TableMetadata metadata;
     private final DecoratedKey partitionKey;
 
-    private Clustering lastClustering; // clustering of the last observed row
+    private Clustering<?> lastClustering; // clustering of the last observed row
 
     private int lastCounted = 0; // last seen recorded # before attempting to fetch more rows
     private int lastFetched = 0; // # rows returned by last attempt to get more (or by the original read command)
     private int lastQueried = 0; // # extra rows requested from the replica last time
 
-    ShortReadRowsProtection(DecoratedKey partitionKey, ReadCommand command, InetAddressAndPort source,
+    ShortReadRowsProtection(DecoratedKey partitionKey, ReadCommand command, Replica source,
                             Function<ReadCommand, UnfilteredPartitionIterator> commandExecutor,
                             DataLimits.Counter singleResultCounter, DataLimits.Counter mergedResultCounter)
     {
@@ -92,7 +92,7 @@ class ShortReadRowsProtection extends Transformation implements MoreRows<Unfilte
          * Can only take the short cut if there is no per partition limit set. Otherwise it's possible to hit false
          * positives due to some rows being uncounted for in certain scenarios (see CASSANDRA-13911).
          */
-        if (!singleResultCounter.isDoneForPartition() && command.limits().perPartitionCount() == DataLimits.NO_LIMIT)
+        if (command.limits().isExhausted(singleResultCounter) && command.limits().perPartitionCount() == DataLimits.NO_LIMIT)
             return null;
 
         /*
@@ -111,18 +111,18 @@ class ShortReadRowsProtection extends Transformation implements MoreRows<Unfilte
          * rows. In that scenario the counter will remain at 0 until the partition is closed - which happens after
          * the moreContents() call.
          */
-        if (countedInCurrentPartition(singleResultCounter) == 0)
+        if (singleResultCounter.rowsCountedInCurrentPartition() == 0)
             return null;
 
         /*
          * This is a table with no clustering columns, and has at most one row per partition - with EMPTY clustering.
          * We already have the row, so there is no point in asking for more from the partition.
          */
-        if (Clustering.EMPTY == lastClustering)
+        if (lastClustering != null && lastClustering.isEmpty())
             return null;
 
-        lastFetched = countedInCurrentPartition(singleResultCounter) - lastCounted;
-        lastCounted = countedInCurrentPartition(singleResultCounter);
+        lastFetched = singleResultCounter.rowsCountedInCurrentPartition() - lastCounted;
+        lastCounted = singleResultCounter.rowsCountedInCurrentPartition();
 
         // getting back fewer rows than we asked for means the partition on the replica has been fully consumed
         if (lastQueried > 0 && lastFetched < lastQueried)
@@ -169,14 +169,6 @@ class ShortReadRowsProtection extends Transformation implements MoreRows<Unfilte
 
         SinglePartitionReadCommand cmd = makeFetchAdditionalRowsReadCommand(lastQueried);
         return UnfilteredPartitionIterators.getOnlyElement(commandExecutor.apply(cmd), cmd);
-    }
-
-    // Counts the number of rows for regular queries and the number of groups for GROUP BY queries
-    private int countedInCurrentPartition(DataLimits.Counter counter)
-    {
-        return command.limits().isGroupByLimit()
-               ? counter.rowCountedInCurrentPartition()
-               : counter.countedInCurrentPartition();
     }
 
     private SinglePartitionReadCommand makeFetchAdditionalRowsReadCommand(int toQuery)

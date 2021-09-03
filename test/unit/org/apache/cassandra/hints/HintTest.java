@@ -18,8 +18,8 @@
 package org.apache.cassandra.hints;
 
 import java.io.IOException;
-import java.util.Collections;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 import com.google.common.collect.ImmutableList;
 
@@ -41,13 +41,12 @@ import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.TokenMetadata;
 import org.apache.cassandra.metrics.StorageMetrics;
-import org.apache.cassandra.net.MessageIn;
+import org.apache.cassandra.net.Message;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.TableMetadata;
-import org.apache.cassandra.schema.TableParams;
 import org.apache.cassandra.schema.MigrationManager;
 import org.apache.cassandra.service.StorageProxy;
 import org.apache.cassandra.service.StorageService;
@@ -58,6 +57,7 @@ import static junit.framework.Assert.*;
 import static org.apache.cassandra.Util.dk;
 import static org.apache.cassandra.hints.HintsTestUtil.assertHintsEqual;
 import static org.apache.cassandra.hints.HintsTestUtil.assertPartitionsEqual;
+import static org.apache.cassandra.net.Verb.HINT_REQ;
 
 public class HintTest
 {
@@ -87,7 +87,7 @@ public class HintTest
         tokenMeta.updateNormalTokens(BootStrapper.getRandomTokens(tokenMeta, 1), local);
 
         for (TableMetadata table : Schema.instance.getTablesAndViews(KEYSPACE))
-            MigrationManager.announceTableUpdate(table.unbuild().gcGraceSeconds(TableParams.DEFAULT_GC_GRACE_SECONDS).build(), true);
+            MigrationManager.announceTableUpdate(table.unbuild().gcGraceSeconds(864000).build(), true);
     }
 
     @Test
@@ -246,9 +246,7 @@ public class HintTest
         long totalHintCount = StorageProxy.instance.getTotalHints();
         // Process hint message.
         HintMessage message = new HintMessage(localId, hint);
-        MessagingService.instance().getVerbHandler(MessagingService.Verb.HINT).doVerb(
-                MessageIn.create(local, message, Collections.emptyMap(), MessagingService.Verb.HINT, MessagingService.current_version),
-                -1);
+        HINT_REQ.handler().doVerb(Message.out(HINT_REQ, message));
 
         // hint should not be applied as we no longer are a replica
         assertNoPartitions(key, TABLE0);
@@ -291,9 +289,8 @@ public class HintTest
             long totalHintCount = StorageMetrics.totalHints.getCount();
             // Process hint message.
             HintMessage message = new HintMessage(localId, hint);
-            MessagingService.instance().getVerbHandler(MessagingService.Verb.HINT).doVerb(
-                    MessageIn.create(local, message, Collections.emptyMap(), MessagingService.Verb.HINT, MessagingService.current_version),
-                    -1);
+            HINT_REQ.<HintMessage>handler().doVerb(
+                    Message.builder(HINT_REQ, message).from(local).build());
 
             // hint should not be applied as we no longer are a replica
             assertNoPartitions(key, TABLE0);
@@ -307,6 +304,26 @@ public class HintTest
         {
             DatabaseDescriptor.setHintedHandoffEnabled(true);
         }
+    }
+
+    @Test
+    public void testCalculateHintExpiration()
+    {
+        // create a hint with gcgs
+        long now = FBUtilities.timestampMicros();
+        long nowInMillis = TimeUnit.MICROSECONDS.toMillis(now);
+        int gcgs = 10; // It is less than the default mutation gcgs
+        String key = "testExpiration";
+        Mutation mutation = createMutation(key, now);
+        // create a hint with explicit small gcgs
+        Hint hint = Hint.create(mutation, nowInMillis, gcgs);
+        assertEquals(nowInMillis + TimeUnit.SECONDS.toMillis(gcgs),
+                     hint.expirationInMillis());
+
+        // create a hint with mutation's gcgs.
+        hint = Hint.create(mutation, nowInMillis);
+        assertEquals(nowInMillis + TimeUnit.SECONDS.toMillis(mutation.smallestGCGS()),
+                     hint.expirationInMillis());
     }
 
     private static Mutation createMutation(String key, long now)

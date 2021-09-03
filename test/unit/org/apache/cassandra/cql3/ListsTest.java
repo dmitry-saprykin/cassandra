@@ -37,6 +37,7 @@ import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.UUIDGen;
 
 public class ListsTest extends CQLTester
@@ -140,8 +141,9 @@ public class ListsTest extends CQLTester
 
         ByteBuffer keyBuf = ByteBufferUtil.bytes("key");
         DecoratedKey key = Murmur3Partitioner.instance.decorateKey(keyBuf);
-        UpdateParameters parameters = new UpdateParameters(metaData, null, null, System.currentTimeMillis(), 1000, Collections.emptyMap());
-        Clustering clustering = Clustering.make(ByteBufferUtil.bytes(1));
+        UpdateParameters parameters =
+            new UpdateParameters(metaData, null, QueryOptions.DEFAULT, System.currentTimeMillis(), FBUtilities.nowInSeconds(), 1000, Collections.emptyMap());
+        Clustering<?> clustering = Clustering.make(ByteBufferUtil.bytes(1));
         parameters.newRow(clustering);
         prepender.execute(key, parameters);
 
@@ -150,7 +152,7 @@ public class ListsTest extends CQLTester
 
         int idx = 0;
         UUID last = null;
-        for (Cell cell : row.cells())
+        for (Cell<?> cell : row.cells())
         {
             UUID uuid = UUIDGen.getUUID(cell.path().get(0));
 
@@ -158,7 +160,7 @@ public class ListsTest extends CQLTester
                 Assert.assertTrue(last.compareTo(uuid) < 0);
             last = uuid;
 
-            Assert.assertEquals(String.format("different values found: expected: '%d', found '%d'", ByteBufferUtil.toInt(terms.get(idx)), ByteBufferUtil.toInt(cell.value())),
+            Assert.assertEquals(String.format("different values found: expected: '%d', found '%d'", ByteBufferUtil.toInt(terms.get(idx)), ByteBufferUtil.toInt(cell.buffer())),
                                 terms.get(idx), cell.value());
             idx++;
         }

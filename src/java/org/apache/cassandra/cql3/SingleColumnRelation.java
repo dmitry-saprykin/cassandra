@@ -20,6 +20,7 @@ package org.apache.cassandra.cql3;
 import java.util.Collections;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
@@ -43,12 +44,12 @@ import static org.apache.cassandra.cql3.statements.RequestValidations.invalidReq
  */
 public final class SingleColumnRelation extends Relation
 {
-    private final ColumnMetadata.Raw entity;
+    private final ColumnIdentifier entity;
     private final Term.Raw mapKey;
     private final Term.Raw value;
     private final List<Term.Raw> inValues;
 
-    private SingleColumnRelation(ColumnMetadata.Raw entity, Term.Raw mapKey, Operator type, Term.Raw value, List<Term.Raw> inValues)
+    private SingleColumnRelation(ColumnIdentifier entity, Term.Raw mapKey, Operator type, Term.Raw value, List<Term.Raw> inValues)
     {
         this.entity = entity;
         this.mapKey = mapKey;
@@ -68,7 +69,7 @@ public final class SingleColumnRelation extends Relation
      * @param type the type that describes how this entity relates to the value.
      * @param value the value being compared.
      */
-    public SingleColumnRelation(ColumnMetadata.Raw entity, Term.Raw mapKey, Operator type, Term.Raw value)
+    public SingleColumnRelation(ColumnIdentifier entity, Term.Raw mapKey, Operator type, Term.Raw value)
     {
         this(entity, mapKey, type, value, null);
     }
@@ -80,7 +81,7 @@ public final class SingleColumnRelation extends Relation
      * @param type the type that describes how this entity relates to the value.
      * @param value the value being compared.
      */
-    public SingleColumnRelation(ColumnMetadata.Raw entity, Operator type, Term.Raw value)
+    public SingleColumnRelation(ColumnIdentifier entity, Operator type, Term.Raw value)
     {
         this(entity, null, type, value);
     }
@@ -95,12 +96,12 @@ public final class SingleColumnRelation extends Relation
         return inValues;
     }
 
-    public static SingleColumnRelation createInRelation(ColumnMetadata.Raw entity, List<Term.Raw> inValues)
+    public static SingleColumnRelation createInRelation(ColumnIdentifier entity, List<Term.Raw> inValues)
     {
         return new SingleColumnRelation(entity, null, Operator.IN, null, inValues);
     }
 
-    public ColumnMetadata.Raw getEntity()
+    public ColumnIdentifier getEntity()
     {
         return entity;
     }
@@ -134,7 +135,7 @@ public final class SingleColumnRelation extends Relation
         }
     }
 
-    public Relation renameIdentifier(ColumnMetadata.Raw from, ColumnMetadata.Raw to)
+    public Relation renameIdentifier(ColumnIdentifier from, ColumnIdentifier to)
     {
         return entity.equals(from)
                ? new SingleColumnRelation(to, mapKey, operator(), value, inValues)
@@ -142,22 +143,45 @@ public final class SingleColumnRelation extends Relation
     }
 
     @Override
-    public String toString()
+    public String toCQLString()
     {
-        String entityAsString = entity.toString();
+        String entityAsString = entity.toCQLString();
         if (mapKey != null)
             entityAsString = String.format("%s[%s]", entityAsString, mapKey);
 
         if (isIN())
-            return String.format("%s IN %s", entityAsString, inValues);
+            return String.format("%s IN %s", entityAsString, Tuples.tupleToString(inValues));
 
         return String.format("%s %s %s", entityAsString, relationType, value);
     }
 
     @Override
+    public int hashCode()
+    {
+        return Objects.hash(relationType, entity, mapKey, value, inValues);
+    }
+
+    @Override
+    public boolean equals(Object o)
+    {
+        if (this == o)
+            return true;
+
+        if (!(o instanceof SingleColumnRelation))
+            return false;
+
+        SingleColumnRelation scr = (SingleColumnRelation) o;
+        return Objects.equals(entity, scr.entity)
+            && Objects.equals(relationType, scr.relationType)
+            && Objects.equals(mapKey, scr.mapKey)
+            && Objects.equals(value, scr.value)
+            && Objects.equals(inValues, scr.inValues);
+    }
+
+    @Override
     protected Restriction newEQRestriction(TableMetadata table, VariableSpecifications boundNames)
     {
-        ColumnMetadata columnDef = entity.prepare(table);
+        ColumnMetadata columnDef = table.getExistingColumn(entity);
         if (mapKey == null)
         {
             Term term = toTerm(toReceivers(columnDef), value, table.keyspace, boundNames);
@@ -172,7 +196,7 @@ public final class SingleColumnRelation extends Relation
     @Override
     protected Restriction newINRestriction(TableMetadata table, VariableSpecifications boundNames)
     {
-        ColumnMetadata columnDef = entity.prepare(table);
+        ColumnMetadata columnDef = table.getExistingColumn(entity);
         List<? extends ColumnSpecification> receivers = toReceivers(columnDef);
         List<Term> terms = toTerms(receivers, inValues, table.keyspace, boundNames);
         if (terms == null)
@@ -194,7 +218,7 @@ public final class SingleColumnRelation extends Relation
                                               Bound bound,
                                               boolean inclusive)
     {
-        ColumnMetadata columnDef = entity.prepare(table);
+        ColumnMetadata columnDef = table.getExistingColumn(entity);
 
         if (columnDef.type.referencesDuration())
         {
@@ -213,7 +237,7 @@ public final class SingleColumnRelation extends Relation
                                                  VariableSpecifications boundNames,
                                                  boolean isKey) throws InvalidRequestException
     {
-        ColumnMetadata columnDef = entity.prepare(table);
+        ColumnMetadata columnDef = table.getExistingColumn(entity);
         Term term = toTerm(toReceivers(columnDef), value, table.keyspace, boundNames);
         return new SingleColumnRestriction.ContainsRestriction(columnDef, term, isKey);
     }
@@ -222,7 +246,7 @@ public final class SingleColumnRelation extends Relation
     protected Restriction newIsNotRestriction(TableMetadata table,
                                               VariableSpecifications boundNames) throws InvalidRequestException
     {
-        ColumnMetadata columnDef = entity.prepare(table);
+        ColumnMetadata columnDef = table.getExistingColumn(entity);
         // currently enforced by the grammar
         assert value == Constants.NULL_LITERAL : "Expected null literal for IS NOT relation: " + this.toString();
         return new SingleColumnRestriction.IsNotNullRestriction(columnDef);
@@ -234,7 +258,7 @@ public final class SingleColumnRelation extends Relation
         if (mapKey != null)
             throw invalidRequest("%s can't be used with collections.", operator());
 
-        ColumnMetadata columnDef = entity.prepare(table);
+        ColumnMetadata columnDef = table.getExistingColumn(entity);
         Term term = toTerm(toReceivers(columnDef), value, table.keyspace, boundNames);
 
         return new SingleColumnRestriction.LikeRestriction(columnDef, operator, term);

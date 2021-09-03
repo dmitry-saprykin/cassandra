@@ -67,7 +67,7 @@ public class TriggerExecutorTest
         // only 1 row
         assertEquals(1, rows.size());
 
-        List<Cell> cells = new ArrayList<>();
+        List<Cell<?>> cells = new ArrayList<>();
         rows.get(0).cells().forEach(cells::add);
 
         // 2 columns
@@ -286,7 +286,7 @@ public class TriggerExecutorTest
 
     private static PartitionUpdate makeCf(TableMetadata metadata, String key, String columnValue1, String columnValue2)
     {
-        Row.Builder builder = BTreeRow.unsortedBuilder(FBUtilities.nowInSeconds());
+        Row.Builder builder = BTreeRow.unsortedBuilder();
         builder.newRow(Clustering.EMPTY);
         long ts = FBUtilities.timestampMicros();
         if (columnValue1 != null)

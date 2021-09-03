@@ -23,10 +23,13 @@ import java.io.InputStreamReader;
 import java.io.Reader;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 
 import org.apache.cassandra.index.sasi.analyzer.filter.*;
 import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.AsciiType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.utils.ByteBufferUtil;
@@ -34,10 +37,19 @@ import org.apache.cassandra.utils.ByteBufferUtil;
 import com.google.common.annotations.VisibleForTesting;
 
 import com.carrotsearch.hppc.IntObjectMap;
-import com.carrotsearch.hppc.IntObjectOpenHashMap;
+import com.carrotsearch.hppc.IntObjectHashMap;
 
 public class StandardAnalyzer extends AbstractAnalyzer
 {
+
+    private static final Set<AbstractType<?>> VALID_ANALYZABLE_TYPES = new HashSet<AbstractType<?>>()
+    {
+        {
+            add(UTF8Type.instance);
+            add(AsciiType.instance);
+        }
+    };
+
     public enum TokenType
     {
         EOF(-1),
@@ -49,7 +61,7 @@ public class StandardAnalyzer extends AbstractAnalyzer
         KATAKANA(12),
         HANGUL(13);
 
-        private static final IntObjectMap<TokenType> TOKENS = new IntObjectOpenHashMap<>();
+        private static final IntObjectMap<TokenType> TOKENS = new IntObjectHashMap<>();
 
         static
         {
@@ -75,7 +87,7 @@ public class StandardAnalyzer extends AbstractAnalyzer
         }
     }
 
-    private AbstractType validator;
+    private AbstractType<?> validator;
 
     private StandardTokenizerInterface scanner;
     private StandardTokenizerOptions options;
@@ -136,7 +148,7 @@ public class StandardAnalyzer extends AbstractAnalyzer
         return builder.build();
     }
 
-    public void init(Map<String, String> options, AbstractType validator)
+    public void init(Map<String, String> options, AbstractType<?> validator)
     {
         init(StandardTokenizerOptions.buildFromMap(options), validator);
     }
@@ -147,7 +159,7 @@ public class StandardAnalyzer extends AbstractAnalyzer
         init(options, UTF8Type.instance);
     }
 
-    public void init(StandardTokenizerOptions tokenizerOptions, AbstractType validator)
+    public void init(StandardTokenizerOptions tokenizerOptions, AbstractType<?> validator)
     {
         this.validator = validator;
         this.options = tokenizerOptions;
@@ -194,8 +206,15 @@ public class StandardAnalyzer extends AbstractAnalyzer
         this.inputReader = reader;
     }
 
+    @Override
     public boolean isTokenizing()
     {
         return true;
+    }
+
+    @Override
+    public boolean isCompatibleWith(AbstractType<?> validator)
+    {
+        return VALID_ANALYZABLE_TYPES.contains(validator);
     }
 }

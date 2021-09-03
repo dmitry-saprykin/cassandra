@@ -36,7 +36,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.db.SystemKeyspace;
-import org.apache.cassandra.net.MessageIn;
+import org.apache.cassandra.net.Message;
 import org.apache.cassandra.utils.UUIDGen;
 
 public class PrepareCallback extends AbstractPaxosCallback<PrepareResponse>
@@ -46,27 +46,24 @@ public class PrepareCallback extends AbstractPaxosCallback<PrepareResponse>
     public boolean promised = true;
     public Commit mostRecentCommit;
     public Commit mostRecentInProgressCommit;
-    public Commit mostRecentInProgressCommitWithUpdate;
 
     private final Map<InetAddressAndPort, Commit> commitsByReplica = new ConcurrentHashMap<>();
 
     public PrepareCallback(DecoratedKey key, TableMetadata metadata, int targets, ConsistencyLevel consistency, long queryStartNanoTime)
     {
         super(targets, consistency, queryStartNanoTime);
-        // need to inject the right key in the empty commit so comparing with empty commits in the reply works as expected
+        // need to inject the right key in the empty commit so comparing with empty commits in the response works as expected
         mostRecentCommit = Commit.emptyCommit(key, metadata);
         mostRecentInProgressCommit = Commit.emptyCommit(key, metadata);
-        mostRecentInProgressCommitWithUpdate = Commit.emptyCommit(key, metadata);
     }
 
-    public synchronized void response(MessageIn<PrepareResponse> message)
+    public synchronized void onResponse(Message<PrepareResponse> message)
     {
         PrepareResponse response = message.payload;
-        logger.trace("Prepare response {} from {}", response, message.from);
+        logger.trace("Prepare response {} from {}", response, message.from());
 
-        // In case of clock skew, another node could be proposing with ballot that are quite a bit
-        // older than our own. In that case, we record the more recent commit we've received to make
-        // sure we re-prepare on an older ballot.
+        // We set the mostRecentInProgressCommit even if we're not promised as, in that case, the ballot of that commit
+        // will be used to avoid generating a ballot that has not chance to win on retry (think clock skew).
         if (response.inProgressCommit.isAfter(mostRecentInProgressCommit))
             mostRecentInProgressCommit = response.inProgressCommit;
 
@@ -78,14 +75,9 @@ public class PrepareCallback extends AbstractPaxosCallback<PrepareResponse>
             return;
         }
 
-        commitsByReplica.put(message.from, response.mostRecentCommit);
+        commitsByReplica.put(message.from(), response.mostRecentCommit);
         if (response.mostRecentCommit.isAfter(mostRecentCommit))
             mostRecentCommit = response.mostRecentCommit;
-
-        // If some response has an update, then we should replay the update with the highest ballot. So find
-        // the the highest commit that actually have an update
-        if (response.inProgressCommit.isAfter(mostRecentInProgressCommitWithUpdate) && !response.inProgressCommit.update.isEmpty())
-            mostRecentInProgressCommitWithUpdate = response.inProgressCommit;
 
         latch.countDown();
     }

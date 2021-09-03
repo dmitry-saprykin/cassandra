@@ -16,8 +16,8 @@ cdc_enabled: false
 hints_directory: build/test/cassandra/hints
 partitioner: org.apache.cassandra.dht.ByteOrderedPartitioner
 listen_address: 127.0.0.1
-storage_port: 7010
-ssl_storage_port: 7011
+storage_port: 7012
+ssl_storage_port: 17012
 start_native_transport: true
 native_transport_port: 9042
 column_index_size_in_kb: 4
@@ -28,7 +28,7 @@ disk_access_mode: mmap
 seed_provider:
     - class_name: org.apache.cassandra.locator.SimpleSeedProvider
       parameters:
-          - seeds: "127.0.0.1:7010"
+          - seeds: "127.0.0.1:7012"
 endpoint_snitch: org.apache.cassandra.locator.SimpleSnitch
 dynamic_snitch: true
 server_encryption_options:
@@ -45,3 +45,14 @@ row_cache_size_in_mb: 16
 enable_user_defined_functions: true
 enable_scripted_user_defined_functions: true
 prepared_statements_cache_size_mb: 1
+corrupted_tombstone_strategy: exception
+stream_entire_sstables: true
+stream_throughput_outbound_megabits_per_sec: 200000000
+enable_sasi_indexes: true
+enable_materialized_views: true
+enable_drop_compact_storage: true
+file_cache_enabled: true
+auto_hints_cleanup_enabled: true
+client_track_warnings_enabled: true
+client_large_read_warn_threshold_kb: 1024
+client_large_read_abort_threshold_kb: 4096

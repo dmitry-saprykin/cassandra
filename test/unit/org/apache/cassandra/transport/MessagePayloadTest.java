@@ -36,7 +36,6 @@ import org.apache.cassandra.cql3.QueryHandler;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.statements.BatchStatement;
-import org.apache.cassandra.cql3.statements.ParsedStatement;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.exceptions.RequestExecutionException;
 import org.apache.cassandra.exceptions.RequestValidationException;
@@ -297,6 +296,10 @@ public class MessagePayloadTest extends CQLTester
                 {
                     Assert.assertTrue(e.getCause() instanceof ProtocolException);
                 }
+                // when a protocol exception is thrown by the server the connection is closed, so need to re-connect
+                client.close();
+                client.connect(false);
+
                 queryMessage.setCustomPayload(null);
                 client.execute(queryMessage);
 
@@ -312,6 +315,10 @@ public class MessagePayloadTest extends CQLTester
                 {
                     Assert.assertTrue(e.getCause() instanceof ProtocolException);
                 }
+                // when a protocol exception is thrown by the server the connection is closed, so need to re-connect
+                client.close();
+                client.connect(false);
+
                 prepareMessage.setCustomPayload(null);
                 ResultMessage.Prepared prepareResponse = (ResultMessage.Prepared) client.execute(prepareMessage);
 
@@ -328,6 +335,9 @@ public class MessagePayloadTest extends CQLTester
                 {
                     Assert.assertTrue(e.getCause() instanceof ProtocolException);
                 }
+                // when a protocol exception is thrown by the server the connection is closed, so need to re-connect
+                client.close();
+                client.connect(false);
 
                 BatchMessage batchMessage = new BatchMessage(BatchStatement.Type.UNLOGGED,
                                                              Collections.<Object>singletonList("INSERT INTO " + KEYSPACE + ".atable (pk,v) VALUES (1, 'foo')"),
@@ -368,9 +378,14 @@ public class MessagePayloadTest extends CQLTester
 
     public static class TestQueryHandler implements QueryHandler
     {
-        public ParsedStatement.Prepared getPrepared(MD5Digest id)
+        public QueryProcessor.Prepared getPrepared(MD5Digest id)
         {
             return QueryProcessor.instance.getPrepared(id);
+        }
+
+        public CQLStatement parse(String query, QueryState state, QueryOptions options)
+        {
+            return QueryProcessor.instance.parse(query, state, options);
         }
 
         public ResultMessage.Prepared prepare(String query,
@@ -389,7 +404,7 @@ public class MessagePayloadTest extends CQLTester
             return result;
         }
 
-        public ResultMessage process(String query,
+        public ResultMessage process(CQLStatement statement,
                                      QueryState state,
                                      QueryOptions options,
                                      Map<String, ByteBuffer> customPayload,
@@ -398,7 +413,7 @@ public class MessagePayloadTest extends CQLTester
         {
             if (customPayload != null)
                 requestPayload = customPayload;
-            ResultMessage result = QueryProcessor.instance.process(query, state, options, customPayload, queryStartNanoTime);
+            ResultMessage result = QueryProcessor.instance.process(statement, state, options, customPayload, queryStartNanoTime);
             if (customPayload != null)
             {
                 result.setCustomPayload(responsePayload);

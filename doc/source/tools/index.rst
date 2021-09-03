@@ -20,8 +20,10 @@ Cassandra Tools
 This section describes the command line tools provided with Apache Cassandra.
 
 .. toctree::
-   :maxdepth: 1
+   :maxdepth: 3
 
    cqlsh
+   generatetokens
    nodetool/nodetool
+   sstable/index
    cassandra_stress

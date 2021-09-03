@@ -21,15 +21,25 @@ package org.apache.cassandra.db;
 import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.*;
 
+import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Assume;
 import org.junit.BeforeClass;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.schema.SchemaConstants;
+import org.apache.cassandra.service.snapshot.SnapshotManifest;
+import org.apache.cassandra.service.snapshot.TableSnapshot;
+
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 import com.google.common.collect.Iterators;
@@ -38,7 +48,6 @@ import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.db.lifecycle.SSTableSet;
 import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.db.partitions.*;
-import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
@@ -49,9 +58,9 @@ import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.WrappedRunnable;
 import static junit.framework.Assert.assertNotNull;
+
 @RunWith(OrderedJUnit4ClassRunner.class)
 public class ColumnFamilyStoreTest
 {
@@ -59,8 +68,6 @@ public class ColumnFamilyStoreTest
     public static final String KEYSPACE2 = "ColumnFamilyStoreTest2";
     public static final String CF_STANDARD1 = "Standard1";
     public static final String CF_STANDARD2 = "Standard2";
-    public static final String CF_SUPER1 = "Super1";
-    public static final String CF_SUPER6 = "Super6";
     public static final String CF_INDEX1 = "Indexed1";
 
     @BeforeClass
@@ -72,9 +79,6 @@ public class ColumnFamilyStoreTest
                                     SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD1),
                                     SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD2),
                                     SchemaLoader.keysIndexCFMD(KEYSPACE1, CF_INDEX1, true));
-                                    // TODO: Fix superCFMD failing on legacy table creation. Seems to be applying composite comparator to partition key
-                                    // SchemaLoader.superCFMD(KEYSPACE1, CF_SUPER1, LongType.instance));
-                                    // SchemaLoader.superCFMD(KEYSPACE1, CF_SUPER6, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", LexicalUUIDType.instance, UTF8Type.instance),
         SchemaLoader.createKeyspace(KEYSPACE2,
                                     KeyspaceParams.simple(1),
                                     SchemaLoader.standardCFMD(KEYSPACE2, CF_STANDARD1));
@@ -85,8 +89,7 @@ public class ColumnFamilyStoreTest
     {
         Keyspace.open(KEYSPACE1).getColumnFamilyStore(CF_STANDARD1).truncateBlocking();
         Keyspace.open(KEYSPACE1).getColumnFamilyStore(CF_STANDARD2).truncateBlocking();
-        // Keyspace.open(KEYSPACE1).getColumnFamilyStore(CF_SUPER1).truncateBlocking();
-
+        Keyspace.open(KEYSPACE1).getColumnFamilyStore(CF_INDEX1).truncateBlocking();
         Keyspace.open(KEYSPACE2).getColumnFamilyStore(CF_STANDARD1).truncateBlocking();
     }
 
@@ -132,7 +135,7 @@ public class ColumnFamilyStoreTest
 
         List<SSTableReader> ssTables = keyspace.getAllSSTables(SSTableSet.LIVE);
         assertEquals(1, ssTables.size());
-        ssTables.get(0).forceFilterFailures();
+        Util.disableBloomFilter(cfs);
         Util.assertEmpty(Util.cmd(cfs, "key2").build());
     }
 
@@ -149,7 +152,7 @@ public class ColumnFamilyStoreTest
             public void runMayThrow() throws IOException
             {
                 Row toCheck = Util.getOnlyRowUnfiltered(Util.cmd(cfs, "key1").build());
-                Iterator<Cell> iter = toCheck.cells().iterator();
+                Iterator<Cell<?>> iter = toCheck.cells().iterator();
                 assert(Iterators.size(iter) == 0);
             }
         };
@@ -240,14 +243,14 @@ public class ColumnFamilyStoreTest
         cfs.snapshot("nonEphemeralSnapshot", null, false, false);
         cfs.snapshot("ephemeralSnapshot", null, true, false);
 
-        Map<String, Pair<Long, Long>> snapshotDetails = cfs.getSnapshotDetails();
+        Map<String, TableSnapshot> snapshotDetails = cfs.listSnapshots();
         assertEquals(2, snapshotDetails.size());
         assertTrue(snapshotDetails.containsKey("ephemeralSnapshot"));
         assertTrue(snapshotDetails.containsKey("nonEphemeralSnapshot"));
 
         ColumnFamilyStore.clearEphemeralSnapshots(cfs.getDirectories());
 
-        snapshotDetails = cfs.getSnapshotDetails();
+        snapshotDetails = cfs.listSnapshots();
         assertEquals(1, snapshotDetails.size());
         assertTrue(snapshotDetails.containsKey("nonEphemeralSnapshot"));
 
@@ -420,12 +423,111 @@ public class ColumnFamilyStoreTest
             {
                 for (Row r : partition)
                 {
-                    if (r.getCell(col).value().equals(val))
+                    if (r.getCell(col).buffer().equals(val))
                         ++found;
                 }
             }
         }
         assertEquals(count, found);
+    }
+
+    @Test
+    public void testSnapshotWithoutFlushWithSecondaryIndexes() throws Exception
+    {
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_INDEX1);
+        cfs.truncateBlocking();
+
+        UpdateBuilder builder = UpdateBuilder.create(cfs.metadata.get(), "key")
+                                             .newRow()
+                                             .add("birthdate", 1L)
+                                             .add("notbirthdate", 2L);
+        new Mutation(builder.build()).applyUnsafe();
+        cfs.forceBlockingFlush();
+
+        String snapshotName = "newSnapshot";
+        cfs.snapshotWithoutFlush(snapshotName);
+
+        File snapshotManifestFile = cfs.getDirectories().getSnapshotManifestFile(snapshotName);
+        SnapshotManifest manifest = SnapshotManifest.deserializeFromJsonFile(snapshotManifestFile);
+
+        // Keyspace1-Indexed1 and the corresponding index
+        assertThat(manifest.getFiles()).hasSize(2);
+
+        // Snapshot of the secondary index is stored in the subfolder with the same file name
+        String baseTableFile = manifest.getFiles().get(0);
+        String indexTableFile = manifest.getFiles().get(1);
+        assertThat(baseTableFile).isNotEqualTo(indexTableFile);
+        assertThat(Directories.isSecondaryIndexFolder(new File(indexTableFile).getParentFile())).isTrue();
+        assertThat(indexTableFile).endsWith(baseTableFile);
+    }
+
+    private void createSnapshotAndDelete(String ks, String table, boolean writeData)
+    {
+        ColumnFamilyStore cfs = Keyspace.open(ks).getColumnFamilyStore(table);
+        if (writeData)
+        {
+            writeData(cfs);
+        }
+
+        TableSnapshot snapshot = cfs.snapshot("basic");
+
+
+        assertThat(snapshot.exists()).isTrue();
+        assertThat(cfs.listSnapshots().containsKey("basic")).isTrue();
+        assertThat(cfs.listSnapshots().get("basic")).isEqualTo(snapshot);
+
+        snapshot.getDirectories().forEach(FileUtils::deleteRecursive);
+
+        assertThat(snapshot.exists()).isFalse();
+        assertFalse(cfs.listSnapshots().containsKey("basic"));
+    }
+
+    private void writeData(ColumnFamilyStore cfs)
+    {
+        if (cfs.name.equals(CF_INDEX1))
+        {
+            new RowUpdateBuilder(cfs.metadata(), 2, "key").add("birthdate", 1L).add("notbirthdate", 2L).build().applyUnsafe();
+            cfs.forceBlockingFlush();
+        }
+        else
+        {
+            new RowUpdateBuilder(cfs.metadata(), 2, "key").clustering("name").add("val", "2").build().applyUnsafe();
+            cfs.forceBlockingFlush();
+        }
+    }
+
+    @Test
+    public void testSnapshotCreationAndDeleteEmptyTable() {
+        createSnapshotAndDelete(KEYSPACE1, CF_INDEX1, false);
+        createSnapshotAndDelete(KEYSPACE1, CF_STANDARD1, false);
+        createSnapshotAndDelete(KEYSPACE1, CF_STANDARD2, false);
+        createSnapshotAndDelete(KEYSPACE2, CF_STANDARD1, false);
+        createSnapshotAndDelete(SchemaConstants.SYSTEM_KEYSPACE_NAME, SystemKeyspace.TRANSFERRED_RANGES_V2, false);
+    }
+
+    @Test
+    public void testSnapshotCreationAndDeletePopulatedTable() {
+        createSnapshotAndDelete(KEYSPACE1, CF_INDEX1, true);
+        createSnapshotAndDelete(KEYSPACE1, CF_STANDARD1, true);
+        createSnapshotAndDelete(KEYSPACE1, CF_STANDARD2, true);
+        createSnapshotAndDelete(KEYSPACE2, CF_STANDARD1, true);
+    }
+
+    @Test
+    public void testDataDirectoriesOfColumnFamily() throws Exception
+    {
+        ColumnFamilyStore cfs = Keyspace.open(KEYSPACE1).getColumnFamilyStore(CF_STANDARD1);
+        List<String> dataPaths = cfs.getDataPaths();
+        Assert.assertFalse(dataPaths.isEmpty());
+
+        Path path = Paths.get(dataPaths.get(0));
+
+        String keyspace = path.getParent().getFileName().toString();
+        String table = path.getFileName().toString().split("-")[0];
+
+        Assert.assertEquals(cfs.getTableName(), table);
+        Assert.assertEquals(KEYSPACE1, keyspace);
     }
 
     @Test

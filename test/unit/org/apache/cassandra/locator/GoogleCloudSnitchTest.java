@@ -27,15 +27,17 @@ import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
-import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.commitlog.CommitLog;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.gms.ApplicationState;
 import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.gms.VersionedValue;
 import org.apache.cassandra.service.StorageService;
 
+import static org.apache.cassandra.ServerTestUtils.cleanup;
+import static org.apache.cassandra.ServerTestUtils.mkdirs;
 import static org.junit.Assert.assertEquals;
 
 public class GoogleCloudSnitchTest
@@ -45,9 +47,12 @@ public class GoogleCloudSnitchTest
     @BeforeClass
     public static void setup() throws Exception
     {
+        System.setProperty(Gossiper.Props.DISABLE_THREAD_VALIDATION, "true");
         DatabaseDescriptor.daemonInitialization();
-        SchemaLoader.mkdirs();
-        SchemaLoader.cleanup();
+        CommitLog.instance.start();
+        CommitLog.instance.segmentManager.awaitManagementTasksCompletion();
+        mkdirs();
+        cleanup();
         Keyspace.setInitialized();
         StorageService.instance.initServer(0);
     }

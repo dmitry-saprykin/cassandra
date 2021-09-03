@@ -19,14 +19,18 @@ package org.apache.cassandra.cql3.statements;
 
 import java.nio.ByteBuffer;
 import java.util.*;
-import java.util.stream.Collectors;
 
+import com.google.common.collect.HashMultiset;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Maps;
 
+import org.apache.cassandra.db.virtual.VirtualMutation;
 import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
+
+import static org.apache.cassandra.utils.MonotonicClock.approxTime;
 
 /**
  * Utility class to collect updates.
@@ -43,20 +47,27 @@ final class BatchUpdatesCollector implements UpdatesCollector
     private final Map<TableId, RegularAndStaticColumns> updatedColumns;
 
     /**
-     * The estimated number of updated row.
+     * The number of updated rows per table and key.
      */
-    private final int updatedRows;
+    private final Map<TableId, HashMultiset<ByteBuffer>> perPartitionKeyCounts;
 
     /**
      * The mutations per keyspace.
+     *
+     * optimised for the common single-keyspace case
+     *
+     * Key is keyspace name, then we have an IMutationBuilder for each touched partition key in that keyspace
+     *
+     * MutationBuilder holds a PartitionUpdate.Builder
      */
-    private final Map<String, Map<ByteBuffer, IMutationBuilder>> mutationBuilders = new HashMap<>();
+    private final Map<String, Map<ByteBuffer, IMutationBuilder>> mutationBuilders = Maps.newHashMapWithExpectedSize(1);
 
-    BatchUpdatesCollector(Map<TableId, RegularAndStaticColumns> updatedColumns, int updatedRows)
+
+    BatchUpdatesCollector(Map<TableId, RegularAndStaticColumns> updatedColumns, Map<TableId, HashMultiset<ByteBuffer>> perPartitionKeyCounts)
     {
         super();
         this.updatedColumns = updatedColumns;
-        this.updatedRows = updatedRows;
+        this.perPartitionKeyCounts = perPartitionKeyCounts;
     }
 
     /**
@@ -76,7 +87,7 @@ final class BatchUpdatesCollector implements UpdatesCollector
         {
             RegularAndStaticColumns columns = updatedColumns.get(metadata.id);
             assert columns != null;
-            upd = new PartitionUpdate.Builder(metadata, dk, columns, updatedRows);
+            upd = new PartitionUpdate.Builder(metadata, dk, columns, perPartitionKeyCounts.get(metadata.id).count(dk.getKey()));
             mut.add(upd);
         }
         return upd;
@@ -84,24 +95,35 @@ final class BatchUpdatesCollector implements UpdatesCollector
 
     private IMutationBuilder getMutationBuilder(TableMetadata metadata, DecoratedKey dk, ConsistencyLevel consistency)
     {
-        String ksName = metadata.keyspace;
-        IMutationBuilder mutationBuilder = keyspaceMap(ksName).get(dk.getKey());
+        Map<ByteBuffer, IMutationBuilder> ksMap = keyspaceMap(metadata.keyspace);
+        IMutationBuilder mutationBuilder = ksMap.get(dk.getKey());
         if (mutationBuilder == null)
         {
-            MutationBuilder builder = new MutationBuilder(ksName, dk);
-            mutationBuilder = metadata.isCounter() ? new CounterMutationBuilder(builder, consistency) : builder;
-            keyspaceMap(ksName).put(dk.getKey(), mutationBuilder);
+            mutationBuilder = makeMutationBuilder(metadata, dk, consistency);
+            ksMap.put(dk.getKey(), mutationBuilder);
         }
         return mutationBuilder;
+    }
+
+    private IMutationBuilder makeMutationBuilder(TableMetadata metadata, DecoratedKey partitionKey, ConsistencyLevel cl)
+    {
+        if (metadata.isVirtual())
+        {
+            return new VirtualMutationBuilder(metadata.keyspace, partitionKey);
+        }
+        else
+        {
+            MutationBuilder builder = new MutationBuilder(metadata.keyspace, partitionKey, 1);
+            return metadata.isCounter() ? new CounterMutationBuilder(builder, cl) : builder;
+        }
     }
 
     /**
      * Returns a collection containing all the mutations.
      * @return a collection containing all the mutations.
      */
-    public Collection<IMutation> toMutations()
+    public List<IMutation> toMutations()
     {
-        //TODO: The case where all statement where on the same keyspace is pretty common, optimize for that?
         List<IMutation> ms = new ArrayList<>();
         for (Map<ByteBuffer, IMutationBuilder> ksMap : mutationBuilders.values())
         {
@@ -123,7 +145,13 @@ final class BatchUpdatesCollector implements UpdatesCollector
      */
     private Map<ByteBuffer, IMutationBuilder> keyspaceMap(String ksName)
     {
-        return mutationBuilders.computeIfAbsent(ksName, k -> new HashMap<>());
+        Map<ByteBuffer, IMutationBuilder> ksMap = mutationBuilders.get(ksName);
+        if (ksMap == null)
+        {
+            ksMap = Maps.newHashMapWithExpectedSize(1);
+            mutationBuilders.put(ksName, ksMap);
+        }
+        return ksMap;
     }
 
     private interface IMutationBuilder
@@ -148,15 +176,16 @@ final class BatchUpdatesCollector implements UpdatesCollector
 
     private static class MutationBuilder implements IMutationBuilder
     {
-        private final HashMap<TableId, PartitionUpdate.Builder> modifications = new HashMap<>();
+        private final Map<TableId, PartitionUpdate.Builder> modifications;
         private final DecoratedKey key;
         private final String keyspaceName;
-        private final long createdAt = System.currentTimeMillis();
+        private final long createdAt = approxTime.now();
 
-        private MutationBuilder(String keyspaceName, DecoratedKey key)
+        private MutationBuilder(String keyspaceName, DecoratedKey key, int initialSize)
         {
             this.keyspaceName = keyspaceName;
             this.key = key;
+            this.modifications = Maps.newHashMapWithExpectedSize(initialSize);
         }
 
         public MutationBuilder add(PartitionUpdate.Builder updateBuilder)
@@ -226,6 +255,43 @@ final class BatchUpdatesCollector implements UpdatesCollector
         public PartitionUpdate.Builder get(TableId id)
         {
             return mutationBuilder.get(id);
+        }
+    }
+
+    private static class VirtualMutationBuilder implements IMutationBuilder
+    {
+        private final String keyspaceName;
+        private final DecoratedKey partitionKey;
+
+        private final HashMap<TableId, PartitionUpdate.Builder> modifications = new HashMap<>();
+
+        private VirtualMutationBuilder(String keyspaceName, DecoratedKey partitionKey)
+        {
+            this.keyspaceName = keyspaceName;
+            this.partitionKey = partitionKey;
+        }
+
+        @Override
+        public VirtualMutationBuilder add(PartitionUpdate.Builder builder)
+        {
+            PartitionUpdate.Builder prev = modifications.put(builder.metadata().id, builder);
+            if (null != prev)
+                throw new IllegalStateException();
+            return this;
+        }
+
+        @Override
+        public VirtualMutation build()
+        {
+            ImmutableMap.Builder<TableId, PartitionUpdate> updates = new ImmutableMap.Builder<>();
+            modifications.forEach((tableId, updateBuilder) -> updates.put(tableId, updateBuilder.build()));
+            return new VirtualMutation(keyspaceName, partitionKey, updates.build());
+        }
+
+        @Override
+        public PartitionUpdate.Builder get(TableId tableId)
+        {
+            return modifications.get(tableId);
         }
     }
 }

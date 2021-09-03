@@ -27,11 +27,11 @@ import java.util.Random;
 import java.util.Set;
 
 import com.google.common.base.Joiner;
+import com.google.common.collect.Sets;
 import org.apache.commons.lang3.StringUtils;
+import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
-
-import org.apache.commons.collections.CollectionUtils;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.PartitionPosition;
@@ -353,8 +353,7 @@ public class RangeTest
             expected.add(makeRange(tokens[i], tokens[i+1]));
         }
 
-        assert CollectionUtils.isEqualCollection(result, expected);
-
+        assertEquals(result, expected);
     }
 
     @Test
@@ -371,6 +370,8 @@ public class RangeTest
         assertRanges(range.subtractAll(collection), 10L, 54L, 60L, 90L);
         collection.add(makeRange(80L, 95L));
         assertRanges(range.subtractAll(collection), 10L, 54L, 60L, 80L);
+
+        assertEquals(Collections.emptySet(), range.subtractAll(Collections.singleton(range)));
     }
 
     @Test
@@ -389,6 +390,44 @@ public class RangeTest
         assertRanges(range.subtractAll(collection), 100L, 200L, 500L, 0L);
         collection.add(makeRange(1000L, 0));
         assertRanges(range.subtractAll(collection), 100L, 200L, 500L, 1000L);
+
+        assertEquals(Collections.emptySet(), range.subtractAll(Collections.singleton(range)));
+    }
+
+    @Test
+    public void testSubtractAllFromFullRingRange()
+    {
+        Range<Token> ring1 = makeRange(50L, 50L);
+        Range<Token> ring2 = makeRange(0L, 0L);
+
+        Set<Range<Token>> contained1 = Collections.singleton(makeRange(10L, 100L));
+        Set<Range<Token>> contained2 = Collections.singleton(makeRange(100L, 10L));
+
+        assertEquals(contained2, ring1.subtractAll(contained1));
+        assertEquals(contained2, ring2.subtractAll(contained1));
+        assertEquals(contained1, ring1.subtractAll(contained2));
+        assertEquals(contained1, ring2.subtractAll(contained2));
+        assertEquals(Collections.emptySet(), ring1.subtractAll(Collections.singleton(ring1)));
+        assertEquals(Collections.emptySet(), ring2.subtractAll(Collections.singleton(ring2)));
+        assertEquals(Collections.emptySet(), ring1.subtractAll(Collections.singleton(ring2)));
+    }
+
+    @Test
+    public void testSubtractFromFullRingRange()
+    {
+        Range<Token> ring1 = makeRange(50L, 50L);
+        Range<Token> ring2 = makeRange(0L, 0L);
+
+        Range<Token> contained1 = makeRange(10L, 100L);
+        Range<Token> contained2 = makeRange(100L, 10L);
+
+        assertEquals(Collections.singleton(contained2), ring1.subtract(contained1));
+        assertEquals(Collections.singleton(contained2), ring2.subtract(contained1));
+        assertEquals(Collections.singleton(contained1), ring1.subtract(contained2));
+        assertEquals(Collections.singleton(contained1), ring2.subtract(contained2));
+        assertEquals(Collections.emptySet(), ring1.subtract(ring1));
+        assertEquals(Collections.emptySet(), ring2.subtract(ring2));
+        assertEquals(Collections.emptySet(), ring1.subtract(ring2));
     }
     
     private Range<Token> makeRange(String token1, String token2)
@@ -642,7 +681,7 @@ public class RangeTest
             Range.OrderedRangeContainmentChecker checker = new Range.OrderedRangeContainmentChecker(ranges);
             for (Token t : tokensToTest)
             {
-                if (checker.contains(t) != Range.isInRanges(t, ranges)) // avoid running Joiner.on(..) every iteration
+                if (checker.test(t) != Range.isInRanges(t, ranges)) // avoid running Joiner.on(..) every iteration
                     fail(String.format("This should never flap! If it does, it is a bug (ranges = %s, token = %s)", Joiner.on(",").join(ranges), t));
             }
         }
@@ -653,11 +692,11 @@ public class RangeTest
     {
         List<Range<Token>> ranges = asList(r(Long.MIN_VALUE, Long.MIN_VALUE + 1), r(Long.MAX_VALUE - 1, Long.MAX_VALUE));
         Range.OrderedRangeContainmentChecker checker = new Range.OrderedRangeContainmentChecker(ranges);
-        assertFalse(checker.contains(t(Long.MIN_VALUE)));
-        assertTrue(checker.contains(t(Long.MIN_VALUE + 1)));
-        assertFalse(checker.contains(t(0)));
-        assertFalse(checker.contains(t(Long.MAX_VALUE - 1)));
-        assertTrue(checker.contains(t(Long.MAX_VALUE)));
+        assertFalse(checker.test(t(Long.MIN_VALUE)));
+        assertTrue(checker.test(t(Long.MIN_VALUE + 1)));
+        assertFalse(checker.test(t(0)));
+        assertFalse(checker.test(t(Long.MAX_VALUE - 1)));
+        assertTrue(checker.test(t(Long.MAX_VALUE)));
     }
 
     private static Range<Token> r(long left, long right)
@@ -682,5 +721,20 @@ public class RangeTest
         Range<Token> r0 = r(10, -10);
         Range<Token> r1 = r(20, -5);
         assertNotSame(r0.compareTo(r1), r1.compareTo(r0));
+    }
+
+    @Test
+    public void testGroupIntersect()
+    {
+        assertTrue(Range.intersects(asList(r(1, 5), r(10, 15)), asList(r(4, 6), r(20, 25))));
+        assertFalse(Range.intersects(asList(r(1, 5), r(10, 15)), asList(r(6, 7), r(20, 25))));
+    }
+
+    @Test
+    public void testGroupSubtract()
+    {
+        Collection<Range<Token>> ranges = Sets.newHashSet(r(1, 5), r(10, 15));
+        assertEquals(ranges, Range.subtract(ranges, asList(r(6, 7), r(20, 25))));
+        assertEquals(Sets.newHashSet(r(1, 4), r(11, 15)), Range.subtract(ranges, asList(r(4, 7), r(8, 11))));
     }
 }

@@ -22,6 +22,8 @@ import com.google.common.base.Charsets;
 
 import org.apache.cassandra.OrderedJUnit4ClassRunner;
 import org.apache.cassandra.Util;
+import org.apache.cassandra.batchlog.Batch;
+import org.apache.cassandra.batchlog.BatchlogManager;
 import org.apache.cassandra.cache.ChunkCache;
 import org.apache.cassandra.UpdateBuilder;
 import org.apache.cassandra.db.compaction.AbstractCompactionStrategy;
@@ -29,6 +31,9 @@ import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.compaction.Verifier;
 import org.apache.cassandra.db.marshal.UUIDType;
 import org.apache.cassandra.dht.ByteOrderedPartitioner;
+import org.apache.cassandra.dht.Murmur3Partitioner;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.WriteTimeoutException;
 import org.apache.cassandra.io.FSWriteError;
@@ -49,9 +54,13 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 
 import java.io.*;
+import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.nio.file.Files;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.zip.CRC32;
 import java.util.zip.CheckedInputStream;
@@ -60,6 +69,7 @@ import static org.apache.cassandra.SchemaLoader.counterCFMD;
 import static org.apache.cassandra.SchemaLoader.createKeyspace;
 import static org.apache.cassandra.SchemaLoader.loadSchema;
 import static org.apache.cassandra.SchemaLoader.standardCFMD;
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
@@ -82,6 +92,7 @@ public class VerifyTest
     public static final String CORRUPTCOUNTER_CF2 = "CounterCorrupt2";
 
     public static final String CF_UUID = "UUIDKeys";
+    public static final String BF_ALWAYS_PRESENT = "BfAlwaysPresent";
 
     @BeforeClass
     public static void defineSchema() throws ConfigurationException
@@ -103,7 +114,8 @@ public class VerifyTest
                        counterCFMD(KEYSPACE, COUNTER_CF4),
                        counterCFMD(KEYSPACE, CORRUPTCOUNTER_CF),
                        counterCFMD(KEYSPACE, CORRUPTCOUNTER_CF2),
-                       standardCFMD(KEYSPACE, CF_UUID, 0, UUIDType.instance));
+                       standardCFMD(KEYSPACE, CF_UUID, 0, UUIDType.instance),
+                       standardCFMD(KEYSPACE, BF_ALWAYS_PRESENT).bloomFilterFpChance(1.0));
     }
 
 
@@ -416,7 +428,7 @@ public class VerifyTest
 
         // make the sstable repaired:
         SSTableReader sstable = cfs.getLiveSSTables().iterator().next();
-        sstable.descriptor.getMetadataSerializer().mutateRepaired(sstable.descriptor, System.currentTimeMillis(), sstable.getSSTableMetadata().pendingRepair);
+        sstable.descriptor.getMetadataSerializer().mutateRepairMetadata(sstable.descriptor, System.currentTimeMillis(), sstable.getPendingRepair(), sstable.isTransient());
         sstable.reloadSSTableMetadata();
 
         // break the sstable:
@@ -482,7 +494,7 @@ public class VerifyTest
         fillCF(cfs, 2);
 
         SSTableReader sstable = cfs.getLiveSSTables().iterator().next();
-        sstable.descriptor.getMetadataSerializer().mutateRepaired(sstable.descriptor, 1, sstable.getSSTableMetadata().pendingRepair);
+        sstable.descriptor.getMetadataSerializer().mutateRepairMetadata(sstable.descriptor, 1, sstable.getPendingRepair(), sstable.isTransient());
         sstable.reloadSSTableMetadata();
         cfs.getTracker().notifySSTableRepairedStatusChanged(Collections.singleton(sstable));
         assertTrue(sstable.isRepaired());
@@ -593,6 +605,144 @@ public class VerifyTest
         catch (CorruptSSTableException err) {}
     }
 
+    @Test
+    public void testRangeOwnHelper()
+    {
+        List<Range<Token>> normalized = new ArrayList<>();
+        normalized.add(r(Long.MIN_VALUE, Long.MIN_VALUE + 1));
+        normalized.add(r(Long.MIN_VALUE + 5, Long.MIN_VALUE + 6));
+        normalized.add(r(Long.MIN_VALUE + 10, Long.MIN_VALUE + 11));
+        normalized.add(r(0,10));
+        normalized.add(r(10,11));
+        normalized.add(r(20,25));
+        normalized.add(r(26,200));
+
+        Verifier.RangeOwnHelper roh = new Verifier.RangeOwnHelper(normalized);
+
+        roh.validate(dk(1));
+        roh.validate(dk(10));
+        roh.validate(dk(11));
+        roh.validate(dk(21));
+        roh.validate(dk(25));
+        boolean gotException = false;
+        try
+        {
+            roh.validate(dk(26));
+        }
+        catch (Throwable t)
+        {
+            gotException = true;
+        }
+        assertTrue(gotException);
+    }
+
+    @Test(expected = AssertionError.class)
+    public void testRangeOwnHelperBadToken()
+    {
+        List<Range<Token>> normalized = new ArrayList<>();
+        normalized.add(r(0,10));
+        Verifier.RangeOwnHelper roh = new Verifier.RangeOwnHelper(normalized);
+        roh.validate(dk(1));
+        // call with smaller token to get exception
+        roh.validate(dk(0));
+    }
+
+
+    @Test
+    public void testRangeOwnHelperNormalize()
+    {
+        List<Range<Token>> normalized = Range.normalize(Collections.singletonList(r(0,0)));
+        Verifier.RangeOwnHelper roh = new Verifier.RangeOwnHelper(normalized);
+        roh.validate(dk(Long.MIN_VALUE));
+        roh.validate(dk(0));
+        roh.validate(dk(Long.MAX_VALUE));
+    }
+
+    @Test
+    public void testRangeOwnHelperNormalizeWrap()
+    {
+        List<Range<Token>> normalized = Range.normalize(Collections.singletonList(r(Long.MAX_VALUE - 1000,Long.MIN_VALUE + 1000)));
+        Verifier.RangeOwnHelper roh = new Verifier.RangeOwnHelper(normalized);
+        roh.validate(dk(Long.MIN_VALUE));
+        roh.validate(dk(Long.MAX_VALUE));
+        boolean gotException = false;
+        try
+        {
+            roh.validate(dk(26));
+        }
+        catch (Throwable t)
+        {
+            gotException = true;
+        }
+        assertTrue(gotException);
+    }
+
+    @Test
+    public void testEmptyRanges()
+    {
+        new Verifier.RangeOwnHelper(Collections.emptyList()).validate(dk(1));
+    }
+
+    @Test
+    public void testVerifyLocalPartitioner() throws UnknownHostException
+    {
+        TokenMetadata tmd = StorageService.instance.getTokenMetadata();
+        byte[] tk1 = new byte[1], tk2 = new byte[1];
+        tk1[0] = 2;
+        tk2[0] = 1;
+        tmd.updateNormalToken(new ByteOrderedPartitioner.BytesToken(tk1), InetAddressAndPort.getByName("127.0.0.1"));
+        tmd.updateNormalToken(new ByteOrderedPartitioner.BytesToken(tk2), InetAddressAndPort.getByName("127.0.0.2"));
+        // write some bogus to a localpartitioner table
+        Batch bogus = Batch.createLocal(UUID.randomUUID(), 0, Collections.emptyList());
+        BatchlogManager.store(bogus);
+        ColumnFamilyStore cfs = Keyspace.open("system").getColumnFamilyStore("batches");
+        cfs.forceBlockingFlush();
+        for (SSTableReader sstable : cfs.getLiveSSTables())
+        {
+
+            try (Verifier verifier = new Verifier(cfs, sstable, false, Verifier.options().checkOwnsTokens(true).build()))
+            {
+                verifier.verify();
+            }
+        }
+    }
+
+    @Test
+    public void testNoFilterFile()
+    {
+        CompactionManager.instance.disableAutoCompaction();
+        Keyspace keyspace = Keyspace.open(KEYSPACE);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(BF_ALWAYS_PRESENT);
+        fillCF(cfs, 100);
+        assertEquals(1.0, cfs.metadata().params.bloomFilterFpChance, 0.0);
+        for (SSTableReader sstable : cfs.getLiveSSTables())
+        {
+            File f = new File(sstable.descriptor.filenameFor(Component.FILTER));
+            assertFalse(f.exists());
+            try (Verifier verifier = new Verifier(cfs, sstable, false, Verifier.options().build()))
+            {
+                verifier.verify();
+            }
+        }
+    }
+
+
+
+    private DecoratedKey dk(long l)
+    {
+        return new BufferDecoratedKey(t(l), ByteBufferUtil.EMPTY_BYTE_BUFFER);
+    }
+
+    private Range<Token> r(long s, long e)
+    {
+        return new Range<>(t(s), t(e));
+    }
+
+    private Token t(long t)
+    {
+        return new Murmur3Partitioner.LongToken(t);
+    }
+
 
     protected void fillCF(ColumnFamilyStore cfs, int partitionsPerSSTable)
     {
@@ -632,7 +782,7 @@ public class VerifyTest
         }
     }
 
-    protected void writeChecksum(long checksum, String filePath)
+    public static void writeChecksum(long checksum, String filePath)
     {
         File outFile = new File(filePath);
         BufferedWriter out = null;

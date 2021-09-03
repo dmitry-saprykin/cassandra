@@ -22,6 +22,7 @@ import java.util.Set;
 import java.util.UUID;
 
 import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.repair.NoSuchRepairSessionException;
 import org.apache.cassandra.service.ActiveRepairService;
 
 /**
@@ -38,25 +39,37 @@ public class LocalSessionAccessor
 
     public static void prepareUnsafe(UUID sessionID, InetAddressAndPort coordinator, Set<InetAddressAndPort> peers)
     {
-        ActiveRepairService.ParentRepairSession prs = ARS.getParentRepairSession(sessionID);
+        ActiveRepairService.ParentRepairSession prs = null;
+        try
+        {
+            prs = ARS.getParentRepairSession(sessionID);
+        }
+        catch (NoSuchRepairSessionException e)
+        {
+            throw new RuntimeException(e);
+        }
         assert prs != null;
         LocalSession session = ARS.consistent.local.createSessionUnsafe(sessionID, prs, peers);
         ARS.consistent.local.putSessionUnsafe(session);
     }
 
-    public static void finalizeUnsafe(UUID sessionID)
+    public static long finalizeUnsafe(UUID sessionID)
     {
-        LocalSession session = ARS.consistent.local.getSession(sessionID);
-        assert session != null;
-        session.setState(ConsistentSession.State.FINALIZED);
-        ARS.consistent.local.save(session);
+        LocalSession session = setState(sessionID, ConsistentSession.State.FINALIZED);
+        return session.repairedAt;
     }
 
     public static void failUnsafe(UUID sessionID)
     {
-        LocalSession session = ARS.consistent.local.getSession(sessionID);
+        setState(sessionID, ConsistentSession.State.FAILED);
+    }
+
+    public static LocalSession setState(UUID sessionId, ConsistentSession.State state)
+    {
+        LocalSession session = ARS.consistent.local.getSession(sessionId);
         assert session != null;
-        session.setState(ConsistentSession.State.FAILED);
+        session.setState(state);
         ARS.consistent.local.save(session);
+        return session;
     }
 }

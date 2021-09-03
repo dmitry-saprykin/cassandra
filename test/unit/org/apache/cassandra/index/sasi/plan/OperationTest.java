@@ -38,6 +38,7 @@ import org.apache.cassandra.db.marshal.LongType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 
 import org.junit.*;
@@ -651,28 +652,37 @@ public class OperationTest extends SchemaLoader
         {
             throw new UnsupportedOperationException();
         }
+
+        @Override
+        protected String toString(boolean cql)
+        {
+            return String.format("%s %s %s",
+                                 cql ? column.name.toCQLString() : column.name.toString(),
+                                 operator,
+                                 ByteBufferUtil.bytesToHex(value));
+        }
     }
 
-    private static Unfiltered buildRow(Cell... cells)
+    private static Unfiltered buildRow(Cell<?>... cells)
     {
         return buildRow(Clustering.EMPTY, null, cells);
     }
 
-    private static Row buildRow(Row.Deletion deletion, Cell... cells)
+    private static Row buildRow(Row.Deletion deletion, Cell<?>... cells)
     {
         return buildRow(Clustering.EMPTY, deletion, cells);
     }
 
-    private static Row buildRow(Clustering clustering, Cell... cells)
+    private static Row buildRow(Clustering<?> clustering, Cell<?>... cells)
     {
         return buildRow(clustering, null, cells);
     }
 
-    private static Row buildRow(Clustering clustering, Row.Deletion deletion, Cell... cells)
+    private static Row buildRow(Clustering<?> clustering, Row.Deletion deletion, Cell<?>... cells)
     {
         Row.Builder rowBuilder = BTreeRow.sortedBuilder();
         rowBuilder.newRow(clustering);
-        for (Cell c : cells)
+        for (Cell<?> c : cells)
             rowBuilder.addCell(c);
 
         if (deletion != null)
@@ -681,12 +691,12 @@ public class OperationTest extends SchemaLoader
         return rowBuilder.build();
     }
 
-    private static Cell buildCell(ColumnMetadata column, ByteBuffer value, long timestamp)
+    private static Cell<?> buildCell(ColumnMetadata column, ByteBuffer value, long timestamp)
     {
         return BufferCell.live(column, timestamp, value);
     }
 
-    private static Cell deletedCell(ColumnMetadata column, long timestamp, int nowInSeconds)
+    private static Cell<?> deletedCell(ColumnMetadata column, long timestamp, int nowInSeconds)
     {
         return BufferCell.tombstone(column, timestamp, nowInSeconds);
     }

@@ -26,9 +26,10 @@ import java.util.*;
 import java.util.concurrent.*;
 
 import com.google.common.collect.Sets;
-import org.junit.Assert;
 import org.junit.BeforeClass;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.ExpectedException;
 import org.junit.runner.RunWith;
 
 import org.apache.cassandra.OrderedJUnit4ClassRunner;
@@ -39,6 +40,8 @@ import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.lifecycle.SSTableSet;
+import org.apache.cassandra.db.lifecycle.View;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterators;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.dht.IPartitioner;
@@ -46,20 +49,20 @@ import org.apache.cassandra.dht.LocalPartitioner.LocalToken;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.index.Index;
+import org.apache.cassandra.io.FSReadError;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.FileDataInput;
 import org.apache.cassandra.io.util.MmappedRegions;
 import org.apache.cassandra.schema.CachingParams;
+import org.apache.cassandra.schema.CompressionParams;
 import org.apache.cassandra.schema.KeyspaceParams;
-import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.CacheService;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FilterFactory;
-import org.apache.cassandra.utils.Pair;
-import static org.apache.cassandra.cql3.QueryProcessor.executeInternal;
 
+import static org.apache.cassandra.cql3.QueryProcessor.executeInternal;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
@@ -69,8 +72,10 @@ public class SSTableReaderTest
     public static final String KEYSPACE1 = "SSTableReaderTest";
     public static final String CF_STANDARD = "Standard1";
     public static final String CF_STANDARD2 = "Standard2";
+    public static final String CF_COMPRESSED = "Compressed";
     public static final String CF_INDEXED = "Indexed1";
-    public static final String CF_STANDARDLOWINDEXINTERVAL = "StandardLowIndexInterval";
+    public static final String CF_STANDARD_LOW_INDEX_INTERVAL = "StandardLowIndexInterval";
+    public static final String CF_STANDARD_SMALL_BLOOM_FILTER = "StandardSmallBloomFilter";
 
     private IPartitioner partitioner;
 
@@ -87,18 +92,23 @@ public class SSTableReaderTest
                                     KeyspaceParams.simple(1),
                                     SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD),
                                     SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD2),
+                                    SchemaLoader.standardCFMD(KEYSPACE1, CF_COMPRESSED).compression(CompressionParams.DEFAULT),
                                     SchemaLoader.compositeIndexCFMD(KEYSPACE1, CF_INDEXED, true),
-                                    SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARDLOWINDEXINTERVAL)
+                                    SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD_LOW_INDEX_INTERVAL)
                                                 .minIndexInterval(8)
                                                 .maxIndexInterval(256)
-                                                .caching(CachingParams.CACHE_NOTHING));
+                                                .caching(CachingParams.CACHE_NOTHING),
+                                    SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD_SMALL_BLOOM_FILTER)
+                                                .minIndexInterval(4)
+                                                .maxIndexInterval(4)
+                                                .bloomFilterFpChance(0.99));
     }
 
     @Test
     public void testGetPositionsForRanges()
     {
         Keyspace keyspace = Keyspace.open(KEYSPACE1);
-        ColumnFamilyStore store = keyspace.getColumnFamilyStore("Standard2");
+        ColumnFamilyStore store = keyspace.getColumnFamilyStore(CF_STANDARD2);
         partitioner = store.getPartitioner();
 
         // insert data and compact to a single sstable
@@ -127,11 +137,11 @@ public class SSTableReaderTest
         // confirm that positions increase continuously
         SSTableReader sstable = store.getLiveSSTables().iterator().next();
         long previous = -1;
-        for (Pair<Long,Long> section : sstable.getPositionsForRanges(ranges))
+        for (SSTableReader.PartitionPositionBounds section : sstable.getPositionsForRanges(ranges))
         {
-            assert previous <= section.left : previous + " ! < " + section.left;
-            assert section.left < section.right : section.left + " ! < " + section.right;
-            previous = section.right;
+            assert previous <= section.lowerPosition : previous + " ! < " + section.lowerPosition;
+            assert section.lowerPosition < section.upperPosition : section.lowerPosition + " ! < " + section.upperPosition;
+            previous = section.upperPosition;
         }
     }
 
@@ -144,7 +154,7 @@ public class SSTableReaderTest
         try
         {
             Keyspace keyspace = Keyspace.open(KEYSPACE1);
-            ColumnFamilyStore store = keyspace.getColumnFamilyStore("Standard1");
+            ColumnFamilyStore store = keyspace.getColumnFamilyStore(CF_STANDARD);
             partitioner = store.getPartitioner();
 
             // insert a bunch of data and compact to a single sstable
@@ -188,7 +198,7 @@ public class SSTableReaderTest
     {
 
         Keyspace keyspace = Keyspace.open(KEYSPACE1);
-        ColumnFamilyStore store = keyspace.getColumnFamilyStore("Standard1");
+        ColumnFamilyStore store = keyspace.getColumnFamilyStore(CF_STANDARD);
         partitioner = store.getPartitioner();
 
         for (int j = 0; j < 100; j += 2)
@@ -216,7 +226,7 @@ public class SSTableReaderTest
     {
         // try to make sure CASSANDRA-8239 never happens again
         Keyspace keyspace = Keyspace.open(KEYSPACE1);
-        ColumnFamilyStore store = keyspace.getColumnFamilyStore("Standard1");
+        ColumnFamilyStore store = keyspace.getColumnFamilyStore(CF_STANDARD);
         partitioner = store.getPartitioner();
 
         for (int j = 0; j < 10; j++)
@@ -245,7 +255,7 @@ public class SSTableReaderTest
     public void testGetPositionsForRangesWithKeyCache()
     {
         Keyspace keyspace = Keyspace.open(KEYSPACE1);
-        ColumnFamilyStore store = keyspace.getColumnFamilyStore("Standard2");
+        ColumnFamilyStore store = keyspace.getColumnFamilyStore(CF_STANDARD2);
         partitioner = store.getPartitioner();
         CacheService.instance.keyCache.setCapacity(100);
 
@@ -270,13 +280,13 @@ public class SSTableReaderTest
         long p6 = sstable.getPosition(k(6), SSTableReader.Operator.EQ).position;
         long p7 = sstable.getPosition(k(7), SSTableReader.Operator.EQ).position;
 
-        Pair<Long, Long> p = sstable.getPositionsForRanges(makeRanges(t(2), t(6))).get(0);
+        SSTableReader.PartitionPositionBounds p = sstable.getPositionsForRanges(makeRanges(t(2), t(6))).get(0);
 
         // range are start exclusive so we should start at 3
-        assert p.left == p3;
+        assert p.lowerPosition == p3;
 
         // to capture 6 we have to stop at the start of 7
-        assert p.right == p7;
+        assert p.upperPosition == p7;
     }
 
     @Test
@@ -298,10 +308,12 @@ public class SSTableReaderTest
         // check if opening and querying works
         assertIndexQueryWorks(store);
     }
+
+    @Test
     public void testGetPositionsKeyCacheStats()
     {
         Keyspace keyspace = Keyspace.open(KEYSPACE1);
-        ColumnFamilyStore store = keyspace.getColumnFamilyStore("Standard2");
+        ColumnFamilyStore store = keyspace.getColumnFamilyStore(CF_STANDARD2);
         partitioner = store.getPartitioner();
         CacheService.instance.keyCache.setCapacity(1000);
 
@@ -319,24 +331,80 @@ public class SSTableReaderTest
         CompactionManager.instance.performMaximal(store, false);
 
         SSTableReader sstable = store.getLiveSSTables().iterator().next();
+        // existing, non-cached key
         sstable.getPosition(k(2), SSTableReader.Operator.EQ);
+        assertEquals(1, sstable.getKeyCacheRequest());
         assertEquals(0, sstable.getKeyCacheHit());
-        assertEquals(1, sstable.getBloomFilterTruePositiveCount());
+        // existing, cached key
         sstable.getPosition(k(2), SSTableReader.Operator.EQ);
+        assertEquals(2, sstable.getKeyCacheRequest());
         assertEquals(1, sstable.getKeyCacheHit());
-        assertEquals(2, sstable.getBloomFilterTruePositiveCount());
-        sstable.getPosition(k(15), SSTableReader.Operator.EQ);
+        // non-existing key (it is specifically chosen to not be rejected by Bloom Filter check)
+        sstable.getPosition(k(14), SSTableReader.Operator.EQ);
+        assertEquals(3, sstable.getKeyCacheRequest());
         assertEquals(1, sstable.getKeyCacheHit());
-        assertEquals(2, sstable.getBloomFilterTruePositiveCount());
-
     }
 
+    @Test
+    public void testGetPositionsBloomFilterStats()
+    {
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore store = keyspace.getColumnFamilyStore(CF_STANDARD_SMALL_BLOOM_FILTER);
+        partitioner = store.getPartitioner();
+        CacheService.instance.keyCache.setCapacity(1000);
+
+        // insert data and compact to a single sstable
+        CompactionManager.instance.disableAutoCompaction();
+        for (int j = 0; j < 10; j++)
+        {
+            new RowUpdateBuilder(store.metadata(), j, String.valueOf(j))
+                    .clustering("0")
+                    .add("val", ByteBufferUtil.EMPTY_BYTE_BUFFER)
+                    .build()
+                    .applyUnsafe();
+        }
+        store.forceBlockingFlush();
+        CompactionManager.instance.performMaximal(store, false);
+
+        SSTableReader sstable = store.getLiveSSTables().iterator().next();
+        // the keys are specifically chosen to cover certain use cases
+        // existing key is read from index
+        sstable.getPosition(k(2), SSTableReader.Operator.EQ);
+        assertEquals(1, sstable.getBloomFilterTruePositiveCount());
+        assertEquals(0, sstable.getBloomFilterTrueNegativeCount());
+        assertEquals(0, sstable.getBloomFilterFalsePositiveCount());
+        // existing key is read from Cache Key
+        sstable.getPosition(k(2), SSTableReader.Operator.EQ);
+        assertEquals(2, sstable.getBloomFilterTruePositiveCount());
+        assertEquals(0, sstable.getBloomFilterTrueNegativeCount());
+        assertEquals(0, sstable.getBloomFilterFalsePositiveCount());
+        // non-existing key is rejected by Bloom Filter check
+        sstable.getPosition(k(10), SSTableReader.Operator.EQ);
+        assertEquals(2, sstable.getBloomFilterTruePositiveCount());
+        assertEquals(1, sstable.getBloomFilterTrueNegativeCount());
+        assertEquals(0, sstable.getBloomFilterFalsePositiveCount());
+        // non-existing key is rejected by sstable keys range check
+        sstable.getPosition(k(99), SSTableReader.Operator.EQ);
+        assertEquals(2, sstable.getBloomFilterTruePositiveCount());
+        assertEquals(1, sstable.getBloomFilterTrueNegativeCount());
+        assertEquals(1, sstable.getBloomFilterFalsePositiveCount());
+        // non-existing key is rejected by index interval check
+        sstable.getPosition(k(14), SSTableReader.Operator.EQ);
+        assertEquals(2, sstable.getBloomFilterTruePositiveCount());
+        assertEquals(1, sstable.getBloomFilterTrueNegativeCount());
+        assertEquals(2, sstable.getBloomFilterFalsePositiveCount());
+        // non-existing key is rejected by index lookup check
+        sstable.getPosition(k(807), SSTableReader.Operator.EQ);
+        assertEquals(2, sstable.getBloomFilterTruePositiveCount());
+        assertEquals(1, sstable.getBloomFilterTrueNegativeCount());
+        assertEquals(3, sstable.getBloomFilterFalsePositiveCount());
+    }
 
     @Test
     public void testOpeningSSTable() throws Exception
     {
         String ks = KEYSPACE1;
-        String cf = "Standard1";
+        String cf = CF_STANDARD;
 
         // clear and create just one sstable for this test
         Keyspace keyspace = Keyspace.open(ks);
@@ -382,7 +450,7 @@ public class SSTableReaderTest
         long bloomModified = Files.getLastModifiedTime(bloomPath).toMillis();
         long summaryModified = Files.getLastModifiedTime(summaryPath).toMillis();
 
-        Thread.sleep(TimeUnit.MILLISECONDS.toMillis(10)); // sleep to ensure modified time will be different
+        TimeUnit.MILLISECONDS.sleep(1000); // sleep to ensure modified time will be different
 
         // Offline tests
         // check that bloomfilter/summary ARE NOT regenerated
@@ -429,7 +497,7 @@ public class SSTableReaderTest
         summaryModified = Files.getLastModifiedTime(summaryPath).toMillis();
         summaryFile.delete();
 
-        Thread.sleep(TimeUnit.MILLISECONDS.toMillis(10)); // sleep to ensure modified time will be different
+        TimeUnit.MILLISECONDS.sleep(1000); // sleep to ensure modified time will be different
         bloomModified = Files.getLastModifiedTime(bloomPath).toMillis();
 
         target = SSTableReader.open(desc, components, store.metadata);
@@ -446,7 +514,7 @@ public class SSTableReaderTest
         summaryModified = Files.getLastModifiedTime(summaryPath).toMillis();
         target = SSTableReader.open(desc, components, store.metadata, false, false);
 
-        Thread.sleep(TimeUnit.MILLISECONDS.toMillis(10)); // sleep to ensure modified time will be different
+        TimeUnit.MILLISECONDS.sleep(1000); // sleep to ensure modified time will be different
         assertEquals(bloomModified, Files.getLastModifiedTime(bloomPath).toMillis());
         assertEquals(summaryModified, Files.getLastModifiedTime(summaryPath).toMillis());
 
@@ -457,7 +525,7 @@ public class SSTableReaderTest
     public void testLoadingSummaryUsesCorrectPartitioner() throws Exception
     {
         Keyspace keyspace = Keyspace.open(KEYSPACE1);
-        ColumnFamilyStore store = keyspace.getColumnFamilyStore("Indexed1");
+        ColumnFamilyStore store = keyspace.getColumnFamilyStore(CF_INDEXED);
 
         new RowUpdateBuilder(store.metadata(), System.currentTimeMillis(), "k1")
         .clustering("0")
@@ -473,7 +541,7 @@ public class SSTableReaderTest
             SSTableReader sstable = indexCfs.getLiveSSTables().iterator().next();
             assert sstable.first.getToken() instanceof LocalToken;
 
-            sstable.saveSummary();
+            SSTableReader.saveSummary(sstable.descriptor, sstable.first, sstable.last, sstable.indexSummary);
             SSTableReader reopened = SSTableReader.open(sstable.descriptor);
             assert reopened.first.getToken() instanceof LocalToken;
             reopened.selfRef().release();
@@ -485,7 +553,7 @@ public class SSTableReaderTest
     public void testGetScannerForNoIntersectingRanges() throws Exception
     {
         Keyspace keyspace = Keyspace.open(KEYSPACE1);
-        ColumnFamilyStore store = keyspace.getColumnFamilyStore("Standard1");
+        ColumnFamilyStore store = keyspace.getColumnFamilyStore(CF_STANDARD);
         partitioner = store.getPartitioner();
 
         new RowUpdateBuilder(store.metadata(), 0, "k1")
@@ -511,7 +579,7 @@ public class SSTableReaderTest
     public void testGetPositionsForRangesFromTableOpenedForBulkLoading() throws IOException
     {
         Keyspace keyspace = Keyspace.open(KEYSPACE1);
-        ColumnFamilyStore store = keyspace.getColumnFamilyStore("Standard2");
+        ColumnFamilyStore store = keyspace.getColumnFamilyStore(CF_STANDARD2);
         partitioner = store.getPartitioner();
 
         // insert data and compact to a single sstable. The
@@ -537,7 +605,7 @@ public class SSTableReaderTest
         ranges.add(new Range<Token>(t(98), t(99)));
 
         SSTableReader sstable = store.getLiveSSTables().iterator().next();
-        List<Pair<Long,Long>> sections = sstable.getPositionsForRanges(ranges);
+        List<SSTableReader.PartitionPositionBounds> sections = sstable.getPositionsForRanges(ranges);
         assert sections.size() == 1 : "Expected to find range in sstable" ;
 
         // re-open the same sstable as it would be during bulk loading
@@ -554,7 +622,7 @@ public class SSTableReaderTest
     public void testIndexSummaryReplacement() throws IOException, ExecutionException, InterruptedException
     {
         Keyspace keyspace = Keyspace.open(KEYSPACE1);
-        final ColumnFamilyStore store = keyspace.getColumnFamilyStore("StandardLowIndexInterval"); // index interval of 8, no key caching
+        final ColumnFamilyStore store = keyspace.getColumnFamilyStore(CF_STANDARD_LOW_INDEX_INTERVAL); // index interval of 8, no key caching
         CompactionManager.instance.disableAutoCompaction();
 
         final int NUM_PARTITIONS = 512;
@@ -586,7 +654,7 @@ public class SSTableReaderTest
                 public void run()
                 {
                     Row row = Util.getOnlyRowUnfiltered(Util.cmd(store, key).build());
-                    assertEquals(0, ByteBufferUtil.compare(String.format("%3d", index).getBytes(), row.cells().iterator().next().value()));
+                    assertEquals(0, ByteBufferUtil.compare(String.format("%3d", index).getBytes(), row.cells().iterator().next().buffer()));
                 }
             }));
 
@@ -633,7 +701,7 @@ public class SSTableReaderTest
     private void testIndexSummaryUpsampleAndReload0() throws Exception
     {
         Keyspace keyspace = Keyspace.open(KEYSPACE1);
-        final ColumnFamilyStore store = keyspace.getColumnFamilyStore("StandardLowIndexInterval"); // index interval of 8, no key caching
+        final ColumnFamilyStore store = keyspace.getColumnFamilyStore(CF_STANDARD_LOW_INDEX_INTERVAL); // index interval of 8, no key caching
         CompactionManager.instance.disableAutoCompaction();
 
         final int NUM_PARTITIONS = 512;
@@ -665,7 +733,7 @@ public class SSTableReaderTest
 
     private void assertIndexQueryWorks(ColumnFamilyStore indexedCFS)
     {
-        assert "Indexed1".equals(indexedCFS.name);
+        assert CF_INDEXED.equals(indexedCFS.name);
 
         // make sure all sstables including 2ary indexes load from disk
         for (ColumnFamilyStore cfs : indexedCFS.concatWithIndexes())
@@ -693,5 +761,151 @@ public class SSTableReaderTest
     private DecoratedKey k(int i)
     {
         return new BufferDecoratedKey(t(i), ByteBufferUtil.bytes(String.valueOf(i)));
+    }
+
+    @Test(expected = RuntimeException.class)
+    public void testMoveAndOpenLiveSSTable()
+    {
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_STANDARD);
+        SSTableReader sstable = getNewSSTable(cfs);
+        Descriptor notLiveDesc = new Descriptor(new File("/tmp"), "", "", 0);
+        SSTableReader.moveAndOpenSSTable(cfs, sstable.descriptor, notLiveDesc, sstable.components, false);
+    }
+
+    @Test(expected = RuntimeException.class)
+    public void testMoveAndOpenLiveSSTable2()
+    {
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_STANDARD);
+        SSTableReader sstable = getNewSSTable(cfs);
+        Descriptor notLiveDesc = new Descriptor(new File("/tmp"), "", "", 0);
+        SSTableReader.moveAndOpenSSTable(cfs, notLiveDesc, sstable.descriptor, sstable.components, false);
+    }
+
+    @Test
+    public void testMoveAndOpenSSTable() throws IOException
+    {
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_STANDARD);
+        SSTableReader sstable = getNewSSTable(cfs);
+        cfs.clearUnsafe();
+        sstable.selfRef().release();
+        File tmpdir = Files.createTempDirectory("testMoveAndOpen").toFile();
+        tmpdir.deleteOnExit();
+        Descriptor notLiveDesc = new Descriptor(tmpdir, sstable.descriptor.ksname, sstable.descriptor.cfname, 100);
+        // make sure the new directory is empty and that the old files exist:
+        for (Component c : sstable.components)
+        {
+            File f = new File(notLiveDesc.filenameFor(c));
+            assertFalse(f.exists());
+            assertTrue(new File(sstable.descriptor.filenameFor(c)).exists());
+        }
+        SSTableReader.moveAndOpenSSTable(cfs, sstable.descriptor, notLiveDesc, sstable.components, false);
+        // make sure the files were moved:
+        for (Component c : sstable.components)
+        {
+            File f = new File(notLiveDesc.filenameFor(c));
+            assertTrue(f.exists());
+            assertTrue(f.toString().contains("-100-"));
+            f.deleteOnExit();
+            assertFalse(new File(sstable.descriptor.filenameFor(c)).exists());
+        }
+    }
+
+
+
+    private SSTableReader getNewSSTable(ColumnFamilyStore cfs)
+    {
+
+        Set<SSTableReader> before = cfs.getLiveSSTables();
+        for (int j = 0; j < 100; j += 2)
+        {
+            new RowUpdateBuilder(cfs.metadata(), j, String.valueOf(j))
+            .clustering("0")
+            .add("val", ByteBufferUtil.EMPTY_BYTE_BUFFER)
+            .build()
+            .applyUnsafe();
+        }
+        cfs.forceBlockingFlush();
+        return Sets.difference(cfs.getLiveSSTables(), before).iterator().next();
+    }
+
+    @Test
+    public void testGetApproximateKeyCount() throws InterruptedException
+    {
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_STANDARD);
+        cfs.discardSSTables(System.currentTimeMillis()); //Cleaning all existing SSTables.
+        getNewSSTable(cfs);
+
+        try (ColumnFamilyStore.RefViewFragment viewFragment1 = cfs.selectAndReference(View.selectFunction(SSTableSet.CANONICAL)))
+        {
+            cfs.discardSSTables(System.currentTimeMillis());
+
+            TimeUnit.MILLISECONDS.sleep(1000); //Giving enough time to clear files.
+            List<SSTableReader> sstables = new ArrayList<>(viewFragment1.sstables);
+            assertEquals(50, SSTableReader.getApproximateKeyCount(sstables));
+        }
+    }
+
+    @Rule
+    public ExpectedException expectedException = ExpectedException.none();
+
+    @Test
+    public void testVerifyCompressionInfoExistenceThrows()
+    {
+        Descriptor desc = setUpForTestVerfiyCompressionInfoExistence();
+
+        // delete the compression info, so it is corrupted.
+        File compressionInfoFile = new File(desc.filenameFor(Component.COMPRESSION_INFO));
+        compressionInfoFile.delete();
+        assertFalse("CompressionInfo file should not exist", compressionInfoFile.exists());
+
+        // discovert the components on disk after deletion
+        Set<Component> components = SSTable.discoverComponentsFor(desc);
+
+        expectedException.expect(CorruptSSTableException.class);
+        expectedException.expectMessage("CompressionInfo.db");
+        SSTableReader.verifyCompressionInfoExistenceIfApplicable(desc, components);
+    }
+
+    @Test
+    public void testVerifyCompressionInfoExistenceWhenTOCUnableToOpen()
+    {
+        Descriptor desc = setUpForTestVerfiyCompressionInfoExistence();
+        Set<Component> components = SSTable.discoverComponentsFor(desc);
+        SSTableReader.verifyCompressionInfoExistenceIfApplicable(desc, components);
+
+        // mark the toc file not readable in order to trigger the FSReadError
+        File tocFile = new File(desc.filenameFor(Component.TOC));
+        tocFile.setReadable(false);
+
+        expectedException.expect(FSReadError.class);
+        expectedException.expectMessage("TOC.txt");
+        SSTableReader.verifyCompressionInfoExistenceIfApplicable(desc, components);
+    }
+
+    @Test
+    public void testVerifyCompressionInfoExistencePasses()
+    {
+        Descriptor desc = setUpForTestVerfiyCompressionInfoExistence();
+        Set<Component> components = SSTable.discoverComponentsFor(desc);
+        SSTableReader.verifyCompressionInfoExistenceIfApplicable(desc, components);
+    }
+
+    private Descriptor setUpForTestVerfiyCompressionInfoExistence()
+    {
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_COMPRESSED);
+        SSTableReader sstable = getNewSSTable(cfs);
+        cfs.clearUnsafe();
+        Descriptor desc = sstable.descriptor;
+
+        File compressionInfoFile = new File(desc.filenameFor(Component.COMPRESSION_INFO));
+        File tocFile = new File(desc.filenameFor(Component.TOC));
+        assertTrue("CompressionInfo file should exist", compressionInfoFile.exists());
+        assertTrue("TOC file should exist", tocFile.exists());
+        return desc;
     }
 }

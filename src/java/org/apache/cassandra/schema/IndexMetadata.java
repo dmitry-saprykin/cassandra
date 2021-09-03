@@ -32,7 +32,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.cql3.ColumnIdentifier;
-import org.apache.cassandra.cql3.statements.IndexTarget;
+import org.apache.cassandra.cql3.CqlBuilder;
+import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.UnknownIndexException;
 import org.apache.cassandra.index.Index;
@@ -98,12 +99,14 @@ public final class IndexMetadata
         return name != null && !name.isEmpty() && PATTERN_WORD_CHARS.matcher(name).matches();
     }
 
-    public static String getDefaultIndexName(String cfName, String root)
+    public static String generateDefaultIndexName(String table, ColumnIdentifier column)
     {
-        if (root == null)
-            return PATTERN_NON_WORD_CHAR.matcher(cfName + "_" + "idx").replaceAll("");
-        else
-            return PATTERN_NON_WORD_CHAR.matcher(cfName + "_" + root + "_idx").replaceAll("");
+        return PATTERN_NON_WORD_CHAR.matcher(table + "_" + column.toString() + "_idx").replaceAll("");
+    }
+
+    public static String generateDefaultIndexName(String table)
+    {
+        return PATTERN_NON_WORD_CHAR.matcher(table + "_" + "idx").replaceAll("");
     }
 
     public void validate(TableMetadata table)
@@ -222,9 +225,61 @@ public final class IndexMetadata
                .build();
     }
 
-    public String toCQLString()
+    public String toCqlString(TableMetadata table, boolean ifNotExists)
     {
-        return ColumnIdentifier.maybeQuote(name);
+        CqlBuilder builder = new CqlBuilder();
+        appendCqlTo(builder, table, ifNotExists);
+        return builder.toString();
+    }
+
+    /**
+     * Appends to the specified builder the CQL used to create this index.
+     * @param builder the builder to which the CQL myst be appended
+     * @param table the parent table
+     * @param ifNotExists includes "IF NOT EXISTS" into statement
+     */
+    public void appendCqlTo(CqlBuilder builder, TableMetadata table, boolean ifNotExists)
+    {
+        if (isCustom())
+        {
+            Map<String, String> copyOptions = new HashMap<>(options);
+
+            builder.append("CREATE CUSTOM INDEX ");
+
+            if (ifNotExists)
+            {
+                builder.append("IF NOT EXISTS ");
+            }
+
+            builder.appendQuotingIfNeeded(name)
+                   .append(" ON ")
+                   .append(table.toString())
+                   .append(" (")
+                   .append(copyOptions.remove(IndexTarget.TARGET_OPTION_NAME))
+                   .append(") USING ")
+                   .appendWithSingleQuotes(copyOptions.remove(IndexTarget.CUSTOM_INDEX_OPTION_NAME));
+
+            if (!copyOptions.isEmpty())
+                builder.append(" WITH OPTIONS = ")
+                       .append(copyOptions);
+        }
+        else
+        {
+            builder.append("CREATE INDEX ");
+
+            if (ifNotExists)
+            {
+                builder.append("IF NOT EXISTS ");
+            }
+
+            builder.appendQuotingIfNeeded(name)
+                   .append(" ON ")
+                   .append(table.toString())
+                   .append(" (")
+                   .append(options.get(IndexTarget.TARGET_OPTION_NAME))
+                   .append(')');
+        }
+        builder.append(';');
     }
 
     public static class Serializer

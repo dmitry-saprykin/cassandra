@@ -83,7 +83,7 @@ public class RowTest
     }
 
     @Test
-    public void testMergeRangeTombstones() throws InterruptedException
+    public void testMergeRangeTombstones()
     {
         PartitionUpdate.Builder update1 = new PartitionUpdate.Builder(metadata, dk, metadata.regularAndStaticColumns(), 1);
         writeRangeTombstone(update1, "1", "11", 123, 123);
@@ -99,7 +99,7 @@ public class RowTest
         writeRangeTombstone(update2, "4", "41", 123, 1230);
         writeRangeTombstone(update2, "5", "51", 123, 1230);
 
-        try (UnfilteredRowIterator merged = UnfilteredRowIterators.merge(ImmutableList.of(update1.build().unfilteredIterator(), update2.build().unfilteredIterator()), nowInSeconds))
+        try (UnfilteredRowIterator merged = UnfilteredRowIterators.merge(ImmutableList.of(update1.build().unfilteredIterator(), update2.build().unfilteredIterator())))
         {
             Object[][] expected = new Object[][]{ { "1", "11", 123l, 123 },
                                                   { "111", "112", 1230l, 123 },
@@ -111,12 +111,12 @@ public class RowTest
             while (merged.hasNext())
             {
                 RangeTombstoneBoundMarker openMarker = (RangeTombstoneBoundMarker)merged.next();
-                ClusteringBound openBound = openMarker.clustering();
+                ClusteringBound<?> openBound = openMarker.clustering();
                 DeletionTime openDeletion = new DeletionTime(openMarker.deletionTime().markedForDeleteAt(),
                                                                    openMarker.deletionTime().localDeletionTime());
 
                 RangeTombstoneBoundMarker closeMarker = (RangeTombstoneBoundMarker)merged.next();
-                ClusteringBound closeBound = closeMarker.clustering();
+                ClusteringBound<?> closeBound = closeMarker.clustering();
                 DeletionTime closeDeletion = new DeletionTime(closeMarker.deletionTime().markedForDeleteAt(),
                                                                     closeMarker.deletionTime().localDeletionTime());
 
@@ -132,7 +132,7 @@ public class RowTest
         ColumnMetadata defA = metadata.getColumn(new ColumnIdentifier("a", true));
         ColumnMetadata defB = metadata.getColumn(new ColumnIdentifier("b", true));
 
-        Row.Builder builder = BTreeRow.unsortedBuilder(nowInSeconds);
+        Row.Builder builder = BTreeRow.unsortedBuilder();
         builder.newRow(metadata.comparator.make("c1"));
         writeSimpleCellValue(builder, defA, "a1", 0);
         writeSimpleCellValue(builder, defA, "a2", 1);
@@ -144,8 +144,8 @@ public class RowTest
         Unfiltered unfiltered = update.unfilteredIterator().next();
         assertTrue(unfiltered.kind() == Unfiltered.Kind.ROW);
         row = (Row) unfiltered;
-        assertEquals("a2", defA.cellValueType().getString(row.getCell(defA).value()));
-        assertEquals("b1", defB.cellValueType().getString(row.getCell(defB).value()));
+        assertEquals("a2", defA.cellValueType().getString(row.getCell(defA).buffer()));
+        assertEquals("b1", defB.cellValueType().getString(row.getCell(defB).buffer()));
         assertEquals(2, row.columns().size());
     }
 
@@ -155,7 +155,7 @@ public class RowTest
         int ttl = 1;
         ColumnMetadata def = metadata.getColumn(new ColumnIdentifier("a", true));
 
-        Cell cell = BufferCell.expiring(def, 0, ttl, nowInSeconds, ((AbstractType) def.cellValueType()).decompose("a1"));
+        Cell<?> cell = BufferCell.expiring(def, 0, ttl, nowInSeconds, ((AbstractType) def.cellValueType()).decompose("a1"));
 
         PartitionUpdate update = PartitionUpdate.singleRowUpdate(metadata, dk, BTreeRow.singleCellRow(metadata.comparator.make("c1"), cell));
         new Mutation(update).applyUnsafe();
@@ -163,7 +163,7 @@ public class RowTest
         // when we read with a nowInSeconds before the cell has expired,
         // the PartitionIterator includes the row we just wrote
         Row row = Util.getOnlyRow(Util.cmd(cfs, dk).includeRow("c1").withNowInSeconds(nowInSeconds).build());
-        assertEquals("a1", ByteBufferUtil.string(row.getCell(def).value()));
+        assertEquals("a1", ByteBufferUtil.string(row.getCell(def).buffer()));
 
         // when we read with a nowInSeconds after the cell has expired, the row is filtered
         // so the PartitionIterator is empty
@@ -176,7 +176,7 @@ public class RowTest
         ColumnMetadata defA = metadata.getColumn(new ColumnIdentifier("a", true));
         ColumnMetadata defB = metadata.getColumn(new ColumnIdentifier("b", true));
 
-        Row.Builder builder = BTreeRow.unsortedBuilder(nowInSeconds);
+        Row.Builder builder = BTreeRow.unsortedBuilder();
         builder.newRow(metadata.comparator.make("c1"));
         writeSimpleCellValue(builder, defA, "a1", 0);
         writeSimpleCellValue(builder, defA, "a2", 1);
@@ -188,17 +188,17 @@ public class RowTest
         assertEquals(Integer.valueOf(1), map.get(row));
     }
 
-    private void assertRangeTombstoneMarkers(ClusteringBound start, ClusteringBound end, DeletionTime deletionTime, Object[] expected)
+    private void assertRangeTombstoneMarkers(ClusteringBound<?> start, ClusteringBound<?> end, DeletionTime deletionTime, Object[] expected)
     {
         AbstractType clusteringType = (AbstractType) metadata.comparator.subtype(0);
 
         assertEquals(1, start.size());
         assertEquals(start.kind(), ClusteringPrefix.Kind.INCL_START_BOUND);
-        assertEquals(expected[0], clusteringType.getString(start.get(0)));
+        assertEquals(expected[0], clusteringType.getString(start.bufferAt(0)));
 
         assertEquals(1, end.size());
         assertEquals(end.kind(), ClusteringPrefix.Kind.INCL_END_BOUND);
-        assertEquals(expected[1], clusteringType.getString(end.get(0)));
+        assertEquals(expected[1], clusteringType.getString(end.bufferAt(0)));
 
         assertEquals(expected[2], deletionTime.markedForDeleteAt());
         assertEquals(expected[3], deletionTime.localDeletionTime());

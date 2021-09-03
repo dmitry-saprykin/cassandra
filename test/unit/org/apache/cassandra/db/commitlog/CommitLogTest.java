@@ -19,6 +19,7 @@
 package org.apache.cassandra.db.commitlog;
 
 import java.io.*;
+import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.concurrent.Callable;
@@ -28,16 +29,25 @@ import java.util.stream.Collectors;
 import java.util.zip.CRC32;
 import java.util.zip.Checksum;
 
-import com.google.common.collect.Iterables;
+import javax.crypto.Cipher;
 
-import org.junit.*;
+import com.google.common.collect.Iterables;
 import com.google.common.io.Files;
+
+import org.junit.AfterClass;
+import org.junit.Assume;
+import org.junit.Before;
+import org.junit.Ignore;
+import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 import org.junit.runners.Parameterized.Parameters;
 
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
+import org.apache.cassandra.io.compress.ZstdCompressor;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.io.util.RandomAccessReader;
 import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.config.DatabaseDescriptor;
@@ -58,8 +68,11 @@ import org.apache.cassandra.io.compress.SnappyCompressor;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.security.CipherFactory;
 import org.apache.cassandra.security.EncryptionContext;
 import org.apache.cassandra.security.EncryptionContextGenerator;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Hex;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.KillerForTests;
@@ -67,9 +80,19 @@ import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.vint.VIntCoding;
 
 import org.junit.After;
+
+import static org.apache.cassandra.db.commitlog.CommitLogSegment.ENTRY_OVERHEAD_SIZE;
 import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
+
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
+
+import org.apache.cassandra.db.marshal.IntegerType;
+import org.apache.cassandra.db.marshal.MapType;
+import org.apache.cassandra.db.marshal.SetType;
+import org.apache.cassandra.db.marshal.UTF8Type;
 
 @Ignore
 @RunWith(Parameterized.class)
@@ -79,6 +102,7 @@ public abstract class CommitLogTest
     private static final String KEYSPACE2 = "CommitLogTestNonDurable";
     protected static final String STANDARD1 = "Standard1";
     private static final String STANDARD2 = "Standard2";
+    private static final String CUSTOM1 = "Custom1";
 
     private static JVMStabilityInspector.Killer oldKiller;
     private static KillerForTests testKiller;
@@ -90,14 +114,25 @@ public abstract class CommitLogTest
     }
 
     @Parameters()
-    public static Collection<Object[]> generateData()
+    public static Collection<Object[]> generateData() throws Exception
     {
-        return Arrays.asList(new Object[][]{
-            {null, EncryptionContextGenerator.createDisabledContext()}, // No compression, no encryption
-            {null, EncryptionContextGenerator.createContext(true)}, // Encryption
-            {new ParameterizedClass(LZ4Compressor.class.getName(), Collections.emptyMap()), EncryptionContextGenerator.createDisabledContext()},
-            {new ParameterizedClass(SnappyCompressor.class.getName(), Collections.emptyMap()), EncryptionContextGenerator.createDisabledContext()},
-            {new ParameterizedClass(DeflateCompressor.class.getName(), Collections.emptyMap()), EncryptionContextGenerator.createDisabledContext()}});
+        return Arrays.asList(new Object[][]
+        {
+            { null, EncryptionContextGenerator.createDisabledContext()}, // No compression, no encryption
+            { null, newEncryptionContext() }, // Encryption
+            { new ParameterizedClass(LZ4Compressor.class.getName(), Collections.emptyMap()), EncryptionContextGenerator.createDisabledContext() },
+            { new ParameterizedClass(SnappyCompressor.class.getName(), Collections.emptyMap()), EncryptionContextGenerator.createDisabledContext()},
+            { new ParameterizedClass(DeflateCompressor.class.getName(), Collections.emptyMap()), EncryptionContextGenerator.createDisabledContext()},
+            { new ParameterizedClass(ZstdCompressor.class.getName(), Collections.emptyMap()), EncryptionContextGenerator.createDisabledContext()}
+        });
+    }
+
+    private static EncryptionContext newEncryptionContext() throws Exception
+    {
+        EncryptionContext context = EncryptionContextGenerator.createContext(true);
+        CipherFactory cipherFactory = new CipherFactory(context.getTransparentDataEncryptionOptions());
+        Cipher cipher = cipherFactory.getEncryptor(context.getTransparentDataEncryptionOptions().cipher, context.getTransparentDataEncryptionOptions().key_alias);
+        return EncryptionContextGenerator.createContext(cipher.getIV(), true);
     }
 
     public static void beforeClass() throws ConfigurationException
@@ -108,10 +143,20 @@ public abstract class CommitLogTest
         KeyspaceParams.DEFAULT_LOCAL_DURABLE_WRITES = false;
 
         SchemaLoader.prepareServer();
+        StorageService.instance.getTokenMetadata().updateHostId(UUID.randomUUID(), FBUtilities.getBroadcastAddressAndPort());
+
+        TableMetadata.Builder custom =
+            TableMetadata.builder(KEYSPACE1, CUSTOM1)
+                         .addPartitionKeyColumn("k", IntegerType.instance)
+                         .addClusteringColumn("c1", MapType.getInstance(UTF8Type.instance, UTF8Type.instance, false))
+                         .addClusteringColumn("c2", SetType.getInstance(UTF8Type.instance, false))
+                         .addStaticColumn("s", IntegerType.instance);
+
         SchemaLoader.createKeyspace(KEYSPACE1,
                                     KeyspaceParams.simple(1),
                                     SchemaLoader.standardCFMD(KEYSPACE1, STANDARD1, 0, AsciiType.instance, BytesType.instance),
-                                    SchemaLoader.standardCFMD(KEYSPACE1, STANDARD2, 0, AsciiType.instance, BytesType.instance));
+                                    SchemaLoader.standardCFMD(KEYSPACE1, STANDARD2, 0, AsciiType.instance, BytesType.instance),
+                                    custom);
         SchemaLoader.createKeyspace(KEYSPACE2,
                                     KeyspaceParams.simpleTransient(1),
                                     SchemaLoader.standardCFMD(KEYSPACE1, STANDARD1, 0, AsciiType.instance, BytesType.instance),
@@ -141,6 +186,7 @@ public abstract class CommitLogTest
     @After
     public void afterTest()
     {
+        CommitLogSegmentReader.setAllowSkipSyncMarkerCrc(false);
         testKiller.reset();
     }
 
@@ -148,10 +194,8 @@ public abstract class CommitLogTest
     public void testRecoveryWithEmptyLog() throws Exception
     {
         runExpecting(() -> {
-            CommitLog.instance.recoverFiles(new File[]{
-            tmpFile(CommitLogDescriptor.current_version),
-            tmpFile(CommitLogDescriptor.current_version)
-            });
+            CommitLog.instance.recoverFiles(tmpFile(CommitLogDescriptor.current_version),
+                                            tmpFile(CommitLogDescriptor.current_version));
             return null;
         }, CommitLogReplayException.class);
     }
@@ -170,6 +214,8 @@ public abstract class CommitLogTest
     @Test
     public void testHeaderOnlyFileFiltering() throws Exception
     {
+        Assume.assumeTrue(!DatabaseDescriptor.getEncryptionContext().isEnabled());
+        
         File directory = Files.createTempDir();
 
         CommitLogDescriptor desc1 = new CommitLogDescriptor(CommitLogDescriptor.current_version, 1, null, DatabaseDescriptor.getEncryptionContext());
@@ -401,7 +447,7 @@ public abstract class CommitLogTest
         max -= CommitLogSegment.ENTRY_OVERHEAD_SIZE; // log entry overhead
 
         // Note that the size of the value if vint encoded. So we first compute the ovehead of the mutation without the value and it's size
-        int mutationOverhead = (int)Mutation.serializer.serializedSize(rm, MessagingService.current_version) - (VIntCoding.computeVIntSize(allocSize) + allocSize);
+        int mutationOverhead = rm.serializedSize(MessagingService.current_version) - (VIntCoding.computeVIntSize(allocSize) + allocSize);
         max -= mutationOverhead;
 
         // Now, max is the max for both the value and it's size. But we want to know how much we can allocate, i.e. the size of the value.
@@ -428,7 +474,7 @@ public abstract class CommitLogTest
         CommitLog.instance.add(rm);
     }
 
-    @Test(expected = IllegalArgumentException.class)
+    @Test(expected = MutationExceededMaxSizeException.class)
     public void testExceedRecordLimit() throws Exception
     {
         Keyspace ks = Keyspace.open(KEYSPACE1);
@@ -437,8 +483,58 @@ public abstract class CommitLogTest
                       .clustering("bytes")
                       .add("val", ByteBuffer.allocate(1 + getMaxRecordDataSize()))
                       .build();
-        CommitLog.instance.add(rm);
+        long cnt = CommitLog.instance.metrics.oversizedMutations.getCount();
+        try
+        {
+            CommitLog.instance.add(rm);
+        }
+        catch (MutationExceededMaxSizeException e)
+        {
+            assertEquals(cnt + 1, CommitLog.instance.metrics.oversizedMutations.getCount());
+            throw e;
+        }
         throw new AssertionError("mutation larger than limit was accepted");
+    }
+    @Test
+    public void testExceedRecordLimitWithMultiplePartitions() throws Exception
+    {
+        CommitLog.instance.resetUnsafe(true);
+        List<Mutation> mutations = new ArrayList<>();
+        Keyspace ks = Keyspace.open(KEYSPACE1);
+        char[] keyChars = new char[MutationExceededMaxSizeException.PARTITION_MESSAGE_LIMIT];
+        Arrays.fill(keyChars, 'k');
+        String key = new String(keyChars);
+
+        // large mutation
+        mutations.add(new RowUpdateBuilder(ks.getColumnFamilyStore(STANDARD1).metadata(), 0, key)
+                      .clustering("bytes")
+                      .add("val", ByteBuffer.allocate(1 + getMaxRecordDataSize()))
+                      .build());
+
+        // smaller mutation
+        mutations.add(new RowUpdateBuilder(ks.getColumnFamilyStore(STANDARD2).metadata(), 0, key)
+                      .clustering("bytes")
+                      .add("val", ByteBuffer.allocate(1 + getMaxRecordDataSize() - 1024))
+                      .build());
+
+        Mutation mutation = Mutation.merge(mutations);
+        try
+        {
+            CommitLog.instance.add(Mutation.merge(mutations));
+            throw new AssertionError("mutation larger than limit was accepted");
+        }
+        catch (MutationExceededMaxSizeException exception)
+        {
+            String message = exception.getMessage();
+
+            long mutationSize = mutation.serializedSize(MessagingService.current_version) + ENTRY_OVERHEAD_SIZE;
+            final String expectedMessagePrefix = String.format("Encountered an oversized mutation (%d/%d) for keyspace: %s.",
+                                                               mutationSize,
+                                                               DatabaseDescriptor.getMaxMutationSize(),
+                                                               KEYSPACE1);
+            assertTrue(message.startsWith(expectedMessagePrefix));
+            assertTrue(message.contains(String.format("%s.%s and 1 more.", STANDARD1, key)));
+        }
     }
 
     protected void testRecoveryWithBadSizeArgument(int size, int dataSize) throws Exception
@@ -500,9 +596,9 @@ public abstract class CommitLogTest
         return Collections.singletonMap(EncryptionContext.ENCRYPTION_IV, Hex.bytesToHex(buf));
     }
 
-    protected File tmpFile(int version) throws IOException
+    protected File tmpFile(int version)
     {
-        File logFile = File.createTempFile("CommitLog-" + version + "-", ".log");
+        File logFile = FileUtils.createTempFile("CommitLog-" + version + "-", ".log");
         assert logFile.length() == 0;
         return logFile;
     }
@@ -579,20 +675,18 @@ public abstract class CommitLogTest
             caught = t;
         }
         if (expected != null && caught == null)
-            Assert.fail("Expected exception " + expected + " but call completed successfully.");
+            fail("Expected exception " + expected + " but call completed successfully.");
 
         assertEquals("JVM kill state doesn't match expectation.", expected != null, testKiller.wasKilled());
     }
 
     protected void testRecovery(final byte[] logData, Class<?> expected) throws Exception
     {
-        ParameterizedClass commitLogCompression = DatabaseDescriptor.getCommitLogCompression();
-        EncryptionContext encryptionContext = DatabaseDescriptor.getEncryptionContext();
         runExpecting(() -> testRecovery(logData, CommitLogDescriptor.current_version), expected);
     }
 
     @Test
-    public void testTruncateWithoutSnapshot() throws ExecutionException, InterruptedException, IOException
+    public void testTruncateWithoutSnapshot()
     {
         boolean originalState = DatabaseDescriptor.isAutoSnapshot();
         try
@@ -636,7 +730,7 @@ public abstract class CommitLogTest
         {
             DatabaseDescriptor.setAutoSnapshot(false);
             Keyspace notDurableKs = Keyspace.open(KEYSPACE2);
-            Assert.assertFalse(notDurableKs.getMetadata().params.durableWrites);
+            assertFalse(notDurableKs.getMetadata().params.durableWrites);
 
             ColumnFamilyStore cfs = notDurableKs.getColumnFamilyStore("Standard1");
             new RowUpdateBuilder(cfs.metadata(), 0, "key1")
@@ -680,12 +774,80 @@ public abstract class CommitLogTest
 
         SimpleCountingReplayer replayer = new SimpleCountingReplayer(CommitLog.instance, CommitLogPosition.NONE, cfs.metadata());
         List<String> activeSegments = CommitLog.instance.getActiveSegmentNames();
-        Assert.assertFalse(activeSegments.isEmpty());
+        assertFalse(activeSegments.isEmpty());
 
         File[] files = new File(CommitLog.instance.segmentManager.storageDirectory).listFiles((file, name) -> activeSegments.contains(name));
         replayer.replayFiles(files);
 
         assertEquals(cellCount, replayer.cells);
+    }
+
+    @Test
+    public void replayWithBadSyncMarkerCRC() throws IOException
+    {
+        ColumnFamilyStore cfs = Keyspace.open(KEYSPACE1).getColumnFamilyStore(STANDARD1);
+
+        Mutation rm2 = new RowUpdateBuilder(cfs.metadata(), 0, "k2").clustering("bytes")
+                                                                    .add("val", bytes("this is a string"))
+                                                                    .build();
+        CommitLog.instance.add(rm2);
+        CommitLog.instance.sync(true);
+
+        List<String> activeSegments = CommitLog.instance.getActiveSegmentNames();
+        assertFalse(activeSegments.isEmpty());
+
+        File directory = new File(CommitLog.instance.segmentManager.storageDirectory);
+        File firstActiveFile = Objects.requireNonNull(directory.listFiles((file, name) -> activeSegments.contains(name)))[0];
+        zeroFirstSyncMarkerCRC(firstActiveFile);
+
+        CommitLogSegmentReader.setAllowSkipSyncMarkerCrc(true);
+
+        if (DatabaseDescriptor.getCommitLogCompression() != null || DatabaseDescriptor.getEncryptionContext().isEnabled())
+        {
+            // If compression or encryption are enabled, expect an error, and do not attempt to replay using only mutation CRCs.
+            runExpecting(() ->
+                         {
+                             CommitLog.instance.recoverFiles(firstActiveFile);
+                             return null;
+                         },
+                         CommitLogReplayException.class);
+        }
+        else
+        {
+            SimpleCountingReplayer replayer = new SimpleCountingReplayer(CommitLog.instance, CommitLogPosition.NONE, cfs.metadata());
+            replayer.replayPath(firstActiveFile, false);
+            assertEquals(1, replayer.cells);
+        }
+    }
+
+    private void zeroFirstSyncMarkerCRC(File file) throws IOException
+    {
+        // Get the position of the first sync marker...
+        int firstSyncMarkerPosition = -1;
+
+        try (RandomAccessReader reader = RandomAccessReader.open(file))
+        {
+            CommitLogDescriptor.readHeader(reader, DatabaseDescriptor.getEncryptionContext());
+            firstSyncMarkerPosition = (int) reader.getFilePointer();
+        }
+
+        // ...buffer the file into memory...
+        ByteBuffer buffer = ByteBuffer.allocate((int) file.length());
+
+        try (RandomAccessReader reader = RandomAccessReader.open(file))
+        {
+            reader.readFully(buffer);
+        }
+
+        // ...overwrite the sync marker CRC with zero...
+        buffer.position(firstSyncMarkerPosition + 4);
+        buffer.putInt(0);
+
+        // ...and write the file back out.
+        try (OutputStream out = new FileOutputStream(file))
+        {
+            out.write(buffer.array());
+        }
     }
 
     @Test
@@ -717,7 +879,7 @@ public abstract class CommitLogTest
 
         SimpleCountingReplayer replayer = new SimpleCountingReplayer(CommitLog.instance, commitLogPosition, cfs.metadata());
         List<String> activeSegments = CommitLog.instance.getActiveSegmentNames();
-        Assert.assertFalse(activeSegments.isEmpty());
+        assertFalse(activeSegments.isEmpty());
 
         File[] files = new File(CommitLog.instance.segmentManager.storageDirectory).listFiles((file, name) -> activeSegments.contains(name));
         replayer.replayFiles(files);
@@ -810,7 +972,8 @@ public abstract class CommitLogTest
         System.setProperty("cassandra.replayList", KEYSPACE1 + "." + STANDARD1);
         // Currently we don't attempt to re-flush a memtable that failed, thus make sure data is replayed by commitlog.
         // If retries work subsequent flushes should clear up error and this should change to expect 0.
-        Assert.assertEquals(1, CommitLog.instance.resetUnsafe(false));
+        assertEquals(1, CommitLog.instance.resetUnsafe(false));
+        System.clearProperty("cassandra.replayList");
     }
 
     public void testOutOfOrderFlushRecovery(BiConsumer<ColumnFamilyStore, Memtable> flushAction, boolean performCompaction)
@@ -844,7 +1007,8 @@ public abstract class CommitLogTest
         // In the absence of error, this should be 0 because forceBlockingFlush/forceRecycleAllSegments would have
         // persisted all data in the commit log. Because we know there was an error, there must be something left to
         // replay.
-        Assert.assertEquals(1, CommitLog.instance.resetUnsafe(false));
+        assertEquals(1, CommitLog.instance.resetUnsafe(false));
+        System.clearProperty("cassandra.replayList");
     }
 
     BiConsumer<ColumnFamilyStore, Memtable> flush = (cfs, current) ->
@@ -896,6 +1060,33 @@ public abstract class CommitLogTest
     public void testOutOfOrderLogDiscardWithCompaction() throws ExecutionException, InterruptedException, IOException
     {
         testOutOfOrderFlushRecovery(recycleSegments, true);
+    }
+
+    @Test
+    public void testRecoveryWithCollectionClusteringKeysStatic() throws Exception
+    {
+
+        ColumnFamilyStore cfs = Keyspace.open(KEYSPACE1).getColumnFamilyStore(CUSTOM1);
+        RowUpdateBuilder rb = new RowUpdateBuilder(cfs.metadata(), 0, BigInteger.ONE);
+
+        rb.add("s", BigInteger.valueOf(2));
+
+        Mutation rm = rb.build();
+        CommitLog.instance.add(rm);
+
+        int replayed = 0;
+
+        try
+        {
+            System.setProperty(CommitLogReplayer.IGNORE_REPLAY_ERRORS_PROPERTY, "true");
+            replayed = CommitLog.instance.resetUnsafe(false);
+        }
+        finally
+        {
+            System.clearProperty(CommitLogReplayer.IGNORE_REPLAY_ERRORS_PROPERTY);
+        }
+
+        assertEquals(replayed, 1);
     }
 }
 

@@ -17,19 +17,22 @@
  */
 package org.apache.cassandra.utils;
 
-import java.lang.management.ManagementFactory;
-import javax.management.MBeanServer;
 import javax.management.ObjectName;
 
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.config.CassandraRelevantProperties;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.MX4JADDRESS;
+import static org.apache.cassandra.config.CassandraRelevantProperties.MX4JPORT;
+
 /**
  * If mx4j-tools is in the classpath call maybeLoad to load the HTTP interface of mx4j.
  *
  * The default port is 8081. To override that provide e.g. -Dmx4jport=8082
- * The default listen address is 0.0.0.0. To override that provide -Dmx4jaddress=127.0.0.1
+ * The default listen address is the broadcast_address. To override that provide -Dmx4jaddress=127.0.0.1
  */
 public class Mx4jTool
 {
@@ -44,7 +47,7 @@ public class Mx4jTool
         try
         {
             logger.trace("Will try to load mx4j now, if it's in the classpath");
-            MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+            MBeanWrapper mbs = MBeanWrapper.instance;
             ObjectName processorName = new ObjectName("Server:name=XSLTProcessor");
 
             Class<?> httpAdaptorClass = Class.forName("mx4j.tools.adaptor.http.HttpAdaptor");
@@ -77,7 +80,7 @@ public class Mx4jTool
 
     private static String getAddress()
     {
-        String sAddress = System.getProperty("mx4jaddress");
+        String sAddress = MX4JADDRESS.getString();
         if (StringUtils.isEmpty(sAddress))
             sAddress = FBUtilities.getBroadcastAddressAndPort().address.getHostAddress();
         return sAddress;
@@ -86,7 +89,7 @@ public class Mx4jTool
     private static int getPort()
     {
         int port = 8081;
-        String sPort = System.getProperty("mx4jport");
+        String sPort = MX4JPORT.getString();
         if (StringUtils.isNotEmpty(sPort))
             port = Integer.parseInt(sPort);
         return port;

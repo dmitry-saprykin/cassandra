@@ -17,9 +17,11 @@
  */
 package org.apache.cassandra.db;
 
+import java.io.IOException;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
 
 import javax.management.openmbean.CompositeData;
@@ -143,11 +145,52 @@ public interface ColumnFamilyStoreMBean
     public List<String> getSSTablesForKey(String key, boolean hexFormat);
 
     /**
-     * Scan through Keyspace/ColumnFamily's data directory
-     * determine which SSTables should be loaded and load them
+     * Load new sstables from the given directory
+     *
+     * @param srcPaths the path to the new sstables - if it is an empty set, the data directories will be scanned
+     * @param resetLevel if the level should be reset to 0 on the new sstables
+     * @param clearRepaired if repaired info should be wiped from the new sstables
+     * @param verifySSTables if the new sstables should be verified that they are not corrupt
+     * @param verifyTokens if the tokens in the new sstables should be verified that they are owned by the current node
+     * @param invalidateCaches if row cache should be invalidated for the keys in the new sstables
+     * @param extendedVerify if we should run an extended verify checking all values in the new sstables
+     *
+     * @return list of failed import directories
      */
-    public void loadNewSSTables();
+    @Deprecated
+    public List<String> importNewSSTables(Set<String> srcPaths,
+                                           boolean resetLevel,
+                                           boolean clearRepaired,
+                                           boolean verifySSTables,
+                                           boolean verifyTokens,
+                                           boolean invalidateCaches,
+                                           boolean extendedVerify);
 
+    /**
+     * Load new sstables from the given directory
+     *
+     * @param srcPaths the path to the new sstables - if it is an empty set, the data directories will be scanned
+     * @param resetLevel if the level should be reset to 0 on the new sstables
+     * @param clearRepaired if repaired info should be wiped from the new sstables
+     * @param verifySSTables if the new sstables should be verified that they are not corrupt
+     * @param verifyTokens if the tokens in the new sstables should be verified that they are owned by the current node
+     * @param invalidateCaches if row cache should be invalidated for the keys in the new sstables
+     * @param extendedVerify if we should run an extended verify checking all values in the new sstables
+     * @param copyData if we should copy data from source paths instead of moving them
+     *
+     * @return list of failed import directories
+     */
+    public List<String> importNewSSTables(Set<String> srcPaths,
+                                          boolean resetLevel,
+                                          boolean clearRepaired,
+                                          boolean verifySSTables,
+                                          boolean verifyTokens,
+                                          boolean invalidateCaches,
+                                          boolean extendedVerify,
+                                          boolean copyData);
+
+    @Deprecated
+    public void loadNewSSTables();
     /**
      * @return the number of SSTables in L0.  Always return 0 if Leveled compaction is not enabled.
      */
@@ -158,6 +201,12 @@ public interface ColumnFamilyStoreMBean
      *         array index corresponds to level(int[0] is for level 0, ...).
      */
     public int[] getSSTableCountPerLevel();
+
+    /**
+     * @return total size on disk for each level. null unless leveled compaction is used.
+     *         array index corresponds to level(int[0] is for level 0, ...).
+     */
+    public long[] getPerLevelSizeBytes();
 
     /**
      * @return sstable fanout size for level compaction strategy.
@@ -179,12 +228,12 @@ public interface ColumnFamilyStoreMBean
      * begin sampling for a specific sampler with a given capacity.  The cardinality may
      * be larger than the capacity, but depending on the use case it may affect its accuracy
      */
-    public void beginLocalSampling(String sampler, int capacity);
+    public void beginLocalSampling(String sampler, int capacity, int durationMillis);
 
     /**
      * @return top <i>count</i> items for the sampler since beginLocalSampling was called
      */
-    public CompositeData finishLocalSampling(String sampler, int count) throws OpenDataException;
+    public List<CompositeData> finishLocalSampling(String sampler, int count) throws OpenDataException;
 
     /*
         Is Compaction space check enabled
@@ -199,4 +248,13 @@ public interface ColumnFamilyStoreMBean
     public void setNeverPurgeTombstones(boolean value);
 
     public boolean getNeverPurgeTombstones();
+
+    /**
+     * Check SSTables whether or not they are misplaced.
+     * @return true if any of the SSTables is misplaced.
+     *         If all SSTables are correctly placed or the partitioner does not support splitting, it returns false.
+     */
+    public boolean hasMisplacedSSTables();
+
+    public List<String> getDataPaths() throws IOException;
 }

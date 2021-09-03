@@ -21,14 +21,17 @@ import java.io.DataInput;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.regex.Pattern;
 import java.util.zip.CRC32;
 import javax.crypto.Cipher;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Objects;
 import com.google.common.collect.ImmutableMap;
@@ -60,7 +63,8 @@ final class HintsDescriptor
     private static final Logger logger = LoggerFactory.getLogger(HintsDescriptor.class);
 
     static final int VERSION_30 = 1;
-    static final int CURRENT_VERSION = VERSION_30;
+    static final int VERSION_40 = 2;
+    static final int CURRENT_VERSION = VERSION_40;
 
     static final String COMPRESSION = "compression";
     static final String ENCRYPTION = "encryption";
@@ -214,6 +218,8 @@ final class HintsDescriptor
         {
             case VERSION_30:
                 return MessagingService.VERSION_30;
+            case VERSION_40:
+                return MessagingService.VERSION_40;
             default:
                 throw new AssertionError();
         }
@@ -222,6 +228,47 @@ final class HintsDescriptor
     static boolean isHintFileName(Path path)
     {
         return pattern.matcher(path.getFileName().toString()).matches();
+    }
+
+    static Optional<HintsDescriptor> readFromFileQuietly(Path path)
+    {
+        try (RandomAccessFile raf = new RandomAccessFile(path.toFile(), "r"))
+        {
+            return Optional.of(deserialize(raf));
+        }
+        catch (ChecksumMismatchException e)
+        {
+            throw new FSReadError(e, path.toFile());
+        }
+        catch (IOException e)
+        {
+            handleDescriptorIOE(e, path);
+            return Optional.empty();
+        }
+    }
+
+    @VisibleForTesting
+    static void handleDescriptorIOE(IOException e, Path path)
+    {
+        try
+        {
+            if (Files.size(path) > 0)
+            {
+                String newFileName = path.getFileName().toString().replace(".hints", ".corrupt.hints");
+                Path target = path.getParent().resolve(newFileName);
+                logger.error("Failed to deserialize hints descriptor {} - saving file as {}", path.toString(), target, e);
+                Files.move(path, target);
+            }
+            else
+            {
+                logger.warn("Found empty hints file {} on startup, removing", path.toString());
+                Files.delete(path);
+            }
+        }
+        catch (IOException ex)
+        {
+            logger.error("Error handling corrupt hints file {}", path.toString(), ex);
+        }
     }
 
     static HintsDescriptor readFromFile(Path path)
@@ -381,6 +428,6 @@ final class HintsDescriptor
     private static void validateCRC(int expected, int actual) throws IOException
     {
         if (expected != actual)
-            throw new IOException("Hints Descriptor CRC Mismatch");
+            throw new ChecksumMismatchException("Hints Descriptor CRC Mismatch");
     }
 }

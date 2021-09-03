@@ -26,7 +26,7 @@ import org.apache.cassandra.cql3.statements.Bound;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.exceptions.InvalidRequestException;
-import org.apache.cassandra.index.SecondaryIndexManager;
+import org.apache.cassandra.index.IndexRegistry;
 import org.apache.cassandra.utils.btree.BTreeSet;
 
 import static org.apache.cassandra.cql3.statements.RequestValidations.checkFalse;
@@ -101,7 +101,7 @@ final class ClusteringColumnRestrictions extends RestrictionSetWrapper
         return false;
     }
 
-    public NavigableSet<Clustering> valuesAsClustering(QueryOptions options) throws InvalidRequestException
+    public NavigableSet<Clustering<?>> valuesAsClustering(QueryOptions options) throws InvalidRequestException
     {
         MultiCBuilder builder = MultiCBuilder.create(comparator, hasIN());
         for (SingleRestriction r : restrictions)
@@ -113,7 +113,7 @@ final class ClusteringColumnRestrictions extends RestrictionSetWrapper
         return builder.build();
     }
 
-    public NavigableSet<ClusteringBound> boundsAsClustering(Bound bound, QueryOptions options) throws InvalidRequestException
+    public NavigableSet<ClusteringBound<?>> boundsAsClustering(Bound bound, QueryOptions options) throws InvalidRequestException
     {
         MultiCBuilder builder = MultiCBuilder.create(comparator, hasIN() || hasMultiColumnSlice());
         int keyPosition = 0;
@@ -199,7 +199,7 @@ final class ClusteringColumnRestrictions extends RestrictionSetWrapper
 
     @Override
     public void addRowFilterTo(RowFilter filter,
-                               SecondaryIndexManager indexManager,
+                               IndexRegistry indexRegistry,
                                QueryOptions options) throws InvalidRequestException
     {
         int position = 0;
@@ -207,9 +207,9 @@ final class ClusteringColumnRestrictions extends RestrictionSetWrapper
         for (SingleRestriction restriction : restrictions)
         {
             // We ignore all the clustering columns that can be handled by slices.
-            if (handleInFilter(restriction, position) || restriction.hasSupportingIndex(indexManager))
+            if (handleInFilter(restriction, position) || restriction.hasSupportingIndex(indexRegistry))
             {
-                restriction.addRowFilterTo(filter, indexManager, options);
+                restriction.addRowFilterTo(filter, indexRegistry, options);
                 continue;
             }
 

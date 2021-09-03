@@ -17,8 +17,8 @@
  */
 package org.apache.cassandra.exceptions;
 
-import java.util.HashMap;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.locator.InetAddressAndPort;
@@ -32,17 +32,36 @@ public class RequestFailureException extends RequestExecutionException
 
     protected RequestFailureException(ExceptionCode code, ConsistencyLevel consistency, int received, int blockFor, Map<InetAddressAndPort, RequestFailureReason> failureReasonByEndpoint)
     {
-        super(code, String.format("Operation failed - received %d responses and %d failures", received, failureReasonByEndpoint.size()));
+        this(code, buildErrorMessage(received, failureReasonByEndpoint), consistency, received, blockFor, failureReasonByEndpoint);
+    }
+
+    protected RequestFailureException(ExceptionCode code, String msg, ConsistencyLevel consistency, int received, int blockFor, Map<InetAddressAndPort, RequestFailureReason> failureReasonByEndpoint)
+    {
+        super(code, buildErrorMessage(msg, failureReasonByEndpoint));
         this.consistency = consistency;
         this.received = received;
         this.blockFor = blockFor;
+        this.failureReasonByEndpoint = failureReasonByEndpoint;
+    }
 
-        // It is possible for the passed in failureReasonByEndpoint map
-        // to have new entries added after this exception is constructed
-        // (e.g. a delayed failure response from a replica). So to be safe
-        // we make a copy of the map at this point to ensure it will not be
-        // modified any further. Otherwise, there could be implications when
-        // we encode this map for transport.
-        this.failureReasonByEndpoint = new HashMap<>(failureReasonByEndpoint);
+    private static String buildErrorMessage(int received, Map<InetAddressAndPort, RequestFailureReason> failures)
+    {
+        return String.format("received %d responses and %d failures", received, failures.size());
+    }
+
+    private static String buildFailureString(Map<InetAddressAndPort, RequestFailureReason> failures)
+    {
+        return failures.entrySet().stream()
+                       .map(e -> String.format("%s from %s", e.getValue(), e.getKey()))
+                       .collect(Collectors.joining(", "));
+    }
+
+    private static String buildErrorMessage(CharSequence msg, Map<InetAddressAndPort, RequestFailureReason> failures)
+    {
+        StringBuilder sb = new StringBuilder("Operation failed - ");
+        sb.append(msg);
+        if (failures != null && !failures.isEmpty())
+            sb.append(": ").append(buildFailureString(failures));
+        return sb.toString();
     }
 }

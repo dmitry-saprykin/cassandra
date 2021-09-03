@@ -43,7 +43,7 @@ public abstract class AbstractSSTableIterator implements UnfilteredRowIterator
     protected final DecoratedKey key;
     protected final DeletionTime partitionLevelDeletion;
     protected final ColumnFilter columns;
-    protected final SerializationHelper helper;
+    protected final DeserializationHelper helper;
 
     protected final Row staticRow;
     protected final Reader reader;
@@ -70,7 +70,7 @@ public abstract class AbstractSSTableIterator implements UnfilteredRowIterator
         this.key = key;
         this.columns = columnFilter;
         this.slices = slices;
-        this.helper = new SerializationHelper(metadata, sstable.descriptor.version.correspondingMessagingVersion(), SerializationHelper.Flag.LOCAL, columnFilter);
+        this.helper = new DeserializationHelper(metadata, sstable.descriptor.version.correspondingMessagingVersion(), DeserializationHelper.Flag.LOCAL, columnFilter);
 
         if (indexEntry == null)
         {
@@ -111,6 +111,8 @@ public abstract class AbstractSSTableIterator implements UnfilteredRowIterator
                     this.staticRow = Rows.EMPTY_STATIC_ROW;
                     this.reader = createReader(indexEntry, file, shouldCloseFile);
                 }
+                if (!partitionLevelDeletion.validate())
+                    UnfilteredValidation.handleInvalid(metadata(), key, sstable, "partitionLevelDeletion="+partitionLevelDeletion.toString());
 
                 if (reader != null && !slices.isEmpty())
                     reader.setForSlice(nextSlice());
@@ -157,7 +159,7 @@ public abstract class AbstractSSTableIterator implements UnfilteredRowIterator
 
     private static Row readStaticRow(SSTableReader sstable,
                                      FileDataInput file,
-                                     SerializationHelper helper,
+                                     DeserializationHelper helper,
                                      Columns statics) throws IOException
     {
         if (!sstable.header.hasStatic())
@@ -448,12 +450,12 @@ public abstract class AbstractSSTableIterator implements UnfilteredRowIterator
             if (blockIdx >= 0 && blockIdx < indexEntry.columnsIndexCount())
             {
                 reader.seekToPosition(columnOffset(blockIdx));
+                mark = reader.file.mark();
                 reader.deserializer.clearState();
             }
 
             currentIndexIdx = blockIdx;
             reader.openMarker = blockIdx > 0 ? index(blockIdx - 1).endOpenMarker : null;
-            mark = reader.file.mark();
         }
 
         private long columnOffset(int i) throws IOException
@@ -528,17 +530,17 @@ public abstract class AbstractSSTableIterator implements UnfilteredRowIterator
 
         // Finds the index of the first block containing the provided bound, starting at the provided index.
         // Will be -1 if the bound is before any block, and blocksCount() if it is after every block.
-        public int findBlockIndex(ClusteringBound bound, int fromIdx) throws IOException
+        public int findBlockIndex(ClusteringBound<?> bound, int fromIdx) throws IOException
         {
-            if (bound == ClusteringBound.BOTTOM)
+            if (bound.isBottom())
                 return -1;
-            if (bound == ClusteringBound.TOP)
+            if (bound.isTop())
                 return blocksCount();
 
             return indexFor(bound, fromIdx);
         }
 
-        public int indexFor(ClusteringPrefix name, int lastIndex) throws IOException
+        public int indexFor(ClusteringPrefix<?> name, int lastIndex) throws IOException
         {
             IndexInfo target = new IndexInfo(name, name, 0, 0, null);
             /*

@@ -18,18 +18,12 @@
 package org.apache.cassandra.service;
 
 import java.net.InetAddress;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Map.Entry;
 import java.util.concurrent.TimeUnit;
 
 import com.google.common.annotations.VisibleForTesting;
-import com.google.common.collect.Lists;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -38,11 +32,11 @@ import io.netty.channel.EventLoopGroup;
 import io.netty.channel.epoll.Epoll;
 import io.netty.channel.epoll.EpollEventLoopGroup;
 import io.netty.channel.nio.NioEventLoopGroup;
-import io.netty.util.concurrent.EventExecutor;
+import io.netty.util.Version;
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.metrics.AuthMetrics;
+import org.apache.cassandra.config.EncryptionOptions;
 import org.apache.cassandra.metrics.ClientMetrics;
-import org.apache.cassandra.transport.RequestThreadPoolExecutor;
+import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.transport.Server;
 import org.apache.cassandra.utils.NativeLibrary;
 
@@ -58,7 +52,6 @@ public class NativeTransportService
 
     private boolean initialized = false;
     private EventLoopGroup workerGroup;
-    private EventExecutor eventExecutorGroup;
 
     /**
      * Creates netty thread pools and event loops.
@@ -68,9 +61,6 @@ public class NativeTransportService
     {
         if (initialized)
             return;
-
-        // prepare netty resources
-        eventExecutorGroup = new RequestThreadPoolExecutor();
 
         if (useEpoll())
         {
@@ -88,68 +78,46 @@ public class NativeTransportService
         InetAddress nativeAddr = DatabaseDescriptor.getRpcAddress();
 
         org.apache.cassandra.transport.Server.Builder builder = new org.apache.cassandra.transport.Server.Builder()
-                                                                .withEventExecutor(eventExecutorGroup)
                                                                 .withEventLoopGroup(workerGroup)
                                                                 .withHost(nativeAddr);
 
-        if (!DatabaseDescriptor.getClientEncryptionOptions().enabled)
+        EncryptionOptions.TlsEncryptionPolicy encryptionPolicy = DatabaseDescriptor.getNativeProtocolEncryptionOptions().tlsEncryptionPolicy();
+        Server regularPortServer;
+        Server tlsPortServer = null;
+
+        // If an SSL port is separately supplied for the native transport, listen for unencrypted connections on the
+        // regular port, and encryption / optionally encrypted connections on the ssl port.
+        if (nativePort != nativePortSSL)
         {
-            servers = Collections.singleton(builder.withSSL(false).withPort(nativePort).build());
+            regularPortServer = builder.withTlsEncryptionPolicy(EncryptionOptions.TlsEncryptionPolicy.UNENCRYPTED).withPort(nativePort).build();
+            switch(encryptionPolicy)
+            {
+                case OPTIONAL: // FALLTHRU - encryption is optional on the regular port, but encrypted on the tls port.
+                case ENCRYPTED:
+                    tlsPortServer = builder.withTlsEncryptionPolicy(encryptionPolicy).withPort(nativePortSSL).build();
+                    break;
+                case UNENCRYPTED: // Should have been caught by DatabaseDescriptor.applySimpleConfig
+                    throw new IllegalStateException("Encryption must be enabled in client_encryption_options for native_transport_port_ssl");
+                default:
+                    throw new IllegalStateException("Unrecognized TLS encryption policy: " + encryptionPolicy);
+            }
+        }
+        // Otherwise, if only the regular port is supplied, listen as the encryption policy specifies
+        else
+        {
+            regularPortServer = builder.withTlsEncryptionPolicy(encryptionPolicy).withPort(nativePort).build();
+        }
+
+        if (tlsPortServer == null)
+        {
+            servers = Collections.singleton(regularPortServer);
         }
         else
         {
-            if (nativePort != nativePortSSL)
-            {
-                // user asked for dedicated ssl port for supporting both non-ssl and ssl connections
-                servers = Collections.unmodifiableList(
-                                                      Arrays.asList(
-                                                                   builder.withSSL(false).withPort(nativePort).build(),
-                                                                   builder.withSSL(true).withPort(nativePortSSL).build()
-                                                      )
-                );
-            }
-            else
-            {
-                // ssl only mode using configured native port
-                servers = Collections.singleton(builder.withSSL(true).withPort(nativePort).build());
-            }
+            servers = Collections.unmodifiableList(Arrays.asList(regularPortServer, tlsPortServer));
         }
 
-        // register metrics
-        ClientMetrics.instance.addGauge("connectedNativeClients", () ->
-        {
-            int ret = 0;
-            for (Server server : servers)
-                ret += server.getConnectedClients();
-            return ret;
-        });
-        ClientMetrics.instance.addGauge("connectedNativeClientsByUser", () ->
-        {
-            Map<String, Integer> result = new HashMap<>();
-            for (Server server : servers)
-            {
-                for (Entry<String, Integer> e : server.getConnectedClientsByUser().entrySet())
-                {
-                    String user = e.getKey();
-                    result.put(user, result.getOrDefault(user, 0) + e.getValue());
-                }
-            }
-            return result;
-        });
-
-        ClientMetrics.instance.addGauge("connections", () ->
-        {
-            List<Map<String, String>> result = new ArrayList<>();
-            for (Server server : servers)
-            {
-                for (Map<String, String> e : server.getConnectionStates())
-                {
-                    result.add(e);
-                }
-            }
-            return result;
-        });
-        AuthMetrics.init();
+        ClientMetrics.instance.init(servers);
 
         initialized = true;
     }
@@ -159,6 +127,7 @@ public class NativeTransportService
      */
     public void start()
     {
+        logger.info("Using Netty Version: {}", Version.identify().entrySet());
         initialize();
         servers.forEach(Server::start);
     }
@@ -182,8 +151,7 @@ public class NativeTransportService
         // shutdown executors used by netty for native transport server
         workerGroup.shutdownGracefully(3, 5, TimeUnit.SECONDS).awaitUninterruptibly();
 
-        // shutdownGracefully not implemented yet in RequestThreadPoolExecutor
-        eventExecutorGroup.shutdown();
+        Dispatcher.shutdown();
     }
 
     /**
@@ -194,7 +162,7 @@ public class NativeTransportService
         final boolean enableEpoll = Boolean.parseBoolean(System.getProperty("cassandra.native.epoll.enabled", "true"));
 
         if (enableEpoll && !Epoll.isAvailable() && NativeLibrary.osType == NativeLibrary.OSType.LINUX)
-            logger.warn("epoll not available {}", Epoll.unavailabilityCause());
+            logger.warn("epoll not available", Epoll.unavailabilityCause());
 
         return enableEpoll && Epoll.isAvailable();
     }
@@ -216,14 +184,14 @@ public class NativeTransportService
     }
 
     @VisibleForTesting
-    EventExecutor getEventExecutor()
-    {
-        return eventExecutorGroup;
-    }
-
-    @VisibleForTesting
     Collection<Server> getServers()
     {
         return servers;
+    }
+
+    public void clearConnectionHistory()
+    {
+        for (Server server : servers)
+            server.clearConnectionHistory();
     }
 }

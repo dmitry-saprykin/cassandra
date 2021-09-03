@@ -67,7 +67,7 @@ public class DataRange
      */
     public static DataRange allData(IPartitioner partitioner)
     {
-        return forTokenRange(new Range<Token>(partitioner.getMinimumToken(), partitioner.getMinimumToken()));
+        return forTokenRange(new Range<>(partitioner.getMinimumToken(), partitioner.getMinimumToken()));
     }
 
     /**
@@ -105,7 +105,7 @@ public class DataRange
      */
     public static DataRange allData(IPartitioner partitioner, ClusteringIndexFilter filter)
     {
-        return new DataRange(Range.makeRowRange(new Range<Token>(partitioner.getMinimumToken(), partitioner.getMinimumToken())), filter);
+        return new DataRange(Range.makeRowRange(new Range<>(partitioner.getMinimumToken(), partitioner.getMinimumToken())), filter);
     }
 
     /**
@@ -185,14 +185,25 @@ public class DataRange
      *
      * @return Whether this {@code DataRange} queries everything.
      */
-    public boolean isUnrestricted()
+    public boolean isUnrestricted(TableMetadata metadata)
     {
-        return startKey().isMinimum() && stopKey().isMinimum() && clusteringIndexFilter.selectsAllPartition();
+        return startKey().isMinimum() && stopKey().isMinimum() &&
+               (clusteringIndexFilter.selectsAllPartition() || metadata.clusteringColumns().isEmpty());
     }
 
     public boolean selectsAllPartition()
     {
         return clusteringIndexFilter.selectsAllPartition();
+    }
+
+    /**
+     * Whether the underlying {@code ClusteringIndexFilter} is reversed or not.
+     *
+     * @return whether the underlying {@code ClusteringIndexFilter} is reversed or not.
+     */
+    public boolean isReversed()
+    {
+        return clusteringIndexFilter.isReversed();
     }
 
     /**
@@ -222,7 +233,7 @@ public class DataRange
      *
      * @return a new {@code DataRange} suitable for paging {@code this} range given the {@code lastRetuned} result of the previous page.
      */
-    public DataRange forPaging(AbstractBounds<PartitionPosition> range, ClusteringComparator comparator, Clustering lastReturned, boolean inclusive)
+    public DataRange forPaging(AbstractBounds<PartitionPosition> range, ClusteringComparator comparator, Clustering<?> lastReturned, boolean inclusive)
     {
         return new Paging(range, clusteringIndexFilter, comparator, lastReturned, inclusive);
     }
@@ -246,10 +257,10 @@ public class DataRange
         return String.format("range=%s pfilter=%s", keyRange.getString(metadata.partitionKeyType), clusteringIndexFilter.toString(metadata));
     }
 
-    public String toCQLString(TableMetadata metadata)
+    public String toCQLString(TableMetadata metadata, RowFilter rowFilter)
     {
-        if (isUnrestricted())
-            return "UNRESTRICTED";
+        if (isUnrestricted(metadata))
+            return rowFilter.toCQLString();
 
         StringBuilder sb = new StringBuilder();
 
@@ -267,7 +278,7 @@ public class DataRange
             needAnd = true;
         }
 
-        String filterString = clusteringIndexFilter.toCQLString(metadata);
+        String filterString = clusteringIndexFilter.toCQLString(metadata, rowFilter);
         if (!filterString.isEmpty())
             sb.append(needAnd ? " AND " : "").append(filterString);
 
@@ -278,16 +289,19 @@ public class DataRange
     {
         sb.append("token(");
         sb.append(ColumnMetadata.toCQLString(metadata.partitionKeyColumns()));
-        sb.append(") ").append(getOperator(isStart, isInclusive)).append(" ");
+        sb.append(") ");
         if (pos instanceof DecoratedKey)
         {
+            sb.append(getOperator(isStart, isInclusive)).append(" ");
             sb.append("token(");
             appendKeyString(sb, metadata.partitionKeyType, ((DecoratedKey)pos).getKey());
             sb.append(")");
         }
         else
         {
-            sb.append(((Token.KeyBound)pos).getToken());
+            Token.KeyBound keyBound = (Token.KeyBound) pos;
+            sb.append(getOperator(isStart, isStart == keyBound.isMinimumBound)).append(" ");
+            sb.append(keyBound.getToken());
         }
     }
 
@@ -298,8 +312,6 @@ public class DataRange
              : (isInclusive ? "<=" : "<");
     }
 
-    // TODO: this is reused in SinglePartitionReadCommand but this should not really be here. Ideally
-    // we need a more "native" handling of composite partition keys.
     public static void appendKeyString(StringBuilder sb, AbstractType<?> type, ByteBuffer key)
     {
         if (type instanceof CompositeType)
@@ -307,11 +319,11 @@ public class DataRange
             CompositeType ct = (CompositeType)type;
             ByteBuffer[] values = ct.split(key);
             for (int i = 0; i < ct.types.size(); i++)
-                sb.append(i == 0 ? "" : ", ").append(ct.types.get(i).getString(values[i]));
+                sb.append(i == 0 ? "" : ", ").append(ct.types.get(i).toCQLString(values[i]));
         }
         else
         {
-            sb.append(type.getString(key));
+            sb.append(type.toCQLString(key));
         }
     }
 
@@ -325,13 +337,13 @@ public class DataRange
     public static class Paging extends DataRange
     {
         private final ClusteringComparator comparator;
-        private final Clustering lastReturned;
+        private final Clustering<?> lastReturned;
         private final boolean inclusive;
 
         private Paging(AbstractBounds<PartitionPosition> range,
                        ClusteringIndexFilter filter,
                        ClusteringComparator comparator,
-                       Clustering lastReturned,
+                       Clustering<?> lastReturned,
                        boolean inclusive)
         {
             super(range, filter);
@@ -367,7 +379,7 @@ public class DataRange
         /**
          * @return the last Clustering that was returned (in the previous page)
          */
-        public Clustering getLastReturned()
+        public Clustering<?> getLastReturned()
         {
             return lastReturned;
         }
@@ -379,7 +391,7 @@ public class DataRange
         }
 
         @Override
-        public boolean isUnrestricted()
+        public boolean isUnrestricted(TableMetadata metadata)
         {
             return false;
         }
@@ -417,7 +429,7 @@ public class DataRange
             if (in.readBoolean())
             {
                 ClusteringComparator comparator = metadata.comparator;
-                Clustering lastReturned = Clustering.serializer.deserialize(in, version, comparator.subtypes());
+                Clustering<byte[]> lastReturned = Clustering.serializer.deserialize(in, version, comparator.subtypes());
                 boolean inclusive = in.readBoolean();
                 return new Paging(range, filter, comparator, lastReturned, inclusive);
             }

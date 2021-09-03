@@ -20,8 +20,6 @@ package org.apache.cassandra.db.partitions;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Iterator;
 import java.util.List;
 
 import com.google.common.collect.Iterables;
@@ -32,12 +30,12 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.index.IndexRegistry;
 import org.apache.cassandra.io.util.*;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.schema.TableMetadata;
-import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.btree.BTree;
 import org.apache.cassandra.utils.btree.UpdateFunction;
 
@@ -117,23 +115,39 @@ public class PartitionUpdate extends AbstractBTreePartition
      *
      * @param metadata the metadata for the created update.
      * @param key the partition key for the partition to update.
-     * @param row the row for the update.
+     * @param row the row for the update (may be null).
+     * @param row the static row for the update (may be null).
+     *
+     * @return the newly created partition update containing only {@code row}.
+     */
+    public static PartitionUpdate singleRowUpdate(TableMetadata metadata, DecoratedKey key, Row row, Row staticRow)
+    {
+        MutableDeletionInfo deletionInfo = MutableDeletionInfo.live();
+        Holder holder = new Holder(
+            new RegularAndStaticColumns(
+                staticRow == null ? Columns.NONE : Columns.from(staticRow.columns()),
+                row == null ? Columns.NONE : Columns.from(row.columns())
+            ),
+            row == null ? BTree.empty() : BTree.singleton(row),
+            deletionInfo,
+            staticRow == null ? Rows.EMPTY_STATIC_ROW : staticRow,
+            EncodingStats.NO_STATS
+        );
+        return new PartitionUpdate(metadata, key, holder, deletionInfo, false);
+    }
+
+    /**
+     * Creates an immutable partition update that contains a single row update.
+     *
+     * @param metadata the metadata for the created update.
+     * @param key the partition key for the partition to update.
+     * @param row the row for the update (may be static).
      *
      * @return the newly created partition update containing only {@code row}.
      */
     public static PartitionUpdate singleRowUpdate(TableMetadata metadata, DecoratedKey key, Row row)
     {
-        MutableDeletionInfo deletionInfo = MutableDeletionInfo.live();
-        if (row.isStatic())
-        {
-            Holder holder = new Holder(new RegularAndStaticColumns(Columns.from(row.columns()), Columns.NONE), BTree.empty(), deletionInfo, row, EncodingStats.NO_STATS);
-            return new PartitionUpdate(metadata, key, holder, deletionInfo, false);
-        }
-        else
-        {
-            Holder holder = new Holder(new RegularAndStaticColumns(Columns.NONE, Columns.from(row.columns())), BTree.singleton(row), deletionInfo, Rows.EMPTY_STATIC_ROW, EncodingStats.NO_STATS);
-            return new PartitionUpdate(metadata, key, holder, deletionInfo, false);
-        }
+        return singleRowUpdate(metadata, key, row.isStatic() ? null : row, row.isStatic() ? row : null);
     }
 
     /**
@@ -161,6 +175,7 @@ public class PartitionUpdate extends AbstractBTreePartition
      * Warning: this method does not close the provided iterator, it is up to
      * the caller to close it.
      */
+    @SuppressWarnings("resource")
     public static PartitionUpdate fromIterator(UnfilteredRowIterator iterator, ColumnFilter filter)
     {
         iterator = UnfilteredRowIterators.withOnlyQueriedData(iterator, filter);
@@ -180,6 +195,7 @@ public class PartitionUpdate extends AbstractBTreePartition
      * Warning: this method does not close the provided iterator, it is up to
      * the caller to close it.
      */
+    @SuppressWarnings("resource")
     public static PartitionUpdate fromIterator(RowIterator iterator, ColumnFilter filter)
     {
         iterator = RowIterators.withOnlyQueriedData(iterator, filter);
@@ -201,6 +217,7 @@ public class PartitionUpdate extends AbstractBTreePartition
      *
      * @return the deserialized update or {@code null} if {@code bytes == null}.
      */
+    @SuppressWarnings("resource")
     public static PartitionUpdate fromBytes(ByteBuffer bytes, int version)
     {
         if (bytes == null)
@@ -210,7 +227,7 @@ public class PartitionUpdate extends AbstractBTreePartition
         {
             return serializer.deserialize(new DataInputBuffer(bytes, true),
                                           version,
-                                          SerializationHelper.Flag.LOCAL);
+                                          DeserializationHelper.Flag.LOCAL);
         }
         catch (IOException e)
         {
@@ -269,9 +286,8 @@ public class PartitionUpdate extends AbstractBTreePartition
         if (size == 1)
             return Iterables.getOnlyElement(updates);
 
-        int nowInSecs = FBUtilities.nowInSeconds();
         List<UnfilteredRowIterator> asIterators = Lists.transform(updates, AbstractBTreePartition::unfilteredIterator);
-        return fromIterator(UnfilteredRowIterators.merge(asIterators, nowInSecs), ColumnFilter.all(updates.get(0).metadata()));
+        return fromIterator(UnfilteredRowIterators.merge(asIterators), ColumnFilter.all(updates.get(0).metadata()));
     }
 
     // We override this, because the version in the super-class calls holder(), which build the update preventing
@@ -307,6 +323,15 @@ public class PartitionUpdate extends AbstractBTreePartition
     public int dataSize()
     {
         int size = 0;
+
+        if (holder.staticRow != null)
+        {
+            for (ColumnData cd : holder.staticRow.columnData())
+            {
+                size += cd.dataSize();
+            }
+        }
+
         for (Row row : this)
         {
             size += row.clustering().dataSize();
@@ -370,13 +395,31 @@ public class PartitionUpdate extends AbstractBTreePartition
             {
                 if (cd.column().isSimple())
                 {
-                    maxTimestamp = Math.max(maxTimestamp, ((Cell)cd).timestamp());
+                    maxTimestamp = Math.max(maxTimestamp, ((Cell<?>)cd).timestamp());
                 }
                 else
                 {
                     ComplexColumnData complexData = (ComplexColumnData)cd;
                     maxTimestamp = Math.max(maxTimestamp, complexData.complexDeletion().markedForDeleteAt());
-                    for (Cell cell : complexData)
+                    for (Cell<?> cell : complexData)
+                        maxTimestamp = Math.max(maxTimestamp, cell.timestamp());
+                }
+            }
+        }
+
+        if (this.holder.staticRow != null)
+        {
+            for (ColumnData cd : this.holder.staticRow.columnData())
+            {
+                if (cd.column().isSimple())
+                {
+                    maxTimestamp = Math.max(maxTimestamp, ((Cell<?>) cd).timestamp());
+                }
+                else
+                {
+                    ComplexColumnData complexData = (ComplexColumnData) cd;
+                    maxTimestamp = Math.max(maxTimestamp, complexData.complexDeletion().markedForDeleteAt());
+                    for (Cell<?> cell : complexData)
                         maxTimestamp = Math.max(maxTimestamp, cell.timestamp());
                 }
             }
@@ -404,7 +447,7 @@ public class PartitionUpdate extends AbstractBTreePartition
 
     private static void addMarksForRow(Row row, List<CounterMark> marks)
     {
-        for (Cell cell : row.cells())
+        for (Cell<?> cell : row.cells())
         {
             if (cell.isCounterCell())
                 marks.add(new CounterMark(row, cell.column(), cell.path()));
@@ -427,7 +470,7 @@ public class PartitionUpdate extends AbstractBTreePartition
 
     public void validateIndexedColumns()
     {
-        Keyspace.openAndGetStore(metadata()).indexManager.validate(this);
+        IndexRegistry.obtain(metadata()).validate(this);
     }
 
     /**
@@ -590,7 +633,7 @@ public class PartitionUpdate extends AbstractBTreePartition
             }
         }
 
-        public PartitionUpdate deserialize(DataInputPlus in, int version, SerializationHelper.Flag flag) throws IOException
+        public PartitionUpdate deserialize(DataInputPlus in, int version, DeserializationHelper.Flag flag) throws IOException
         {
             TableMetadata metadata = Schema.instance.getExistingTableMetadata(TableId.deserialize(in));
             UnfilteredRowIteratorSerializer.Header header = UnfilteredRowIteratorSerializer.serializer.deserializeHeader(metadata, null, in, version, flag);
@@ -652,7 +695,7 @@ public class PartitionUpdate extends AbstractBTreePartition
             this.path = path;
         }
 
-        public Clustering clustering()
+        public Clustering<?> clustering()
         {
             return row.clustering();
         }
@@ -670,8 +713,8 @@ public class PartitionUpdate extends AbstractBTreePartition
         public ByteBuffer value()
         {
             return path == null
-                 ? row.getCell(column).value()
-                 : row.getCell(column, path).value();
+                 ? row.getCell(column).buffer()
+                 : row.getCell(column, path).buffer();
         }
 
         public void setValue(ByteBuffer value)
@@ -696,7 +739,6 @@ public class PartitionUpdate extends AbstractBTreePartition
         private final boolean canHaveShadowedData;
         private Object[] tree = BTree.empty();
         private final BTree.Builder<Row> rowBuilder;
-        private final int createdAtInSec = FBUtilities.nowInSeconds();
         private Row staticRow = Rows.EMPTY_STATIC_ROW;
         private final RegularAndStaticColumns columns;
         private boolean isBuilt = false;
@@ -780,7 +822,7 @@ public class PartitionUpdate extends AbstractBTreePartition
                 assert columns().statics.containsAll(row.columns()) : columns().statics + " is not superset of " + row.columns();
                 staticRow = staticRow.isEmpty()
                             ? row
-                            : Rows.merge(staticRow, row, createdAtInSec);
+                            : Rows.merge(staticRow, row);
             }
             else
             {
@@ -817,7 +859,7 @@ public class PartitionUpdate extends AbstractBTreePartition
             assert !isBuilt : "A PartitionUpdate.Builder should only get built once";
             Object[] add = rowBuilder.build();
             Object[] merged = BTree.<Row>merge(tree, add, metadata.comparator,
-                                               UpdateFunction.Simple.of((a, b) -> Rows.merge(a, b, createdAtInSec)));
+                                               UpdateFunction.Simple.of(Rows::merge));
 
             EncodingStats newStats = EncodingStats.Collector.collect(staticRow, BTree.iterator(merged), deletionInfo);
 
@@ -846,8 +888,7 @@ public class PartitionUpdate extends AbstractBTreePartition
         private BTree.Builder<Row> rowBuilder(int initialCapacity)
         {
             return BTree.<Row>builder(metadata.comparator, initialCapacity)
-                   .setQuickResolver((a, b) ->
-                                     Rows.merge(a, b, createdAtInSec));
+                   .setQuickResolver(Rows::merge);
         }
         /**
          * Modify this update to set every timestamp for live data to {@code newTimestamp} and
@@ -879,11 +920,11 @@ public class PartitionUpdate extends AbstractBTreePartition
                    ", key=" + key +
                    ", deletionInfo=" + deletionInfo +
                    ", canHaveShadowedData=" + canHaveShadowedData +
-                   ", createdAtInSec=" + createdAtInSec +
                    ", staticRow=" + staticRow +
                    ", columns=" + columns +
                    ", isBuilt=" + isBuilt +
                    '}';
         }
+
     }
 }

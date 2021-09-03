@@ -21,17 +21,14 @@ import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.*;
 import java.lang.management.ManagementFactory;
-import java.lang.management.RuntimeMXBean;
+import java.util.function.LongSupplier;
 
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.util.concurrent.Futures;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.apache.cassandra.concurrent.ScheduledExecutors;
-import org.apache.cassandra.concurrent.Stage;
-import org.apache.cassandra.concurrent.StageManager;
-import org.apache.cassandra.cql3.functions.UDAggregate;
-import org.apache.cassandra.cql3.functions.UDFunction;
+
 import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.marshal.UserType;
 import org.apache.cassandra.exceptions.AlreadyExistsException;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.gms.*;
@@ -39,11 +36,13 @@ import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.locator.InetAddressAndPort;
-import org.apache.cassandra.net.MessageOut;
+import org.apache.cassandra.net.Message;
 import org.apache.cassandra.net.MessagingService;
-import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.schema.Keyspaces.KeyspacesDiff;
 import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.utils.WrappedRunnable;
+
+import static org.apache.cassandra.concurrent.Stage.MIGRATION;
+import static org.apache.cassandra.net.Verb.SCHEMA_PUSH_REQ;
 
 public class MigrationManager
 {
@@ -51,7 +50,13 @@ public class MigrationManager
 
     public static final MigrationManager instance = new MigrationManager();
 
-    private static final RuntimeMXBean runtimeMXBean = ManagementFactory.getRuntimeMXBean();
+    private static LongSupplier getUptimeFn = () -> ManagementFactory.getRuntimeMXBean().getUptime();
+
+    @VisibleForTesting
+    public static void setUptimeFn(LongSupplier supplier)
+    {
+        getUptimeFn = supplier;
+    }
 
     private static final int MIGRATION_DELAY_IN_MS = 60000;
 
@@ -59,118 +64,12 @@ public class MigrationManager
 
     private MigrationManager() {}
 
-    public static void scheduleSchemaPull(InetAddressAndPort endpoint, EndpointState state)
+    private static boolean shouldPushSchemaTo(InetAddressAndPort endpoint)
     {
-        UUID schemaVersion = state.getSchemaVersion();
-        if (!endpoint.equals(FBUtilities.getBroadcastAddressAndPort()) && schemaVersion != null)
-            maybeScheduleSchemaPull(schemaVersion, endpoint);
-    }
-
-    /**
-     * If versions differ this node sends request with local migration list to the endpoint
-     * and expecting to receive a list of migrations to apply locally.
-     */
-    private static void maybeScheduleSchemaPull(final UUID theirVersion, final InetAddressAndPort endpoint)
-    {
-        if (Schema.instance.getVersion() == null)
-        {
-            logger.debug("Not pulling schema from {}, because local schama version is not known yet",
-                         endpoint);
-            return;
-        }
-        if (Schema.instance.isSameVersion(theirVersion))
-        {
-            logger.debug("Not pulling schema from {}, because schema versions match ({})",
-                         endpoint,
-                         Schema.schemaVersionToString(theirVersion));
-            return;
-        }
-        if (!shouldPullSchemaFrom(endpoint))
-        {
-            logger.debug("Not pulling schema from {}, because versions match ({}/{}), or shouldPullSchemaFrom returned false",
-                         endpoint, Schema.instance.getVersion(), theirVersion);
-            return;
-        }
-
-        if (Schema.instance.isEmpty() || runtimeMXBean.getUptime() < MIGRATION_DELAY_IN_MS)
-        {
-            // If we think we may be bootstrapping or have recently started, submit MigrationTask immediately
-            logger.debug("Immediately submitting migration task for {}, " +
-                         "schema versions: local={}, remote={}",
-                         endpoint,
-                         Schema.schemaVersionToString(Schema.instance.getVersion()),
-                         Schema.schemaVersionToString(theirVersion));
-            submitMigrationTask(endpoint);
-        }
-        else
-        {
-            // Include a delay to make sure we have a chance to apply any changes being
-            // pushed out simultaneously. See CASSANDRA-5025
-            Runnable runnable = () ->
-            {
-                // grab the latest version of the schema since it may have changed again since the initial scheduling
-                UUID epSchemaVersion = Gossiper.instance.getSchemaVersion(endpoint);
-                if (epSchemaVersion == null)
-                {
-                    logger.debug("epState vanished for {}, not submitting migration task", endpoint);
-                    return;
-                }
-                if (Schema.instance.isSameVersion(epSchemaVersion))
-                {
-                    logger.debug("Not submitting migration task for {} because our versions match ({})", endpoint, epSchemaVersion);
-                    return;
-                }
-                logger.debug("Submitting migration task for {}, schema version mismatch: local={}, remote={}",
-                             endpoint,
-                             Schema.schemaVersionToString(Schema.instance.getVersion()),
-                             Schema.schemaVersionToString(epSchemaVersion));
-                submitMigrationTask(endpoint);
-            };
-            ScheduledExecutors.nonPeriodicTasks.schedule(runnable, MIGRATION_DELAY_IN_MS, TimeUnit.MILLISECONDS);
-        }
-    }
-
-    private static Future<?> submitMigrationTask(InetAddressAndPort endpoint)
-    {
-        /*
-         * Do not de-ref the future because that causes distributed deadlock (CASSANDRA-3832) because we are
-         * running in the gossip stage.
-         */
-        return StageManager.getStage(Stage.MIGRATION).submit(new MigrationTask(endpoint));
-    }
-
-    static boolean shouldPullSchemaFrom(InetAddressAndPort endpoint)
-    {
-        /*
-         * Don't request schema from nodes with a differnt or unknonw major version (may have incompatible schema)
-         * Don't request schema from fat clients
-         */
-        return MessagingService.instance().knowsVersion(endpoint)
-                && MessagingService.instance().getRawVersion(endpoint) == MessagingService.current_version
-                && !Gossiper.instance.isGossipOnlyMember(endpoint);
-    }
-
-    public static boolean isReadyForBootstrap()
-    {
-        return MigrationTask.getInflightTasks().isEmpty();
-    }
-
-    public static void waitUntilReadyForBootstrap()
-    {
-        CountDownLatch completionLatch;
-        while ((completionLatch = MigrationTask.getInflightTasks().poll()) != null)
-        {
-            try
-            {
-                if (!completionLatch.await(MIGRATION_TASK_WAIT_IN_SECONDS, TimeUnit.SECONDS))
-                    logger.error("Migration task failed to complete");
-            }
-            catch (InterruptedException e)
-            {
-                Thread.currentThread().interrupt();
-                logger.error("Migration task was interrupted");
-            }
-        }
+        // only push schema to nodes with known and equal versions
+        return !endpoint.equals(FBUtilities.getBroadcastAddressAndPort())
+               && MessagingService.instance().versions.knows(endpoint)
+               && MessagingService.instance().versions.getRaw(endpoint) == MessagingService.current_version;
     }
 
     public static void announceNewKeyspace(KeyspaceMetadata ksm) throws ConfigurationException
@@ -194,37 +93,12 @@ public class MigrationManager
         announce(SchemaKeyspace.makeCreateKeyspaceMutation(ksm, timestamp), announceLocally);
     }
 
-    public static void announceNewTable(TableMetadata cfm) throws ConfigurationException
+    public static void announceNewTable(TableMetadata cfm)
     {
-        announceNewTable(cfm, false);
+        announceNewTable(cfm, true, FBUtilities.timestampMicros());
     }
 
-    public static void announceNewTable(TableMetadata cfm, boolean announceLocally)
-    {
-        announceNewTable(cfm, announceLocally, true);
-    }
-
-    /**
-     * Announces the table even if the definition is already know locally.
-     * This should generally be avoided but is used internally when we want to force the most up to date version of
-     * a system table schema (Note that we don't know if the schema we force _is_ the most recent version or not, we
-     * just rely on idempotency to basically ignore that announce if it's not. That's why we can't use announceUpdateColumnFamily,
-     * it would for instance delete new columns if this is not called with the most up-to-date version)
-     *
-     * Note that this is only safe for system tables where we know the id is fixed and will be the same whatever version
-     * of the definition is used.
-     */
-    public static void forceAnnounceNewTable(TableMetadata cfm)
-    {
-        announceNewTable(cfm, false, false, 0);
-    }
-
-    private static void announceNewTable(TableMetadata cfm, boolean announceLocally, boolean throwOnDuplicate)
-    {
-        announceNewTable(cfm, announceLocally, throwOnDuplicate, FBUtilities.timestampMicros());
-    }
-
-    private static void announceNewTable(TableMetadata cfm, boolean announceLocally, boolean throwOnDuplicate, long timestamp)
+    private static void announceNewTable(TableMetadata cfm, boolean throwOnDuplicate, long timestamp)
     {
         cfm.validate();
 
@@ -236,49 +110,10 @@ public class MigrationManager
             throw new AlreadyExistsException(cfm.keyspace, cfm.name);
 
         logger.info("Create new table: {}", cfm);
-        announce(SchemaKeyspace.makeCreateTableMutation(ksm, cfm, timestamp), announceLocally);
+        announce(SchemaKeyspace.makeCreateTableMutation(ksm, cfm, timestamp), false);
     }
 
-    public static void announceNewView(ViewMetadata view, boolean announceLocally) throws ConfigurationException
-    {
-        view.metadata.validate();
-
-        KeyspaceMetadata ksm = Schema.instance.getKeyspaceMetadata(view.keyspace);
-        if (ksm == null)
-            throw new ConfigurationException(String.format("Cannot add table '%s' to non existing keyspace '%s'.", view.name, view.keyspace));
-        else if (ksm.getTableOrViewNullable(view.name) != null)
-            throw new AlreadyExistsException(view.keyspace, view.name);
-
-        logger.info("Create new view: {}", view);
-        announce(SchemaKeyspace.makeCreateViewMutation(ksm, view, FBUtilities.timestampMicros()), announceLocally);
-    }
-
-    public static void announceNewType(UserType newType, boolean announceLocally)
-    {
-        KeyspaceMetadata ksm = Schema.instance.getKeyspaceMetadata(newType.keyspace);
-        announce(SchemaKeyspace.makeCreateTypeMutation(ksm, newType, FBUtilities.timestampMicros()), announceLocally);
-    }
-
-    public static void announceNewFunction(UDFunction udf, boolean announceLocally)
-    {
-        logger.info("Create scalar function '{}'", udf.name());
-        KeyspaceMetadata ksm = Schema.instance.getKeyspaceMetadata(udf.name().keyspace);
-        announce(SchemaKeyspace.makeCreateFunctionMutation(ksm, udf, FBUtilities.timestampMicros()), announceLocally);
-    }
-
-    public static void announceNewAggregate(UDAggregate udf, boolean announceLocally)
-    {
-        logger.info("Create aggregate function '{}'", udf.name());
-        KeyspaceMetadata ksm = Schema.instance.getKeyspaceMetadata(udf.name().keyspace);
-        announce(SchemaKeyspace.makeCreateAggregateMutation(ksm, udf, FBUtilities.timestampMicros()), announceLocally);
-    }
-
-    public static void announceKeyspaceUpdate(KeyspaceMetadata ksm) throws ConfigurationException
-    {
-        announceKeyspaceUpdate(ksm, false);
-    }
-
-    public static void announceKeyspaceUpdate(KeyspaceMetadata ksm, boolean announceLocally) throws ConfigurationException
+    static void announceKeyspaceUpdate(KeyspaceMetadata ksm)
     {
         ksm.validate();
 
@@ -287,20 +122,15 @@ public class MigrationManager
             throw new ConfigurationException(String.format("Cannot update non existing keyspace '%s'.", ksm.name));
 
         logger.info("Update Keyspace '{}' From {} To {}", ksm.name, oldKsm, ksm);
-        announce(SchemaKeyspace.makeCreateKeyspaceMutation(ksm.name, ksm.params, FBUtilities.timestampMicros()), announceLocally);
+        announce(SchemaKeyspace.makeCreateKeyspaceMutation(ksm.name, ksm.params, FBUtilities.timestampMicros()), false);
     }
 
-    public static void announceTableUpdate(TableMetadata tm) throws ConfigurationException
+    public static void announceTableUpdate(TableMetadata tm)
     {
         announceTableUpdate(tm, false);
     }
 
-    public static void announceTableUpdate(TableMetadata updated, boolean announceLocally) throws ConfigurationException
-    {
-        announceTableUpdate(updated, null, announceLocally);
-    }
-
-    public static void announceTableUpdate(TableMetadata updated, Collection<ViewMetadata> views, boolean announceLocally) throws ConfigurationException
+    public static void announceTableUpdate(TableMetadata updated, boolean announceLocally)
     {
         updated.validate();
 
@@ -309,69 +139,27 @@ public class MigrationManager
             throw new ConfigurationException(String.format("Cannot update non existing table '%s' in keyspace '%s'.", updated.name, updated.keyspace));
         KeyspaceMetadata ksm = Schema.instance.getKeyspaceMetadata(current.keyspace);
 
-        current.validateCompatibility(updated);
+        updated.validateCompatibility(current);
 
         long timestamp = FBUtilities.timestampMicros();
 
         logger.info("Update table '{}/{}' From {} To {}", current.keyspace, current.name, current, updated);
         Mutation.SimpleBuilder builder = SchemaKeyspace.makeUpdateTableMutation(ksm, current, updated, timestamp);
 
-        if (views != null)
-            views.forEach(view -> addViewUpdateToMutationBuilder(view, builder));
-
         announce(builder, announceLocally);
     }
 
-    public static void announceViewUpdate(ViewMetadata view, boolean announceLocally) throws ConfigurationException
-    {
-        KeyspaceMetadata ksm = Schema.instance.getKeyspaceMetadata(view.keyspace);
-        long timestamp = FBUtilities.timestampMicros();
-        Mutation.SimpleBuilder builder = SchemaKeyspace.makeCreateKeyspaceMutation(ksm.name, ksm.params, timestamp);
-        addViewUpdateToMutationBuilder(view, builder);
-        announce(builder, announceLocally);
-    }
-
-    private static void addViewUpdateToMutationBuilder(ViewMetadata view, Mutation.SimpleBuilder builder)
-    {
-        view.metadata.validate();
-
-        ViewMetadata oldView = Schema.instance.getView(view.keyspace, view.name);
-        if (oldView == null)
-            throw new ConfigurationException(String.format("Cannot update non existing materialized view '%s' in keyspace '%s'.", view.name, view.keyspace));
-
-        oldView.metadata.validateCompatibility(view.metadata);
-
-        logger.info("Update view '{}/{}' From {} To {}", view.keyspace, view.name, oldView, view);
-        SchemaKeyspace.makeUpdateViewMutation(builder, oldView, view);
-    }
-
-    public static void announceTypeUpdate(UserType updatedType, boolean announceLocally)
-    {
-        logger.info("Update type '{}.{}' to {}", updatedType.keyspace, updatedType.getNameAsString(), updatedType);
-        announceNewType(updatedType, announceLocally);
-    }
-
-    public static void announceKeyspaceDrop(String ksName) throws ConfigurationException
-    {
-        announceKeyspaceDrop(ksName, false);
-    }
-
-    public static void announceKeyspaceDrop(String ksName, boolean announceLocally) throws ConfigurationException
+    static void announceKeyspaceDrop(String ksName)
     {
         KeyspaceMetadata oldKsm = Schema.instance.getKeyspaceMetadata(ksName);
         if (oldKsm == null)
             throw new ConfigurationException(String.format("Cannot drop non existing keyspace '%s'.", ksName));
 
         logger.info("Drop Keyspace '{}'", oldKsm.name);
-        announce(SchemaKeyspace.makeDropKeyspaceMutation(oldKsm, FBUtilities.timestampMicros()), announceLocally);
+        announce(SchemaKeyspace.makeDropKeyspaceMutation(oldKsm, FBUtilities.timestampMicros()), false);
     }
 
-    public static void announceTableDrop(String ksName, String cfName) throws ConfigurationException
-    {
-        announceTableDrop(ksName, cfName, false);
-    }
-
-    public static void announceTableDrop(String ksName, String cfName, boolean announceLocally) throws ConfigurationException
+    public static void announceTableDrop(String ksName, String cfName, boolean announceLocally)
     {
         TableMetadata tm = Schema.instance.getTableMetadata(ksName, cfName);
         if (tm == null)
@@ -380,37 +168,6 @@ public class MigrationManager
 
         logger.info("Drop table '{}/{}'", tm.keyspace, tm.name);
         announce(SchemaKeyspace.makeDropTableMutation(ksm, tm, FBUtilities.timestampMicros()), announceLocally);
-    }
-
-    public static void announceViewDrop(String ksName, String viewName, boolean announceLocally) throws ConfigurationException
-    {
-        ViewMetadata view = Schema.instance.getView(ksName, viewName);
-        if (view == null)
-            throw new ConfigurationException(String.format("Cannot drop non existing materialized view '%s' in keyspace '%s'.", viewName, ksName));
-        KeyspaceMetadata ksm = Schema.instance.getKeyspaceMetadata(ksName);
-
-        logger.info("Drop table '{}/{}'", view.keyspace, view.name);
-        announce(SchemaKeyspace.makeDropViewMutation(ksm, view, FBUtilities.timestampMicros()), announceLocally);
-    }
-
-    public static void announceTypeDrop(UserType droppedType, boolean announceLocally)
-    {
-        KeyspaceMetadata ksm = Schema.instance.getKeyspaceMetadata(droppedType.keyspace);
-        announce(SchemaKeyspace.dropTypeFromSchemaMutation(ksm, droppedType, FBUtilities.timestampMicros()), announceLocally);
-    }
-
-    public static void announceFunctionDrop(UDFunction udf, boolean announceLocally)
-    {
-        logger.info("Drop scalar function overload '{}' args '{}'", udf.name(), udf.argTypes());
-        KeyspaceMetadata ksm = Schema.instance.getKeyspaceMetadata(udf.name().keyspace);
-        announce(SchemaKeyspace.makeDropFunctionMutation(ksm, udf, FBUtilities.timestampMicros()), announceLocally);
-    }
-
-    public static void announceAggregateDrop(UDAggregate udf, boolean announceLocally)
-    {
-        logger.info("Drop aggregate function overload '{}' args '{}'", udf.name(), udf.argTypes());
-        KeyspaceMetadata ksm = Schema.instance.getKeyspaceMetadata(udf.name().keyspace);
-        announce(SchemaKeyspace.makeDropAggregateMutation(ksm, udf, FBUtilities.timestampMicros()), announceLocally);
     }
 
     /**
@@ -424,50 +181,77 @@ public class MigrationManager
         if (announceLocally)
             Schema.instance.merge(mutations);
         else
-            FBUtilities.waitOnFuture(announce(mutations));
+            announce(mutations);
     }
 
-    private static void pushSchemaMutation(InetAddressAndPort endpoint, Collection<Mutation> schema)
+    public static void announce(Mutation change)
     {
-        MessageOut<Collection<Mutation>> msg = new MessageOut<>(MessagingService.Verb.DEFINITIONS_UPDATE,
-                                                                schema,
-                                                                MigrationsSerializer.instance);
-        MessagingService.instance().sendOneWay(msg, endpoint);
+        announce(Collections.singleton(change));
     }
 
-    // Returns a future on the local application of the schema
-    private static Future<?> announce(final Collection<Mutation> schema)
+    public static void announce(Collection<Mutation> schema)
     {
-        Future<?> f = StageManager.getStage(Stage.MIGRATION).submit(new WrappedRunnable()
-        {
-            protected void runMayThrow() throws ConfigurationException
-            {
-                Schema.instance.mergeAndAnnounceVersion(schema);
-            }
-        });
+        Future<?> f = announceWithoutPush(schema);
 
+        Set<InetAddressAndPort> schemaDestinationEndpoints = new HashSet<>();
+        Set<InetAddressAndPort> schemaEndpointsIgnored = new HashSet<>();
+        Message<Collection<Mutation>> message = Message.out(SCHEMA_PUSH_REQ, schema);
         for (InetAddressAndPort endpoint : Gossiper.instance.getLiveMembers())
         {
-            // only push schema to nodes with known and equal versions
-            if (!endpoint.equals(FBUtilities.getBroadcastAddressAndPort()) &&
-                    MessagingService.instance().knowsVersion(endpoint) &&
-                    MessagingService.instance().getRawVersion(endpoint) == MessagingService.current_version)
-                pushSchemaMutation(endpoint, schema);
+            if (shouldPushSchemaTo(endpoint))
+            {
+                MessagingService.instance().send(message, endpoint);
+                schemaDestinationEndpoints.add(endpoint);
+            }
+            else
+            {
+                schemaEndpointsIgnored.add(endpoint);
+            }
         }
 
-        return f;
+        SchemaAnnouncementDiagnostics.schemaMutationsAnnounced(schemaDestinationEndpoints, schemaEndpointsIgnored);
+        FBUtilities.waitOnFuture(f);
     }
 
-    /**
-     * Announce my version passively over gossip.
-     * Used to notify nodes as they arrive in the cluster.
-     *
-     * @param version The schema version to announce
-     */
-    static void passiveAnnounce(UUID version)
+    public static Future<?> announceWithoutPush(Collection<Mutation> schema)
     {
-        Gossiper.instance.addLocalApplicationState(ApplicationState.SCHEMA, StorageService.instance.valueFactory.schema(version));
-        logger.debug("Gossiping my schema version {}", version);
+        return MIGRATION.submit(() -> Schema.instance.mergeAndAnnounceVersion(schema));
+    }
+
+    public static KeyspacesDiff announce(SchemaTransformation transformation, boolean locally)
+    {
+        long now = FBUtilities.timestampMicros();
+
+        Future<Schema.TransformationResult> future =
+            MIGRATION.submit(() -> Schema.instance.transform(transformation, locally, now));
+
+        Schema.TransformationResult result = Futures.getUnchecked(future);
+        if (!result.success)
+            throw result.exception;
+
+        if (locally || result.diff.isEmpty())
+            return result.diff;
+
+        Set<InetAddressAndPort> schemaDestinationEndpoints = new HashSet<>();
+        Set<InetAddressAndPort> schemaEndpointsIgnored = new HashSet<>();
+        Message<Collection<Mutation>> message = Message.out(SCHEMA_PUSH_REQ, result.mutations);
+        for (InetAddressAndPort endpoint : Gossiper.instance.getLiveMembers())
+        {
+            if (shouldPushSchemaTo(endpoint))
+            {
+                MessagingService.instance().send(message, endpoint);
+                schemaDestinationEndpoints.add(endpoint);
+            }
+            else
+            {
+                schemaEndpointsIgnored.add(endpoint);
+            }
+        }
+
+        SchemaAnnouncementDiagnostics.schemaTransformationAnnounced(schemaDestinationEndpoints, schemaEndpointsIgnored,
+                                                                    transformation);
+
+        return result.diff;
     }
 
     /**
@@ -479,6 +263,8 @@ public class MigrationManager
         logger.info("Starting local schema reset...");
 
         logger.debug("Truncating schema tables...");
+
+        SchemaMigrationDiagnostics.resetLocalSchema();
 
         SchemaKeyspace.truncate();
 
@@ -492,15 +278,58 @@ public class MigrationManager
         // force migration if there are nodes around
         for (InetAddressAndPort node : liveEndpoints)
         {
-            if (shouldPullSchemaFrom(node))
-            {
-                logger.debug("Requesting schema from {}", node);
-                FBUtilities.waitOnFuture(submitMigrationTask(node));
-                break;
-            }
+            EndpointState state = Gossiper.instance.getEndpointStateForEndpoint(node);
+            Future<Void> pull = MigrationCoordinator.instance.reportEndpointVersion(node, state);
+            if (pull != null)
+                FBUtilities.waitOnFuture(pull);
         }
 
         logger.info("Local schema reset is complete.");
+    }
+
+    /**
+     * We have a set of non-local, distributed system keyspaces, e.g. system_traces, system_auth, etc.
+     * (see {@link SchemaConstants#REPLICATED_SYSTEM_KEYSPACE_NAMES}), that need to be created on cluster initialisation,
+     * and later evolved on major upgrades (sometimes minor too). This method compares the current known definitions
+     * of the tables (if the keyspace exists) to the expected, most modern ones expected by the running version of C*;
+     * if any changes have been detected, a schema Mutation will be created which, when applied, should make
+     * cluster's view of that keyspace aligned with the expected modern definition.
+     *
+     * @param keyspace   the expected modern definition of the keyspace
+     * @param generation timestamp to use for the table changes in the schema mutation
+     *
+     * @return empty Optional if the current definition is up to date, or an Optional with the Mutation that would
+     *         bring the schema in line with the expected definition.
+     */
+    public static Optional<Mutation> evolveSystemKeyspace(KeyspaceMetadata keyspace, long generation)
+    {
+        Mutation.SimpleBuilder builder = null;
+
+        KeyspaceMetadata definedKeyspace = Schema.instance.getKeyspaceMetadata(keyspace.name);
+        Tables definedTables = null == definedKeyspace ? Tables.none() : definedKeyspace.tables;
+
+        for (TableMetadata table : keyspace.tables)
+        {
+            if (table.equals(definedTables.getNullable(table.name)))
+                continue;
+
+            if (null == builder)
+            {
+                // for the keyspace definition itself (name, replication, durability) always use generation 0;
+                // this ensures that any changes made to replication by the user will never be overwritten.
+                builder = SchemaKeyspace.makeCreateKeyspaceMutation(keyspace.name, keyspace.params, 0);
+
+                // now set the timestamp to generation, so the tables have the expected timestamp
+                builder.timestamp(generation);
+            }
+
+            // for table definitions always use the provided generation; these tables, unlike their containing
+            // keyspaces, are *NOT* meant to be altered by the user; if their definitions need to change,
+            // the schema must be updated in code, and the appropriate generation must be bumped.
+            SchemaKeyspace.addTableToSchemaMutation(table, true, builder);
+        }
+
+        return builder == null ? Optional.empty() : Optional.of(builder.build());
     }
 
     public static class MigrationsSerializer implements IVersionedSerializer<Collection<Mutation>>
@@ -529,7 +358,7 @@ public class MigrationManager
         {
             int size = TypeSizes.sizeof(schema.size());
             for (Mutation mutation : schema)
-                size += Mutation.serializer.serializedSize(mutation, version);
+                size += mutation.serializedSize(version);
             return size;
         }
     }
