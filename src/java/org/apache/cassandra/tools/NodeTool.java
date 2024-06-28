@@ -22,15 +22,16 @@ import static com.google.common.collect.Iterables.toArray;
 import static com.google.common.collect.Lists.newArrayList;
 import static java.lang.Integer.parseInt;
 import static java.lang.String.format;
+import static org.apache.cassandra.io.util.File.WriteMode.APPEND;
 import static org.apache.commons.lang3.ArrayUtils.EMPTY_STRING_ARRAY;
 import static org.apache.commons.lang3.StringUtils.EMPTY;
 import static org.apache.commons.lang3.StringUtils.isEmpty;
 import static org.apache.commons.lang3.StringUtils.isNotEmpty;
 
 import java.io.Console;
-import java.io.File;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.io.util.FileWriter;
 import java.io.FileNotFoundException;
-import java.io.FileWriter;
 import java.io.IOError;
 import java.io.IOException;
 import java.net.UnknownHostException;
@@ -44,13 +45,14 @@ import java.util.Map.Entry;
 import java.util.Scanner;
 import java.util.SortedMap;
 
+import javax.management.InstanceNotFoundException;
+
 import com.google.common.base.Joiner;
 import com.google.common.base.Throwables;
 
 import org.apache.cassandra.locator.EndpointSnitchInfoMBean;
 import org.apache.cassandra.tools.nodetool.*;
 import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.tools.nodetool.Sjk;
 
 import com.google.common.collect.Maps;
 
@@ -92,132 +94,147 @@ public class NodeTool
     public int execute(String... args)
     {
         List<Class<? extends NodeToolCmdRunnable>> commands = newArrayList(
+                AbortBootstrap.class,
+                Assassinate.class,
                 CassHelp.class,
-                Info.class,
-                Ring.class,
-                NetStats.class,
-                CfStats.class,
-                TableStats.class,
-                CfHistograms.class,
-                TableHistograms.class,
+                CIDRFilteringStats.class,
                 Cleanup.class,
                 ClearSnapshot.class,
                 ClientStats.class,
                 Compact.class,
-                Scrub.class,
-                Verify.class,
-                Flush.class,
-                UpgradeSSTable.class,
-                GarbageCollect.class,
-                DisableAutoCompaction.class,
-                EnableAutoCompaction.class,
-                CompactionStats.class,
                 CompactionHistory.class,
+                CompactionStats.class,
+                DataPaths.class,
                 Decommission.class,
                 DescribeCluster.class,
+                DescribeRing.class,
+                DisableAuditLog.class,
+                DisableAutoCompaction.class,
+                DisableBackup.class,
                 DisableBinary.class,
-                EnableBinary.class,
-                EnableGossip.class,
-                DisableGossip.class,
-                EnableHandoff.class,
-                EnableFullQueryLog.class,
                 DisableFullQueryLog.class,
+                DisableGossip.class,
+                DisableHandoff.class,
+                DisableHintsForDC.class,
+                DisableOldProtocolVersions.class,
+                Drain.class,
+                DropCIDRGroup.class,
+                EnableAuditLog.class,
+                EnableAutoCompaction.class,
+                EnableBackup.class,
+                EnableBinary.class,
+                EnableFullQueryLog.class,
+                EnableGossip.class,
+                EnableHandoff.class,
+                EnableHintsForDC.class,
+                EnableOldProtocolVersions.class,
+                FailureDetectorInfo.class,
+                Flush.class,
+                GarbageCollect.class,
                 GcStats.class,
                 GetAuditLog.class,
+                GetAuthCacheConfig.class,
                 GetBatchlogReplayTrottle.class,
+                GetCIDRGroupsOfIP.class,
+                GetColumnIndexSize.class,
                 GetCompactionThreshold.class,
                 GetCompactionThroughput.class,
                 GetConcurrency.class,
-                GetFullQueryLog.class,
-                GetTimeout.class,
-                GetStreamThroughput.class,
-                GetTraceProbability.class,
-                GetInterDCStreamThroughput.class,
+                GetConcurrentCompactors.class,
+                GetConcurrentViewBuilders.class,
+                GetDefaultKeyspaceRF.class,
                 GetEndpoints.class,
-                GetSeeds.class,
-                GetSSTables.class,
+                GetFullQueryLog.class,
+                GetInterDCStreamThroughput.class,
+                GetLoggingLevels.class,
                 GetMaxHintWindow.class,
+                GetSSTables.class,
+                GetSeeds.class,
+                GetSnapshotThrottle.class,
+                GetStreamThroughput.class,
+                GetTimeout.class,
+                GetTraceProbability.class,
                 GossipInfo.class,
                 Import.class,
+                Info.class,
+                InvalidateCIDRPermissionsCache.class,
                 InvalidateCounterCache.class,
                 InvalidateCredentialsCache.class,
                 InvalidateJmxPermissionsCache.class,
+                ReloadCIDRGroupsCache.class,
                 InvalidateKeyCache.class,
                 InvalidateNetworkPermissionsCache.class,
                 InvalidatePermissionsCache.class,
                 InvalidateRolesCache.class,
                 InvalidateRowCache.class,
                 Join.class,
+                ListCIDRGroups.class,
+                ListPendingHints.class,
+                ListSnapshots.class,
                 Move.class,
+                NetStats.class,
                 PauseHandoff.class,
-                ResumeHandoff.class,
                 ProfileLoad.class,
                 ProxyHistograms.class,
+                RangeKeySample.class,
                 Rebuild.class,
+                RebuildIndex.class,
+                RecompressSSTables.class,
                 Refresh.class,
-                RemoveNode.class,
-                Assassinate.class,
+                RefreshSizeEstimates.class,
+                ReloadLocalSchema.class,
                 ReloadSeeds.class,
-                ResetFullQueryLog.class,
+                ReloadSslCertificates.class,
+                ReloadTriggers.class,
+                RelocateSSTables.class,
+                RemoveNode.class,
                 Repair.class,
                 ReplayBatchlog.class,
-                SetCacheCapacity.class,
-                SetConcurrency.class,
-                SetHintedHandoffThrottleInKB.class,
+                ResetFullQueryLog.class,
+                ResetLocalSchema.class,
+                ResumeHandoff.class,
+                Ring.class,
+                Scrub.class,
+                SetAuthCacheConfig.class,
                 SetBatchlogReplayThrottle.class,
+                SetCacheCapacity.class,
+                SetCacheKeysToSave.class,
+                SetColumnIndexSize.class,
                 SetCompactionThreshold.class,
                 SetCompactionThroughput.class,
-                GetConcurrentCompactors.class,
-                SetConcurrentCompactors.class,
-                GetConcurrentViewBuilders.class,
-                SetConcurrentViewBuilders.class,
                 SetConcurrency.class,
-                SetTimeout.class,
-                SetStreamThroughput.class,
+                SetConcurrentCompactors.class,
+                SetConcurrentViewBuilders.class,
+                SetDefaultKeyspaceRF.class,
+                SetHintedHandoffThrottleInKB.class,
                 SetInterDCStreamThroughput.class,
-                SetTraceProbability.class,
+                SetLoggingLevel.class,
                 SetMaxHintWindow.class,
-                Snapshot.class,
-                ListSnapshots.class,
-                GetSnapshotThrottle.class,
                 SetSnapshotThrottle.class,
+                SetStreamThroughput.class,
+                SetTimeout.class,
+                SetTraceProbability.class,
+                Sjk.class,
+                Snapshot.class,
                 Status.class,
+                StatusAutoCompaction.class,
+                StatusBackup.class,
                 StatusBinary.class,
                 StatusGossip.class,
-                StatusBackup.class,
                 StatusHandoff.class,
-                StatusAutoCompaction.class,
                 Stop.class,
                 StopDaemon.class,
-                Version.class,
-                DescribeRing.class,
-                RebuildIndex.class,
-                RangeKeySample.class,
-                EnableBackup.class,
-                DisableBackup.class,
-                ResetLocalSchema.class,
-                ReloadLocalSchema.class,
-                ReloadTriggers.class,
-                SetCacheKeysToSave.class,
-                DisableHandoff.class,
-                Drain.class,
-                TruncateHints.class,
-                TpStats.class,
+                TableHistograms.class,
+                TableStats.class,
                 TopPartitions.class,
-                SetLoggingLevel.class,
-                GetLoggingLevels.class,
-                Sjk.class,
-                DisableHintsForDC.class,
-                EnableHintsForDC.class,
-                FailureDetectorInfo.class,
-                RefreshSizeEstimates.class,
-                RelocateSSTables.class,
+                TpStats.class,
+                TruncateHints.class,
+                UpdateCIDRGroup.class,
+                UpgradeSSTable.class,
+                Verify.class,
+                Version.class,
                 ViewBuildStatus.class,
-                ReloadSslCertificates.class,
-                EnableAuditLog.class,
-                DisableAuditLog.class,
-                EnableOldProtocolVersions.class,
-                DisableOldProtocolVersions.class
+                ForceCompact.class
         );
 
         Cli.CliBuilder<NodeToolCmdRunnable> builder = Cli.builder("nodetool");
@@ -240,6 +257,15 @@ public class NodeTool
                .withCommand(RepairAdmin.CleanupDataCmd.class)
                .withCommand(RepairAdmin.SummarizePendingCmd.class)
                .withCommand(RepairAdmin.SummarizeRepairedCmd.class);
+
+        builder.withGroup("cms")
+               .withDescription("Manage cluster metadata")
+               .withDefaultCommand(CMSAdmin.DescribeCMS.class)
+               .withCommand(CMSAdmin.DescribeCMS.class)
+               .withCommand(CMSAdmin.InitializeCMS.class)
+               .withCommand(CMSAdmin.ReconfigureCMS.class)
+               .withCommand(CMSAdmin.Snapshot.class)
+               .withCommand(CMSAdmin.Unregister.class);
 
         Cli<NodeToolCmdRunnable> parser = builder.build();
 
@@ -279,7 +305,7 @@ public class NodeTool
         String cmdLine = Joiner.on(" ").skipNulls().join(args);
         cmdLine = cmdLine.replaceFirst("(?<=(-pw|--password))\\s+\\S+", " <hidden>");
 
-        try (FileWriter writer = new FileWriter(new File(FBUtilities.getToolsOutputDirectory(), HISTORYFILE), true))
+        try (FileWriter writer = new File(FBUtilities.getToolsOutputDirectory(), HISTORYFILE).newWriter(APPEND))
         {
             SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss,SSS");
             writer.append(sdf.format(new Date())).append(": ").append(cmdLine).append(System.lineSeparator());
@@ -298,6 +324,10 @@ public class NodeTool
 
     protected void err(Throwable e)
     {
+        // CASSANDRA-11537: friendly error message when server is not ready
+        if (e instanceof InstanceNotFoundException)
+            throw new IllegalArgumentException("Server is not initialized yet, cannot run nodetool.");
+
         output.err.println("error: " + e.getMessage());
         output.err.println("-- StackTrace --");
         output.err.println(getStackTraceAsString(e));
@@ -334,7 +364,7 @@ public class NodeTool
         @Option(type = OptionType.GLOBAL, name = {"-pwf", "--password-file"}, description = "Path to the JMX password file")
         private String passwordFilePath = EMPTY;
 
-		@Option(type = OptionType.GLOBAL, name = { "-pp", "--print-port"}, description = "Operate in 4.0 mode with hosts disambiguated by port number", arity = 0)
+        @Option(type = OptionType.GLOBAL, name = { "-pp", "--print-port"}, description = "Operate in 4.0 mode with hosts disambiguated by port number", arity = 0)
         protected boolean printPort = false;
 
         private INodeProbeFactory nodeProbeFactory;
@@ -375,7 +405,7 @@ public class NodeTool
             String password = EMPTY;
 
             File passwordFile = new File(passwordFilePath);
-            try (Scanner scanner = new Scanner(passwordFile).useDelimiter("\\s+"))
+            try (Scanner scanner = new Scanner(passwordFile.toJavaIOFile()).useDelimiter("\\s+"))
             {
                 while (scanner.hasNextLine())
                 {
@@ -390,7 +420,8 @@ public class NodeTool
                     }
                     scanner.nextLine();
                 }
-            } catch (FileNotFoundException e)
+            }
+            catch (FileNotFoundException e)
             {
                 throw new RuntimeException(e);
             }
@@ -474,6 +505,11 @@ public class NodeTool
         protected String[] parseOptionalTables(List<String> cmdArgs)
         {
             return cmdArgs.size() <= 1 ? EMPTY_STRING_ARRAY : toArray(cmdArgs.subList(1, cmdArgs.size()), String.class);
+        }
+
+        protected String[] parsePartitionKeys(List<String> cmdArgs)
+        {
+            return cmdArgs.size() <= 2 ? EMPTY_STRING_ARRAY : toArray(cmdArgs.subList(2, cmdArgs.size()), String.class);
         }
     }
 

@@ -26,37 +26,86 @@ import org.apache.cassandra.auth.IResource;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLStatement;
 import org.apache.cassandra.cql3.QueryOptions;
+import org.apache.cassandra.db.compaction.TimeWindowCompactionStrategy;
+import org.apache.cassandra.db.guardrails.Guardrails;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.schema.*;
 import org.apache.cassandra.schema.Keyspaces.KeyspacesDiff;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.ClientWarn;
 import org.apache.cassandra.service.QueryState;
+import org.apache.cassandra.tcm.ClusterMetadata;
+import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.transport.Event.SchemaChange;
 import org.apache.cassandra.transport.messages.ResultMessage;
 
-abstract class AlterSchemaStatement implements CQLStatement, SchemaTransformation
+abstract public class AlterSchemaStatement implements CQLStatement.SingleKeyspaceCqlStatement, SchemaTransformation
 {
     protected final String keyspaceName; // name of the keyspace affected by the statement
+    protected ClientState state;
+    // TODO: not sure if this is going to stay the same, or will be replaced by more efficient serialization/sanitation means
+    // or just `toString` for every statement
+    private String cql;
 
     protected AlterSchemaStatement(String keyspaceName)
     {
         this.keyspaceName = keyspaceName;
     }
 
-    public final void validate(ClientState state)
+    public void setCql(String cql)
     {
-        // no-op; validation is performed while executing the statement, in apply()
+        this.cql = cql;
     }
 
-    public ResultMessage execute(QueryState state, QueryOptions options, long queryStartNanoTime)
+    @Override
+    public String cql()
     {
-        return execute(state, false);
+        assert cql != null;
+        return cql;
+    }
+
+    @Override
+    public void enterExecution()
+    {
+        ClientWarn.instance.pauseCapture();
+        ClientState localState = state;
+        if (localState != null)
+            localState.pauseGuardrails();
+    }
+
+    @Override
+    public void exitExecution()
+    {
+        ClientWarn.instance.resumeCapture();
+        ClientState localState = state;
+        if (localState != null)
+            localState.resumeGuardrails();
+    }
+
+    // TODO: validation should be performed during application
+    public void validate(ClientState state)
+    {
+        // validation is performed while executing the statement, in apply()
+
+        // Cache our ClientState for use by guardrails
+        this.state = state;
+    }
+
+    @Override
+    public ResultMessage execute(QueryState state, QueryOptions options, Dispatcher.RequestTime requestTime)
+    {
+        return execute(state);
+    }
+
+    @Override
+    public String keyspace()
+    {
+        return keyspaceName;
     }
 
     public ResultMessage executeLocally(QueryState state, QueryOptions options)
     {
-        return execute(state, true);
+        return execute(state);
     }
 
     /**
@@ -88,7 +137,7 @@ abstract class AlterSchemaStatement implements CQLStatement, SchemaTransformatio
         return ImmutableSet.of();
     }
 
-    public ResultMessage execute(QueryState state, boolean locally)
+    public ResultMessage execute(QueryState state)
     {
         if (SchemaConstants.isLocalSystemKeyspace(keyspaceName))
             throw ire("System keyspace '%s' is not user-modifiable", keyspaceName);
@@ -98,9 +147,21 @@ abstract class AlterSchemaStatement implements CQLStatement, SchemaTransformatio
             throw ire("Virtual keyspace '%s' is not user-modifiable", keyspaceName);
 
         validateKeyspaceName();
+        // Perform a 'dry-run' attempt to apply the transformation locally before submitting to the CMS. This can save a
+        // round trip to the CMS for things syntax errors, but also fail fast for things like configuration errors.
+        // Such failures may be dependent on the specific node's config (for things like guardrails/memtable
+        // config/etc), but executing a schema change which has already been committed by the CMS should always succeed
+        // or else the node cannot make progress on any subsequent metadata changes. For this reason, validation errors
+        // during execution are trapped and the node will fall back to safe default config wherever possible. Attempting
+        // to apply the SchemaTransformation at this point will catch any such error which occurs locally before
+        // submission to the CMS, but it can't guarantee that the statement can be applied as-is on every node in the
+        // cluster, as config can be heterogenous falling back to safe defaults may occur on some nodes.
+        ClusterMetadata metadata = ClusterMetadata.current();
+        apply(metadata);
 
-        KeyspacesDiff diff = MigrationManager.announce(this, locally);
+        ClusterMetadata result = Schema.instance.submit(this);
 
+        KeyspacesDiff diff = Keyspaces.diff(metadata.schema.getKeyspaces(), result.schema.getKeyspaces());
         clientWarnings(diff).forEach(ClientWarn.instance::warn);
 
         if (diff.isEmpty())
@@ -130,6 +191,14 @@ abstract class AlterSchemaStatement implements CQLStatement, SchemaTransformatio
         }
     }
 
+    protected void validateDefaultTimeToLive(TableParams params)
+    {
+        if (params.defaultTimeToLive == 0
+            && !SchemaConstants.isSystemKeyspace(keyspaceName)
+            && TimeWindowCompactionStrategy.class.isAssignableFrom(params.compaction.klass()))
+            Guardrails.zeroTTLOnTWCSEnabled.ensureEnabled(state);
+    }
+
     private void grantPermissionsOnResource(IResource resource, AuthenticatedUser user)
     {
         try
@@ -149,5 +218,13 @@ abstract class AlterSchemaStatement implements CQLStatement, SchemaTransformatio
     static InvalidRequestException ire(String format, Object... args)
     {
         return new InvalidRequestException(String.format(format, args));
+    }
+
+    public String toString()
+    {
+        return "AlterSchemaStatement{" +
+               "keyspaceName='" + keyspaceName + '\'' +
+               ", cql='" + cql() + '\'' +
+               '}';
     }
 }

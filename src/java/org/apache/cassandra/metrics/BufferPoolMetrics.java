@@ -25,11 +25,15 @@ import static org.apache.cassandra.metrics.CassandraMetricsRegistry.Metrics;
 
 public class BufferPoolMetrics
 {
+    public static final String TYPE_NAME = "BufferPool";
     /** Total number of hits */
     public final Meter hits;
 
     /** Total number of misses */
     public final Meter misses;
+
+    /** Total threshold for a certain type of buffer pool*/
+    public final Gauge<Long> capacity;
 
     /** Total size of buffer pools, in bytes, including overflow allocation */
     public final Gauge<Long> size;
@@ -46,11 +50,13 @@ public class BufferPoolMetrics
 
     public BufferPoolMetrics(String scope, BufferPool bufferPool)
     {
-        MetricNameFactory factory = new DefaultNameFactory("BufferPool", scope);
+        MetricNameFactory factory = new DefaultNameFactory(TYPE_NAME, scope);
 
         hits = Metrics.meter(factory.createMetricName("Hits"));
 
         misses = Metrics.meter(factory.createMetricName("Misses"));
+
+        capacity = Metrics.register(factory.createMetricName("Capacity"), bufferPool::memoryUsageThreshold);
 
         overflowSize = Metrics.register(factory.createMetricName("OverflowSize"), bufferPool::overflowMemoryInBytes);
 
@@ -59,13 +65,4 @@ public class BufferPoolMetrics
         size = Metrics.register(factory.createMetricName("Size"), bufferPool::sizeInBytes);
     }
 
-    /**
-     * used to register alias for 3.0/3.11 compatibility
-     */
-    public void register3xAlias()
-    {
-        MetricNameFactory legacyFactory = new DefaultNameFactory("BufferPool");
-        Metrics.registerMBean(misses, legacyFactory.createMetricName("Misses").getMBeanName());
-        Metrics.registerMBean(size, legacyFactory.createMetricName("Size").getMBeanName());
-    }
 }

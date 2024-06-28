@@ -19,12 +19,11 @@ package org.apache.cassandra.exceptions;
 
 import java.io.IOException;
 
-import com.google.common.primitives.Ints;
-
 import org.apache.cassandra.db.filter.TombstoneOverwhelmingException;
 import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.tcm.NotCMSException;
 import org.apache.cassandra.utils.vint.VIntCoding;
 
 import static java.lang.Math.max;
@@ -36,8 +35,15 @@ public enum RequestFailureReason
     READ_TOO_MANY_TOMBSTONES (1),
     TIMEOUT                  (2),
     INCOMPATIBLE_SCHEMA      (3),
-    READ_TOO_LARGE           (4);
-    
+    READ_SIZE                (4),
+    NODE_DOWN                (5),
+    INDEX_NOT_AVAILABLE      (6),
+    NOT_CMS                  (7),
+    INVALID_ROUTING          (8),
+    COORDINATOR_BEHIND       (9),
+    READ_TOO_MANY_INDEXES    (10),
+    ;
+
     public static final Serializer serializer = new Serializer();
 
     public final int code;
@@ -86,6 +92,15 @@ public enum RequestFailureReason
         if (t instanceof IncompatibleSchemaException)
             return INCOMPATIBLE_SCHEMA;
 
+        if (t instanceof NotCMSException)
+            return NOT_CMS;
+
+        if (t instanceof InvalidRoutingException)
+            return INVALID_ROUTING;
+
+        if (t instanceof CoordinatorBehindException)
+            return COORDINATOR_BEHIND;
+
         return UNKNOWN;
     }
 
@@ -97,20 +112,20 @@ public enum RequestFailureReason
 
         public void serialize(RequestFailureReason reason, DataOutputPlus out, int version) throws IOException
         {
-            if (version < VERSION_40)
-                out.writeShort(reason.code);
-            else
-                out.writeUnsignedVInt(reason.code);
+            assert version >= VERSION_40;
+            out.writeUnsignedVInt32(reason.code);
         }
 
         public RequestFailureReason deserialize(DataInputPlus in, int version) throws IOException
         {
-            return fromCode(version < VERSION_40 ? in.readUnsignedShort() : Ints.checkedCast(in.readUnsignedVInt()));
+            assert version >= VERSION_40;
+            return fromCode(in.readUnsignedVInt32());
         }
 
         public long serializedSize(RequestFailureReason reason, int version)
         {
-            return version < VERSION_40 ? 2 : VIntCoding.computeVIntSize(reason.code);
+            assert version >= VERSION_40;
+            return VIntCoding.computeVIntSize(reason.code);
         }
     }
 }

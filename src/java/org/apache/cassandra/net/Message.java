@@ -21,15 +21,18 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Collections;
 import java.util.EnumMap;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-
+import java.util.function.Supplier;
 import javax.annotation.Nullable;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.primitives.Ints;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.exceptions.RequestFailureReason;
@@ -39,23 +42,27 @@ import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.tcm.ClusterMetadata;
+import org.apache.cassandra.tcm.Epoch;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.tracing.Tracing.TraceType;
-import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.utils.MonotonicClockTranslation;
+import org.apache.cassandra.utils.NoSpamLogger;
+import org.apache.cassandra.utils.TimeUUID;
 
 import static java.util.concurrent.TimeUnit.MINUTES;
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static org.apache.cassandra.db.TypeSizes.sizeof;
 import static org.apache.cassandra.db.TypeSizes.sizeofUnsignedVInt;
-import static org.apache.cassandra.locator.InetAddressAndPort.Serializer.inetAddressAndPortSerializer;
-import static org.apache.cassandra.net.MessagingService.VERSION_3014;
-import static org.apache.cassandra.net.MessagingService.VERSION_30;
 import static org.apache.cassandra.net.MessagingService.VERSION_40;
-import static org.apache.cassandra.net.MessagingService.instance;
-import static org.apache.cassandra.utils.MonotonicClock.approxTime;
+import static org.apache.cassandra.net.MessagingService.VERSION_50;
+import static org.apache.cassandra.net.MessagingService.VERSION_51;
+import static org.apache.cassandra.utils.FBUtilities.getBroadcastAddressAndPort;
+import static org.apache.cassandra.utils.MonotonicClock.Global.approxTime;
 import static org.apache.cassandra.utils.vint.VIntCoding.computeUnsignedVIntSize;
 import static org.apache.cassandra.utils.vint.VIntCoding.getUnsignedVInt;
+import static org.apache.cassandra.utils.vint.VIntCoding.getUnsignedVInt32;
 import static org.apache.cassandra.utils.vint.VIntCoding.skipUnsignedVInt;
 
 /**
@@ -66,13 +73,21 @@ import static org.apache.cassandra.utils.vint.VIntCoding.skipUnsignedVInt;
  */
 public class Message<T>
 {
+    private static final Logger logger = LoggerFactory.getLogger(Message.class);
+    private static final NoSpamLogger noSpam1m = NoSpamLogger.getLogger(logger, 1, TimeUnit.MINUTES);
+
+    private static final Supplier<Epoch> epochSupplier = () -> ClusterMetadata.current().epoch;
+
     public final Header header;
     public final T payload;
 
-    private Message(Header header, T payload)
+    private final IVersionedAsymmetricSerializer<T, ?> payloadSerializer;
+
+    Message(Header header, T payload)
     {
         this.header = header;
         this.payload = payload;
+        this.payloadSerializer = verb().serializer();
     }
 
     /** Sender of the message. */
@@ -84,7 +99,7 @@ public class Message<T>
     /** Whether the message has crossed the node boundary, that is whether it originated from another node. */
     public boolean isCrossNode()
     {
-        return !from().equals(FBUtilities.getBroadcastAddressAndPort());
+        return !from().equals(getBroadcastAddressAndPort());
     }
 
     /**
@@ -96,12 +111,17 @@ public class Message<T>
         return header.id;
     }
 
+    public Epoch epoch()
+    {
+        return header.epoch;
+    }
+
     public Verb verb()
     {
         return header.verb;
     }
 
-    boolean isFailureResponse()
+    public boolean isFailureResponse()
     {
         return verb() == Verb.FAILURE_RSP;
     }
@@ -163,7 +183,7 @@ public class Message<T>
     }
 
     @Nullable
-    public UUID traceSession()
+    public TimeUUID traceSession()
     {
         return header.traceSession();
     }
@@ -189,14 +209,28 @@ public class Message<T>
      */
     public static <T> Message<T> out(Verb verb, T payload)
     {
-        assert !verb.isResponse();
+        assert !verb.isResponse() : verb;
 
         return outWithParam(nextId(), verb, payload, null, null);
+    }
+
+    public static <T> Message<T> synthetic(InetAddressAndPort from, Verb verb, T payload)
+    {
+        return new Message<>(new Header(-1, epochSupplier.get(), verb, from, -1, -1, 0, NO_PARAMS), payload);
     }
 
     public static <T> Message<T> out(Verb verb, T payload, long expiresAtNanos)
     {
         return outWithParam(nextId(), verb, expiresAtNanos, payload, 0, null, null);
+    }
+
+    public static <T> Message<T> out(Verb verb, T payload, boolean isUrgent)
+    {
+        assert !verb.isResponse();
+        if (isUrgent)
+            return outWithFlag(verb, payload,  MessageFlag.URGENT);
+        else
+            return out(verb, payload);
     }
 
     public static <T> Message<T> outWithFlag(Verb verb, T payload, MessageFlag flag)
@@ -211,6 +245,25 @@ public class Message<T>
         return outWithParam(nextId(), verb, 0, payload, flag2.addTo(flag1.addTo(0)), null, null);
     }
 
+    public static <T> Message<T> outWithFlags(Verb verb, T payload, Dispatcher.RequestTime requestTime, List<MessageFlag> flags)
+    {
+        assert !verb.isResponse();
+        int encodedFlags = 0;
+        for (MessageFlag flag : flags)
+            encodedFlags = flag.addTo(encodedFlags);
+
+        return new Message<T>(new Header(nextId(),
+                                         epochSupplier.get(),
+                                         verb,
+                                         getBroadcastAddressAndPort(),
+                                         requestTime.startedAtNanos(),
+                                         requestTime.computeDeadline(verb.expiresAfterNanos()),
+                                         encodedFlags,
+                                         buildParams(null, null)),
+                              payload);
+    }
+
+    @VisibleForTesting
     static <T> Message<T> outWithParam(long id, Verb verb, T payload, ParamType paramType, Object paramValue)
     {
         return outWithParam(id, verb, 0, payload, paramType, paramValue);
@@ -223,15 +276,19 @@ public class Message<T>
 
     private static <T> Message<T> outWithParam(long id, Verb verb, long expiresAtNanos, T payload, int flags, ParamType paramType, Object paramValue)
     {
+        return withParam(getBroadcastAddressAndPort(), id, verb, expiresAtNanos, payload, flags, paramType, paramValue);
+    }
+
+    private static <T> Message<T> withParam(InetAddressAndPort from, long id, Verb verb, long expiresAtNanos, T payload, int flags, ParamType paramType, Object paramValue)
+    {
         if (payload == null)
             throw new IllegalArgumentException();
 
-        InetAddressAndPort from = FBUtilities.getBroadcastAddressAndPort();
         long createdAtNanos = approxTime.now();
         if (expiresAtNanos == 0)
             expiresAtNanos = verb.expiresAtNanos(createdAtNanos);
 
-        return new Message<>(new Header(id, verb, from, createdAtNanos, expiresAtNanos, flags, buildParams(paramType, paramValue)), payload);
+        return new Message<>(new Header(id, epochSupplier.get(), verb, from, createdAtNanos, expiresAtNanos, flags, buildParams(paramType, paramValue)), payload);
     }
 
     public static <T> Message<T> internalResponse(Verb verb, T payload)
@@ -240,10 +297,52 @@ public class Message<T>
         return outWithParam(0, verb, payload, null, null);
     }
 
+    /**
+     * Used by the {@code MultiRangeReadCommand} to split multi-range responses from a replica
+     * into single-range responses.
+     */
+    public static <T> Message<T> remoteResponse(InetAddressAndPort from, Verb verb, T payload)
+    {
+        assert verb.isResponse();
+        long createdAtNanos = approxTime.now();
+        long expiresAtNanos = verb.expiresAtNanos(createdAtNanos);
+        return new Message<>(new Header(0, epochSupplier.get(), verb, from, createdAtNanos, expiresAtNanos, 0, NO_PARAMS), payload);
+    }
+
+    /**
+     * A way to generate messages originating from arbitrary node. Should ONLY be used for testing purposes, as meddling with an
+     * originator can be dangerous.
+     */
+    @VisibleForTesting
+    public static <T> Message<T> remoteResponseForTests(long id, InetAddressAndPort from, Verb verb, T payload)
+    {
+        assert verb.isResponse();
+        long createdAtNanos = approxTime.now();
+        long expiresAtNanos = verb.expiresAtNanos(createdAtNanos);
+        return new Message<>(new Header(id, epochSupplier.get(), verb, from, createdAtNanos, expiresAtNanos, 0, NO_PARAMS), payload);
+    }
+
+    @VisibleForTesting
+    public static <T> Message<T> forgeIdentityForTests(Message<T> msg, InetAddressAndPort addr)
+    {
+        return new Message<>(new Header(msg.header.id,
+                                        msg.header.epoch,
+                                        msg.header.verb,
+                                        addr,
+                                        msg.header.createdAtNanos,
+                                        msg.header.expiresAtNanos,
+                                        msg.header.flags,
+                                        msg.header.params),
+                             msg.payload);
+    }
+
     /** Builds a response Message with provided payload, and all the right fields inferred from request Message */
     public <T> Message<T> responseWith(T payload)
     {
-        return outWithParam(id(), verb().responseVerb, expiresAtNanos(), payload, null, null);
+        Message<T> msg = outWithParam(id(), verb().responseVerb, expiresAtNanos(), payload, null, null);
+        if (header.hasFlag(MessageFlag.URGENT))
+            msg = msg.withFlag(MessageFlag.URGENT);
+        return msg;
     }
 
     /** Builds a response Message with no payload, and all the right fields inferred from request Message */
@@ -263,6 +362,11 @@ public class Message<T>
         return outWithParam(id, Verb.FAILURE_RSP, expiresAtNanos, reason, null, null);
     }
 
+    public <V> Message<V> withPayload(V newPayload)
+    {
+        return new Message<>(header, newPayload);
+    }
+
     Message<T> withCallBackOnFailure()
     {
         return new Message<>(header.withFlag(MessageFlag.CALL_BACK_ON_FAILURE), payload);
@@ -273,9 +377,19 @@ public class Message<T>
         return new Message<>(header.withParam(ParamType.FORWARD_TO, peers), payload);
     }
 
+    public Message<T> withFrom(InetAddressAndPort from)
+    {
+        return new Message<>(header.withFrom(from), payload);
+    }
+
     public Message<T> withFlag(MessageFlag flag)
     {
         return new Message<>(header.withFlag(flag), payload);
+    }
+
+    public Message<T> withEpoch(Epoch epoch)
+    {
+        return new Message<>(header.withEpoch(epoch), payload);
     }
 
     public Message<T> withParam(ParamType type, Object value)
@@ -388,6 +502,7 @@ public class Message<T>
     public static class Header
     {
         public final long id;
+        public final Epoch epoch;
         public final Verb verb;
         public final InetAddressAndPort from;
         public final long createdAtNanos;
@@ -395,9 +510,10 @@ public class Message<T>
         private final int flags;
         private final Map<ParamType, Object> params;
 
-        private Header(long id, Verb verb, InetAddressAndPort from, long createdAtNanos, long expiresAtNanos, int flags, Map<ParamType, Object> params)
+        private Header(long id, Epoch epoch, Verb verb, InetAddressAndPort from, long createdAtNanos, long expiresAtNanos, int flags, Map<ParamType, Object> params)
         {
             this.id = id;
+            this.epoch = epoch;
             this.verb = verb;
             this.from = from;
             this.expiresAtNanos = expiresAtNanos;
@@ -406,19 +522,34 @@ public class Message<T>
             this.params = params;
         }
 
+        public boolean hasFlag(MessageFlag messageFlag)
+        {
+            return messageFlag.isIn(flags);
+        }
+
+        Header withFrom(InetAddressAndPort from)
+        {
+            return new Header(id, epoch, verb, from, createdAtNanos, expiresAtNanos, flags, params);
+        }
+
         Header withFlag(MessageFlag flag)
         {
-            return new Header(id, verb, from, createdAtNanos, expiresAtNanos, flag.addTo(flags), params);
+            return new Header(id, epoch, verb, from, createdAtNanos, expiresAtNanos, flag.addTo(flags), params);
+        }
+
+        Header withEpoch(Epoch epoch)
+        {
+            return new Header(id, epoch, verb, from, createdAtNanos, expiresAtNanos, flags, params);
         }
 
         Header withParam(ParamType type, Object value)
         {
-            return new Header(id, verb, from, createdAtNanos, expiresAtNanos, flags, addParam(params, type, value));
+            return new Header(id, epoch, verb, from, createdAtNanos, expiresAtNanos, flags, addParam(params, type, value));
         }
 
         Header withParams(Map<ParamType, Object> values)
         {
-            return new Header(id, verb, from, createdAtNanos, expiresAtNanos, flags, addParams(params, values));
+            return new Header(id, epoch, verb, from, createdAtNanos, expiresAtNanos, flags, addParams(params, values));
         }
 
         boolean callBackOnFailure()
@@ -445,13 +576,15 @@ public class Message<T>
         @Nullable
         InetAddressAndPort respondTo()
         {
-            return (InetAddressAndPort) params.get(ParamType.RESPOND_TO);
+            InetAddressAndPort respondTo = (InetAddressAndPort) params.get(ParamType.RESPOND_TO);
+            if (respondTo == null) respondTo = from;
+            return respondTo;
         }
 
         @Nullable
-        public UUID traceSession()
+        public TimeUUID traceSession()
         {
-            return (UUID) params.get(ParamType.TRACE_SESSION);
+            return (TimeUUID) params.get(ParamType.TRACE_SESSION);
         }
 
         @Nullable
@@ -463,6 +596,12 @@ public class Message<T>
         public Map<ParamType, Object> params()
         {
             return Collections.unmodifiableMap(params);
+        }
+
+        @Nullable
+        public Map<String,byte[]> customParams()
+        {
+            return (Map<String,byte[]>) params.get(ParamType.CUSTOM_MAP);
         }
     }
 
@@ -477,6 +616,7 @@ public class Message<T>
         private long createdAtNanos;
         private long expiresAtNanos;
         private long id;
+        private Epoch epoch;
 
         private boolean hasId;
 
@@ -514,6 +654,15 @@ public class Message<T>
             return this;
         }
 
+        public Builder<T> withCustomParam(String name, byte[] value)
+        {
+            Map<String,byte[]> customParams  = (Map<String,byte[]>)
+                    params.computeIfAbsent(ParamType.CUSTOM_MAP, (t) -> new HashMap<String,byte[]>());
+
+            customParams.put(name, value);
+            return this;
+        }
+
         /**
          * A shortcut to add tracing params.
          * Effectively, it is the same as calling {@link #withParam(ParamType, Object)} with tracing params
@@ -544,7 +693,7 @@ public class Message<T>
             if (expiresAtNanos == 0 && verb != null && createdAtNanos != 0)
                 expiresAtNanos = verb.expiresAtNanos(createdAtNanos);
             if (!this.verb.isResponse() && from == null) // default to sending from self if we're a request verb
-                from = FBUtilities.getBroadcastAddressAndPort();
+                from = getBroadcastAddressAndPort();
             return this;
         }
 
@@ -569,6 +718,12 @@ public class Message<T>
             return this;
         }
 
+        public Builder<T> withEpoch(Epoch epoch)
+        {
+            this.epoch = epoch;
+            return this;
+        }
+
         public Message<T> build()
         {
             if (verb == null)
@@ -577,8 +732,10 @@ public class Message<T>
                 throw new IllegalArgumentException();
             if (payload == null)
                 throw new IllegalArgumentException();
+            if (epoch == null)
+                epoch = epochSupplier.get();
 
-            return new Message<>(new Header(hasId ? id : nextId(), verb, from, createdAtNanos, expiresAtNanos, flags, params), payload);
+            return new Message<>(new Header(hasId ? id : nextId(), epoch, verb, from, createdAtNanos, expiresAtNanos, flags, params), payload);
         }
     }
 
@@ -591,6 +748,7 @@ public class Message<T>
                                .withExpiresAt(message.expiresAtNanos())
                                .withFlags(message.header.flags)
                                .withParams(message.header.params)
+                               .withEpoch(message.header.epoch)
                                .withPayload(message.payload);
     }
 
@@ -629,6 +787,8 @@ public class Message<T>
      * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
      * | Message ID (vint)             |
      * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+     * | Epoch (vint)                  |
+     * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
      * | Creation timestamp (int)      |
      * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
      * | Expiry (vint)                 |
@@ -662,15 +822,17 @@ public class Message<T>
 
         public <T> void serialize(Message<T> message, DataOutputPlus out, int version) throws IOException
         {
-            if (version >= VERSION_40)
-                serializePost40(message, out, version);
-            else
-                serializePre40(message, out, version);
+            serializeHeader(message.header, out, version);
+            out.writeUnsignedVInt32(message.payloadSize(version));
+            message.verb().serializer().serialize(message.payload, out, version);
         }
 
         public <T> Message<T> deserialize(DataInputPlus in, InetAddressAndPort peer, int version) throws IOException
         {
-            return version >= VERSION_40 ? deserializePost40(in, peer, version) : deserializePre40(in, version);
+            Header header = deserializeHeader(in, peer, version);
+            skipUnsignedVInt(in); // payload size, not needed by payload deserializer
+            T payload = (T) header.verb.serializer().deserialize(in, version);
+            return new Message<>(header, payload);
         }
 
         /**
@@ -680,160 +842,25 @@ public class Message<T>
          */
         public <T> Message<T> deserialize(DataInputPlus in, Header header, int version) throws IOException
         {
-            return version >= VERSION_40 ? deserializePost40(in, header, version) : deserializePre40(in, header, version);
+            skipHeader(in, version);
+            skipUnsignedVInt(in); // payload size, not needed by payload deserializer
+            T payload = (T) header.verb.serializer().deserialize(in, version);
+            return new Message<>(header, payload);
         }
 
         private <T> int serializedSize(Message<T> message, int version)
         {
-            return version >= VERSION_40 ? serializedSizePost40(message, version) : serializedSizePre40(message, version);
-        }
-
-        /**
-         * Size of the next message in the stream. Returns -1 if there aren't sufficient bytes read yet to determine size.
-         */
-        int inferMessageSize(ByteBuffer buf, int index, int limit, int version) throws InvalidLegacyProtocolMagic
-        {
-            int size = version >= VERSION_40 ? inferMessageSizePost40(buf, index, limit) : inferMessageSizePre40(buf, index, limit);
-            if (size > DatabaseDescriptor.getInternodeMaxMessageSizeInBytes())
-                throw new OversizedMessageException(size);
-            return size;
-        }
-
-        /**
-         * Partially deserialize the message - by only extracting the header and leaving the payload alone.
-         *
-         * To get the rest of the message without repeating the work done here, use {@link #deserialize(DataInputPlus, Header, int)}
-         * method.
-         *
-         * It's assumed that the provided buffer contains all the bytes necessary to deserialize the header fully.
-         */
-        Header extractHeader(ByteBuffer buf, InetAddressAndPort from, long currentTimeNanos, int version) throws IOException
-        {
-            return version >= VERSION_40
-                 ? extractHeaderPost40(buf, from, currentTimeNanos, version)
-                 : extractHeaderPre40(buf, currentTimeNanos, version);
-        }
-
-        private static long getExpiresAtNanos(long createdAtNanos, long currentTimeNanos, long expirationPeriodNanos)
-        {
-            if (!DatabaseDescriptor.hasCrossNodeTimeout() || createdAtNanos > currentTimeNanos)
-                createdAtNanos = currentTimeNanos;
-            return createdAtNanos + expirationPeriodNanos;
-        }
-
-        /*
-         * 4.0 ser/deser
-         */
-
-        private void serializeHeaderPost40(Header header, DataOutputPlus out, int version) throws IOException
-        {
-            out.writeUnsignedVInt(header.id);
-            // int cast cuts off the high-order half of the timestamp, which we can assume remains
-            // the same between now and when the recipient reconstructs it.
-            out.writeInt((int) approxTime.translate().toMillisSinceEpoch(header.createdAtNanos));
-            out.writeUnsignedVInt(NANOSECONDS.toMillis(header.expiresAtNanos - header.createdAtNanos));
-            out.writeUnsignedVInt(header.verb.id);
-            out.writeUnsignedVInt(header.flags);
-            serializeParams(header.params, out, version);
-        }
-
-        private Header deserializeHeaderPost40(DataInputPlus in, InetAddressAndPort peer, int version) throws IOException
-        {
-            long id = in.readUnsignedVInt();
-            long currentTimeNanos = approxTime.now();
-            MonotonicClockTranslation timeSnapshot = approxTime.translate();
-            long creationTimeNanos = calculateCreationTimeNanos(in.readInt(), timeSnapshot, currentTimeNanos);
-            long expiresAtNanos = getExpiresAtNanos(creationTimeNanos, currentTimeNanos, TimeUnit.MILLISECONDS.toNanos(in.readUnsignedVInt()));
-            Verb verb = Verb.fromId(Ints.checkedCast(in.readUnsignedVInt()));
-            int flags = Ints.checkedCast(in.readUnsignedVInt());
-            Map<ParamType, Object> params = deserializeParams(in, version);
-            return new Header(id, verb, peer, creationTimeNanos, expiresAtNanos, flags, params);
-        }
-
-        private void skipHeaderPost40(DataInputPlus in) throws IOException
-        {
-            skipUnsignedVInt(in); // id
-            in.skipBytesFully(4); // createdAt
-            skipUnsignedVInt(in); // expiresIn
-            skipUnsignedVInt(in); // verb
-            skipUnsignedVInt(in); // flags
-            skipParamsPost40(in); // params
-        }
-
-        private int serializedHeaderSizePost40(Header header, int version)
-        {
             long size = 0;
-            size += sizeofUnsignedVInt(header.id);
-            size += CREATION_TIME_SIZE;
-            size += sizeofUnsignedVInt(NANOSECONDS.toMillis(header.expiresAtNanos - header.createdAtNanos));
-            size += sizeofUnsignedVInt(header.verb.id);
-            size += sizeofUnsignedVInt(header.flags);
-            size += serializedParamsSize(header.params, version);
-            return Ints.checkedCast(size);
-        }
-
-        private Header extractHeaderPost40(ByteBuffer buf, InetAddressAndPort from, long currentTimeNanos, int version) throws IOException
-        {
-            MonotonicClockTranslation timeSnapshot = approxTime.translate();
-
-            int index = buf.position();
-
-            long id = getUnsignedVInt(buf, index);
-            index += computeUnsignedVIntSize(id);
-
-            int createdAtMillis = buf.getInt(index);
-            index += sizeof(createdAtMillis);
-
-            long expiresInMillis = getUnsignedVInt(buf, index);
-            index += computeUnsignedVIntSize(expiresInMillis);
-
-            Verb verb = Verb.fromId(Ints.checkedCast(getUnsignedVInt(buf, index)));
-            index += computeUnsignedVIntSize(verb.id);
-
-            int flags = Ints.checkedCast(getUnsignedVInt(buf, index));
-            index += computeUnsignedVIntSize(flags);
-
-            Map<ParamType, Object> params = extractParams(buf, index, version);
-
-            long createdAtNanos = calculateCreationTimeNanos(createdAtMillis, timeSnapshot, currentTimeNanos);
-            long expiresAtNanos = getExpiresAtNanos(createdAtNanos, currentTimeNanos, TimeUnit.MILLISECONDS.toNanos(expiresInMillis));
-
-            return new Header(id, verb, from, createdAtNanos, expiresAtNanos, flags, params);
-        }
-
-        private <T> void serializePost40(Message<T> message, DataOutputPlus out, int version) throws IOException
-        {
-            serializeHeaderPost40(message.header, out, version);
-            out.writeUnsignedVInt(message.payloadSize(version));
-            message.getPayloadSerializer().serialize(message.payload, out, version);
-        }
-
-        private <T> Message<T> deserializePost40(DataInputPlus in, InetAddressAndPort peer, int version) throws IOException
-        {
-            Header header = deserializeHeaderPost40(in, peer, version);
-            skipUnsignedVInt(in); // payload size, not needed by payload deserializer
-            T payload = (T) header.verb.serializer().deserialize(in, version);
-            return new Message<>(header, payload);
-        }
-
-        private <T> Message<T> deserializePost40(DataInputPlus in, Header header, int version) throws IOException
-        {
-            skipHeaderPost40(in);
-            skipUnsignedVInt(in); // payload size, not needed by payload deserializer
-            T payload = (T) header.verb.serializer().deserialize(in, version);
-            return new Message<>(header, payload);
-        }
-
-        private <T> int serializedSizePost40(Message<T> message, int version)
-        {
-            long size = 0;
-            size += serializedHeaderSizePost40(message.header, version);
+            size += serializedHeader(message.header, version);
             int payloadSize = message.payloadSize(version);
             size += sizeofUnsignedVInt(payloadSize) + payloadSize;
             return Ints.checkedCast(size);
         }
 
-        private int inferMessageSizePost40(ByteBuffer buf, int readerIndex, int readerLimit)
+        /**
+         * Size of the next message in the stream. Returns -1 if there aren't sufficient bytes read yet to determine size.
+         */
+        int inferMessageSize(ByteBuffer buf, int readerIndex, int readerLimit, int version)
         {
             int index = readerIndex;
 
@@ -841,6 +868,14 @@ public class Message<T>
             if (idSize < 0)
                 return -1; // not enough bytes to read id
             index += idSize;
+
+            if (version >= VERSION_51)
+            {
+                int epochSize = computeUnsignedVIntSize(buf, index, readerLimit);
+                if (epochSize < 0)
+                    return -1; // not enough bytes to read epoch
+                index += epochSize;
+            }
 
             index += CREATION_TIME_SIZE;
             if (index > readerLimit)
@@ -861,7 +896,7 @@ public class Message<T>
                 return -1;
             index += flagsSize;
 
-            int paramsSize = extractParamsSizePost40(buf, index, readerLimit);
+            int paramsSize = extractParamsSize(buf, index, readerLimit);
             if (paramsSize < 0)
                 return -1;
             index += paramsSize;
@@ -871,220 +906,117 @@ public class Message<T>
                 return -1;
             index += computeUnsignedVIntSize(payloadSize) + payloadSize;
 
-            return index - readerIndex;
+            int size = index - readerIndex;
+
+            if (size > DatabaseDescriptor.getInternodeMaxMessageSizeInBytes())
+                throw new OversizedMessageException(size);
+            return size;
         }
 
-        /*
-         * legacy ser/deser
+        /**
+         * Partially deserialize the message - by only extracting the header and leaving the payload alone.
+         *
+         * To get the rest of the message without repeating the work done here, use {@link #deserialize(DataInputPlus, Header, int)}
+         * method.
+         *
+         * It's assumed that the provided buffer contains all the bytes necessary to deserialize the header fully.
          */
-
-        private void serializeHeaderPre40(Header header, DataOutputPlus out, int version) throws IOException
-        {
-            out.writeInt(PROTOCOL_MAGIC);
-            out.writeInt(Ints.checkedCast(header.id));
-            // int cast cuts off the high-order half of the timestamp, which we can assume remains
-            // the same between now and when the recipient reconstructs it.
-            out.writeInt((int) approxTime.translate().toMillisSinceEpoch(header.createdAtNanos));
-            inetAddressAndPortSerializer.serialize(header.from, out, version);
-            out.writeInt(header.verb.toPre40Verb().id);
-            serializeParams(addFlagsToLegacyParams(header.params, header.flags), out, version);
-        }
-
-        private Header deserializeHeaderPre40(DataInputPlus in, int version) throws IOException
-        {
-            validateLegacyProtocolMagic(in.readInt());
-            int id = in.readInt();
-            long currentTimeNanos = approxTime.now();
-            MonotonicClockTranslation timeSnapshot = approxTime.translate();
-            long creationTimeNanos = calculateCreationTimeNanos(in.readInt(), timeSnapshot, currentTimeNanos);
-            InetAddressAndPort from = inetAddressAndPortSerializer.deserialize(in, version);
-            Verb verb = Verb.fromId(in.readInt());
-            Map<ParamType, Object> params = deserializeParams(in, version);
-            int flags = removeFlagsFromLegacyParams(params);
-            return new Header(id, verb, from, creationTimeNanos, verb.expiresAtNanos(creationTimeNanos), flags, params);
-        }
-
-        private static final int PRE_40_MESSAGE_PREFIX_SIZE = 12; // protocol magic + id + createdAt
-
-        private void skipHeaderPre40(DataInputPlus in) throws IOException
-        {
-            in.skipBytesFully(PRE_40_MESSAGE_PREFIX_SIZE); // magic, id, createdAt
-            in.skipBytesFully(in.readByte());              // from
-            in.skipBytesFully(4);                          // verb
-            skipParamsPre40(in);                           // params
-        }
-
-        private int serializedHeaderSizePre40(Header header, int version)
-        {
-            long size = 0;
-            size += PRE_40_MESSAGE_PREFIX_SIZE;
-            size += inetAddressAndPortSerializer.serializedSize(header.from, version);
-            size += sizeof(header.verb.id);
-            size += serializedParamsSize(addFlagsToLegacyParams(header.params, header.flags), version);
-            return Ints.checkedCast(size);
-        }
-
-        private Header extractHeaderPre40(ByteBuffer buf, long currentTimeNanos, int version) throws IOException
+        Header extractHeader(ByteBuffer buf, InetAddressAndPort from, long currentTimeNanos, int version) throws IOException
         {
             MonotonicClockTranslation timeSnapshot = approxTime.translate();
 
             int index = buf.position();
 
-            index += 4; // protocol magic
+            long id = getUnsignedVInt(buf, index);
+            index += computeUnsignedVIntSize(id);
 
-            long id = buf.getInt(index);
-            index += 4;
-
+            Epoch epoch = Epoch.EMPTY;
+            if (version >= VERSION_51)
+            {
+                long epochl = getUnsignedVInt(buf, index);
+                index += computeUnsignedVIntSize(epochl);
+                epoch = Epoch.create(epochl);
+            }
             int createdAtMillis = buf.getInt(index);
-            index += 4;
+            index += sizeof(createdAtMillis);
 
-            InetAddressAndPort from = inetAddressAndPortSerializer.extract(buf, index);
-            index += 1 + buf.get(index);
+            long expiresInMillis = getUnsignedVInt(buf, index);
+            index += computeUnsignedVIntSize(expiresInMillis);
 
-            Verb verb = Verb.fromId(buf.getInt(index));
-            index += 4;
+            Verb verb = Verb.fromId(getUnsignedVInt32(buf, index));
+            index += computeUnsignedVIntSize(verb.id);
+
+            int flags = getUnsignedVInt32(buf, index);
+            index += computeUnsignedVIntSize(flags);
 
             Map<ParamType, Object> params = extractParams(buf, index, version);
-            int flags = removeFlagsFromLegacyParams(params);
 
             long createdAtNanos = calculateCreationTimeNanos(createdAtMillis, timeSnapshot, currentTimeNanos);
-            long expiresAtNanos = verb.expiresAtNanos(createdAtNanos);
+            long expiresAtNanos = getExpiresAtNanos(createdAtNanos, TimeUnit.MILLISECONDS.toNanos(expiresInMillis));
 
-            return new Header(id, verb, from, createdAtNanos, expiresAtNanos, flags, params);
+            return new Header(id, epoch, verb, from, createdAtNanos, expiresAtNanos, flags, params);
         }
 
-        private <T> void serializePre40(Message<T> message, DataOutputPlus out, int version) throws IOException
+        private static long getExpiresAtNanos(long createdAtNanos, long expirationPeriodNanos)
         {
-            if (message.isFailureResponse())
-                message = toPre40FailureResponse(message);
-
-            serializeHeaderPre40(message.header, out, version);
-
-            if (message.payload != null && message.payload != NoPayload.noPayload)
-            {
-                int payloadSize = message.payloadSize(version);
-                out.writeInt(payloadSize);
-                message.getPayloadSerializer().serialize(message.payload, out, version);
-            }
-            else
-            {
-                out.writeInt(0);
-            }
+            return createdAtNanos + expirationPeriodNanos;
         }
 
-        private <T> Message<T> deserializePre40(DataInputPlus in, int version) throws IOException
+        private void serializeHeader(Header header, DataOutputPlus out, int version) throws IOException
         {
-            Header header = deserializeHeaderPre40(in, version);
-            return deserializePre40(in, header, false, version);
+            out.writeUnsignedVInt(header.id);
+            if (version >= VERSION_51)
+                Epoch.messageSerializer.serialize(header.epoch, out, version);
+            // int cast cuts off the high-order half of the timestamp, which we can assume remains
+            // the same between now and when the recipient reconstructs it.
+            out.writeInt((int) approxTime.translate().toMillisSinceEpoch(header.createdAtNanos));
+            out.writeUnsignedVInt(NANOSECONDS.toMillis(header.expiresAtNanos - header.createdAtNanos));
+            out.writeUnsignedVInt32(header.verb.id);
+            out.writeUnsignedVInt32(header.flags);
+            serializeParams(header.params, out, version);
         }
 
-        private <T> Message<T> deserializePre40(DataInputPlus in, Header header, int version) throws IOException
+        public Header deserializeHeader(DataInputPlus in, InetAddressAndPort peer, int version) throws IOException
         {
-            return deserializePre40(in, header, true, version);
+            long id = in.readUnsignedVInt();
+            Epoch epoch = Epoch.EMPTY;
+            if (version >= VERSION_51)
+                epoch = Epoch.messageSerializer.deserialize(in, version);
+            long currentTimeNanos = approxTime.now();
+            MonotonicClockTranslation timeSnapshot = approxTime.translate();
+            long creationTimeNanos = calculateCreationTimeNanos(in.readInt(), timeSnapshot, currentTimeNanos);
+            long expiresAtNanos = getExpiresAtNanos(creationTimeNanos, TimeUnit.MILLISECONDS.toNanos(in.readUnsignedVInt()));
+            Verb verb = Verb.fromId(in.readUnsignedVInt32());
+            int flags = in.readUnsignedVInt32();
+            Map<ParamType, Object> params = deserializeParams(in, version);
+
+            return new Header(id, epoch, verb, peer, creationTimeNanos, expiresAtNanos, flags, params);
         }
 
-        private <T> Message<T> deserializePre40(DataInputPlus in, Header header, boolean skipHeader, int version) throws IOException
+        private void skipHeader(DataInputPlus in, int version) throws IOException
         {
-            if (skipHeader)
-                skipHeaderPre40(in);
-
-            int payloadSize = in.readInt();
-            T payload = deserializePayloadPre40(in, version, getPayloadSerializer(header.verb, header.id, header.from), payloadSize);
-
-            Message<T> message = new Message<>(header, payload);
-
-            return header.params.containsKey(ParamType.FAILURE_RESPONSE)
-                 ? (Message<T>) toPost40FailureResponse(message)
-                 : message;
+            skipUnsignedVInt(in); // id
+            if (version >= VERSION_51)
+                skipUnsignedVInt(in); // epoch
+            in.skipBytesFully(4); // createdAt
+            skipUnsignedVInt(in); // expiresIn
+            skipUnsignedVInt(in); // verb
+            skipUnsignedVInt(in); // flags
+            skipParams(in); // params
         }
 
-        private <T> T deserializePayloadPre40(DataInputPlus in, int version, IVersionedAsymmetricSerializer<?, T> serializer, int payloadSize) throws IOException
+        private int serializedHeader(Header header, int version)
         {
-            if (payloadSize == 0 || serializer == null)
-            {
-                // if there's no deserializer for the verb, skip the payload bytes to leave
-                // the stream in a clean state (for the next message)
-                in.skipBytesFully(payloadSize);
-                return null;
-            }
-
-            return serializer.deserialize(in, version);
-        }
-
-        private <T> int serializedSizePre40(Message<T> message, int version)
-        {
-            if (message.isFailureResponse())
-                message = toPre40FailureResponse(message);
-
             long size = 0;
-            size += serializedHeaderSizePre40(message.header, version);
-            int payloadSize = message.payloadSize(version);
-            size += sizeof(payloadSize);
-            size += payloadSize;
+            size += sizeofUnsignedVInt(header.id);
+            if (version >= VERSION_51)
+                size += sizeofUnsignedVInt(header.epoch.getEpoch());
+            size += CREATION_TIME_SIZE;
+            size += sizeofUnsignedVInt(NANOSECONDS.toMillis(header.expiresAtNanos - header.createdAtNanos));
+            size += sizeofUnsignedVInt(header.verb.id);
+            size += sizeofUnsignedVInt(header.flags);
+            size += serializedParamsSize(header.params, version);
             return Ints.checkedCast(size);
-        }
-
-        private int inferMessageSizePre40(ByteBuffer buf, int readerIndex, int readerLimit) throws InvalidLegacyProtocolMagic
-        {
-            int index = readerIndex;
-            // protocol magic
-            index += 4;
-            if (index > readerLimit)
-                return -1;
-            validateLegacyProtocolMagic(buf.getInt(index - 4));
-
-            // rest of prefix
-            index += PRE_40_MESSAGE_PREFIX_SIZE - 4;
-            // ip address
-            index += 1;
-            if (index > readerLimit)
-                return -1;
-            index += buf.get(index - 1);
-            // verb
-            index += 4;
-            if (index > readerLimit)
-                return -1;
-
-            int paramsSize = extractParamsSizePre40(buf, index, readerLimit);
-            if (paramsSize < 0)
-                return -1;
-            index += paramsSize;
-
-            // payload
-            index += 4;
-
-            if (index > readerLimit)
-                return -1;
-            index += buf.getInt(index - 4);
-
-            return index - readerIndex;
-        }
-
-        private Message toPre40FailureResponse(Message post40)
-        {
-            Map<ParamType, Object> params = new EnumMap<>(ParamType.class);
-            params.putAll(post40.header.params);
-
-            params.put(ParamType.FAILURE_RESPONSE, LegacyFlag.instance);
-            params.put(ParamType.FAILURE_REASON, post40.payload);
-
-            Header header = new Header(post40.id(), post40.verb().toPre40Verb(), post40.from(), post40.createdAtNanos(), post40.expiresAtNanos(), 0, params);
-            return new Message<>(header, NoPayload.noPayload);
-        }
-
-        private Message<RequestFailureReason> toPost40FailureResponse(Message<?> pre40)
-        {
-            Map<ParamType, Object> params = new EnumMap<>(ParamType.class);
-            params.putAll(pre40.header.params);
-
-            params.remove(ParamType.FAILURE_RESPONSE);
-
-            RequestFailureReason reason = (RequestFailureReason) params.remove(ParamType.FAILURE_REASON);
-            if (null == reason)
-                reason = RequestFailureReason.UNKNOWN;
-
-            Header header = new Header(pre40.id(), Verb.FAILURE_RSP, pre40.from(), pre40.createdAtNanos(), pre40.expiresAtNanos(), pre40.header.flags, params);
-            return new Message<>(header, reason);
         }
 
         /*
@@ -1094,8 +1026,13 @@ public class Message<T>
         private static final long TIMESTAMP_WRAPAROUND_GRACE_PERIOD_START  = 0xFFFFFFFFL - MINUTES.toMillis(15L);
         private static final long TIMESTAMP_WRAPAROUND_GRACE_PERIOD_END    =               MINUTES.toMillis(15L);
 
-        private static long calculateCreationTimeNanos(int messageTimestampMillis, MonotonicClockTranslation timeSnapshot, long currentTimeNanos)
+        @VisibleForTesting
+        static long calculateCreationTimeNanos(int messageTimestampMillis, MonotonicClockTranslation timeSnapshot, long currentTimeNanos)
         {
+            // We do not trust external time source, so we override their value with current time
+            if (!DatabaseDescriptor.hasCrossNodeTimeout())
+                return currentTimeNanos;
+
             long currentTimeMillis = timeSnapshot.toMillisSinceEpoch(currentTimeNanos);
             // Reconstruct the message construction time sent by the remote host (we sent only the lower 4 bytes, assuming the
             // higher 4 bytes wouldn't change between the sender and receiver)
@@ -1112,8 +1049,21 @@ public class Message<T>
             {
                 highBits -= 0x0000000100000000L;
             }
+            // if the message timestamp wrapped, but we still haven't, add one highBit
+            else if (sentLowBits < TIMESTAMP_WRAPAROUND_GRACE_PERIOD_END
+                     && currentLowBits > TIMESTAMP_WRAPAROUND_GRACE_PERIOD_START)
+            {
+                highBits += 0x0000000100000000L;
+            }
 
             long sentTimeMillis = (highBits | sentLowBits);
+
+            if (Math.abs(currentTimeMillis - sentTimeMillis) > MINUTES.toMillis(15))
+            {
+                noSpam1m.warn("Bad timestamp {} generated, overriding with currentTimeMillis = {}", sentTimeMillis, currentTimeMillis);
+                sentTimeMillis = currentTimeMillis;
+            }
+
             return timeSnapshot.fromMillisSinceEpoch(sentTimeMillis);
         }
 
@@ -1121,59 +1071,20 @@ public class Message<T>
          * param ser/deser
          */
 
-        private Map<ParamType, Object> addFlagsToLegacyParams(Map<ParamType, Object> params, int flags)
-        {
-            if (flags == 0)
-                return params;
-
-            Map<ParamType, Object> extended = new EnumMap<>(ParamType.class);
-            extended.putAll(params);
-
-            if (MessageFlag.CALL_BACK_ON_FAILURE.isIn(flags))
-                extended.put(ParamType.FAILURE_CALLBACK, LegacyFlag.instance);
-
-            if (MessageFlag.TRACK_REPAIRED_DATA.isIn(flags))
-                extended.put(ParamType.TRACK_REPAIRED_DATA, LegacyFlag.instance);
-
-            return extended;
-        }
-
-        private int removeFlagsFromLegacyParams(Map<ParamType, Object> params)
-        {
-            int flags = 0;
-
-            if (null != params.remove(ParamType.FAILURE_CALLBACK))
-                flags = MessageFlag.CALL_BACK_ON_FAILURE.addTo(flags);
-
-            if (null != params.remove(ParamType.TRACK_REPAIRED_DATA))
-                flags = MessageFlag.TRACK_REPAIRED_DATA.addTo(flags);
-
-            return flags;
-        }
-
         private void serializeParams(Map<ParamType, Object> params, DataOutputPlus out, int version) throws IOException
         {
-            if (version >= VERSION_40)
-                out.writeUnsignedVInt(params.size());
-            else
-                out.writeInt(params.size());
+            out.writeUnsignedVInt32(params.size());
 
             for (Map.Entry<ParamType, Object> kv : params.entrySet())
             {
                 ParamType type = kv.getKey();
-                if (version >= VERSION_40)
-                    out.writeUnsignedVInt(type.id);
-                else
-                    out.writeUTF(type.legacyAlias);
+                out.writeUnsignedVInt32(type.id);
 
                 IVersionedSerializer serializer = type.serializer;
                 Object value = kv.getValue();
 
                 int length = Ints.checkedCast(serializer.serializedSize(value, version));
-                if (version >= VERSION_40)
-                    out.writeUnsignedVInt(length);
-                else
-                    out.writeInt(length);
+                out.writeUnsignedVInt32(length);
 
                 serializer.serialize(value, out, version);
             }
@@ -1181,7 +1092,7 @@ public class Message<T>
 
         private Map<ParamType, Object> deserializeParams(DataInputPlus in, int version) throws IOException
         {
-            int count = version >= VERSION_40 ? Ints.checkedCast(in.readUnsignedVInt()) : in.readInt();
+            int count = in.readUnsignedVInt32();
 
             if (count == 0)
                 return NO_PARAMS;
@@ -1190,25 +1101,13 @@ public class Message<T>
 
             for (int i = 0; i < count; i++)
             {
-                ParamType type = version >= VERSION_40
-                    ? ParamType.lookUpById(Ints.checkedCast(in.readUnsignedVInt()))
-                    : ParamType.lookUpByAlias(in.readUTF());
+                ParamType type = ParamType.lookUpById(in.readUnsignedVInt32());
 
-                int length = version >= VERSION_40
-                    ? Ints.checkedCast(in.readUnsignedVInt())
-                    : in.readInt();
+                int length = in.readUnsignedVInt32();
 
                 if (null != type)
                 {
-                    // Have to special case deserializer as pre-4.0 needs length to decode correctly
-                    if (version < VERSION_40 && type == ParamType.RESPOND_TO)
-                    {
-                        params.put(type, InetAddressAndPort.FwdFrmSerializer.fwdFrmSerializer.pre40DeserializeWithLength(in, version, length));
-                    }
-                    else
-                    {
-                        params.put(type, type.serializer.deserialize(in, version));
-                    }
+                    params.put(type, type.serializer.deserialize(in, version));
                 }
                 else
                 {
@@ -1219,12 +1118,9 @@ public class Message<T>
             return params;
         }
 
-        /*
-         * Extract post-4.0 params map from a ByteBuffer without modifying it.
-         */
         private Map<ParamType, Object> extractParams(ByteBuffer buf, int readerIndex, int version) throws IOException
         {
-            long count = version >= VERSION_40 ? getUnsignedVInt(buf, readerIndex) : buf.getInt(readerIndex);
+            long count = getUnsignedVInt(buf, readerIndex);
 
             if (count == 0)
                 return NO_PARAMS;
@@ -1242,33 +1138,20 @@ public class Message<T>
             }
         }
 
-        private void skipParamsPost40(DataInputPlus in) throws IOException
+        private void skipParams(DataInputPlus in) throws IOException
         {
-            int count = Ints.checkedCast(in.readUnsignedVInt());
+            int count = in.readUnsignedVInt32();
 
             for (int i = 0; i < count; i++)
             {
                 skipUnsignedVInt(in);
-                in.skipBytesFully(Ints.checkedCast(in.readUnsignedVInt()));
-            }
-        }
-
-        private void skipParamsPre40(DataInputPlus in) throws IOException
-        {
-            int count = in.readInt();
-
-            for (int i = 0; i < count; i++)
-            {
-                in.skipBytesFully(in.readShort());
-                in.skipBytesFully(in.readInt());
+                in.skipBytesFully(in.readUnsignedVInt32());
             }
         }
 
         private long serializedParamsSize(Map<ParamType, Object> params, int version)
         {
-            long size = version >= VERSION_40
-                      ? computeUnsignedVIntSize(params.size())
-                      : sizeof(params.size());
+            long size = computeUnsignedVIntSize(params.size());
 
             for (Map.Entry<ParamType, Object> kv : params.entrySet())
             {
@@ -1277,10 +1160,7 @@ public class Message<T>
 
                 long valueLength = type.serializer.serializedSize(value, version);
 
-                if (version >= VERSION_40)
-                    size += sizeofUnsignedVInt(type.id) + sizeofUnsignedVInt(valueLength);
-                else
-                    size += sizeof(type.legacyAlias) + 4;
+                size += sizeofUnsignedVInt(type.id) + sizeofUnsignedVInt(valueLength);
 
                 size += valueLength;
             }
@@ -1288,7 +1168,7 @@ public class Message<T>
             return size;
         }
 
-        private int extractParamsSizePost40(ByteBuffer buf, int readerIndex, int readerLimit)
+        private int extractParamsSize(ByteBuffer buf, int readerIndex, int readerLimit)
         {
             int index = readerIndex;
 
@@ -1313,33 +1193,6 @@ public class Message<T>
             return index - readerIndex;
         }
 
-        private int extractParamsSizePre40(ByteBuffer buf, int readerIndex, int readerLimit)
-        {
-            int index = readerIndex;
-
-            index += 4;
-            if (index > readerLimit)
-                return -1;
-            int paramsCount = buf.getInt(index - 4);
-
-            for (int i = 0; i < paramsCount; i++)
-            {
-                // try to read length and skip to the end of the param name
-                index += 2;
-
-                if (index > readerLimit)
-                    return -1;
-                index += buf.getShort(index - 2);
-                // try to read length and skip to the end of the param value
-                index += 4;
-                if (index > readerLimit)
-                    return -1;
-                index += buf.getInt(index - 4);
-            }
-
-            return index - readerIndex;
-        }
-
         private <T> int payloadSize(Message<T> message, int version)
         {
             long payloadSize = message.payload != null && message.payload != NoPayload.noPayload
@@ -1351,21 +1204,12 @@ public class Message<T>
 
     private IVersionedAsymmetricSerializer<T, ?> getPayloadSerializer()
     {
-        return getPayloadSerializer(verb(), id(), from());
+        return payloadSerializer;
     }
 
-    // Verb#serializer() is null for legacy response messages. Once all Verbs with null handlers
-    // are removed in a future major, this method can be replaced with a call to verb.serializer.
-    private static <In,Out> IVersionedAsymmetricSerializer<In, Out> getPayloadSerializer(Verb verb, long id, InetAddressAndPort from)
-    {
-        return null != verb.serializer()
-             ? verb.serializer()
-             : instance().callbacks.responseSerializer(id, from);
-    }
-
-    private int serializedSize30;
-    private int serializedSize3014;
     private int serializedSize40;
+    private int serializedSize50;
+    private int serializedSize51;
 
     /**
      * Serialized size of the entire message, for the provided messaging version. Caches the calculated value.
@@ -1374,45 +1218,46 @@ public class Message<T>
     {
         switch (version)
         {
-            case VERSION_30:
-                if (serializedSize30 == 0)
-                    serializedSize30 = serializer.serializedSize(this, VERSION_30);
-                return serializedSize30;
-            case VERSION_3014:
-                if (serializedSize3014 == 0)
-                    serializedSize3014 = serializer.serializedSize(this, VERSION_3014);
-                return serializedSize3014;
             case VERSION_40:
                 if (serializedSize40 == 0)
                     serializedSize40 = serializer.serializedSize(this, VERSION_40);
                 return serializedSize40;
+            case VERSION_50:
+                if (serializedSize50 == 0)
+                    serializedSize50 = serializer.serializedSize(this, VERSION_50);
+                return serializedSize50;
+            case VERSION_51:
+                if (serializedSize51 == 0)
+                    serializedSize51 = serializer.serializedSize(this, VERSION_51);
+                return serializedSize51;
             default:
-                throw new IllegalStateException();
+                throw new IllegalStateException("Unknown serialization version " + version);
         }
     }
 
-    private int payloadSize30   = -1;
-    private int payloadSize3014 = -1;
-    private int payloadSize40   = -1;
+    private int payloadSize40 = -1;
+    private int payloadSize50 = -1;
+    private int payloadSize51 = -1;
 
     private int payloadSize(int version)
     {
         switch (version)
         {
-            case VERSION_30:
-                if (payloadSize30 < 0)
-                    payloadSize30 = serializer.payloadSize(this, VERSION_30);
-                return payloadSize30;
-            case VERSION_3014:
-                if (payloadSize3014 < 0)
-                    payloadSize3014 = serializer.payloadSize(this, VERSION_3014);
-                return payloadSize3014;
             case VERSION_40:
                 if (payloadSize40 < 0)
                     payloadSize40 = serializer.payloadSize(this, VERSION_40);
                 return payloadSize40;
+            case VERSION_50:
+                if (payloadSize50 < 0)
+                    payloadSize50 = serializer.payloadSize(this, VERSION_50);
+                return payloadSize50;
+            case VERSION_51:
+                if (payloadSize51 < 0)
+                    payloadSize51 = serializer.payloadSize(this, VERSION_51);
+                return payloadSize51;
+
             default:
-                throw new IllegalStateException();
+                throw new IllegalStateException("Unkown serialization version " + version);
         }
     }
 

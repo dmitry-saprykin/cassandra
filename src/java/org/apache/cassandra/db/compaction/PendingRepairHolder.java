@@ -22,15 +22,15 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
-import java.util.UUID;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Iterables;
 
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.SerializationHeader;
+import org.apache.cassandra.db.commitlog.CommitLogPosition;
+import org.apache.cassandra.db.commitlog.IntervalSet;
 import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
-import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.index.Index;
@@ -38,9 +38,9 @@ import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.ISSTableScanner;
 import org.apache.cassandra.io.sstable.SSTableMultiWriter;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
-import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
 import org.apache.cassandra.schema.CompactionParams;
 import org.apache.cassandra.service.ActiveRepairService;
+import org.apache.cassandra.utils.TimeUUID;
 
 public class PendingRepairHolder extends AbstractStrategyHolder
 {
@@ -94,7 +94,7 @@ public class PendingRepairHolder extends AbstractStrategyHolder
         return Iterables.concat(Iterables.transform(managers, PendingRepairManager::getStrategies));
     }
 
-    Iterable<AbstractCompactionStrategy> getStrategiesFor(UUID session)
+    Iterable<AbstractCompactionStrategy> getStrategiesFor(TimeUUID session)
     {
         List<AbstractCompactionStrategy> strategies = new ArrayList<>(managers.size());
         for (PendingRepairManager manager : managers)
@@ -112,7 +112,7 @@ public class PendingRepairHolder extends AbstractStrategyHolder
     }
 
     @Override
-    public Collection<TaskSupplier> getBackgroundTaskSuppliers(int gcBefore)
+    public Collection<TaskSupplier> getBackgroundTaskSuppliers(long gcBefore)
     {
         List<TaskSupplier> suppliers = new ArrayList<>(managers.size());
         for (PendingRepairManager manager : managers)
@@ -122,7 +122,7 @@ public class PendingRepairHolder extends AbstractStrategyHolder
     }
 
     @Override
-    public Collection<AbstractCompactionTask> getMaximalTasks(int gcBefore, boolean splitOutput)
+    public Collection<AbstractCompactionTask> getMaximalTasks(long gcBefore, boolean splitOutput)
     {
         List<AbstractCompactionTask> tasks = new ArrayList<>(managers.size());
         for (PendingRepairManager manager : managers)
@@ -135,7 +135,7 @@ public class PendingRepairHolder extends AbstractStrategyHolder
     }
 
     @Override
-    public Collection<AbstractCompactionTask> getUserDefinedTasks(GroupedSSTableContainer sstables, int gcBefore)
+    public Collection<AbstractCompactionTask> getUserDefinedTasks(GroupedSSTableContainer sstables, long gcBefore)
     {
         List<AbstractCompactionTask> tasks = new ArrayList<>(managers.size());
 
@@ -147,6 +147,13 @@ public class PendingRepairHolder extends AbstractStrategyHolder
             tasks.addAll(managers.get(i).createUserDefinedTasks(sstables.getGroup(i), gcBefore));
         }
         return tasks;
+    }
+
+    @Override
+    public void addSSTable(SSTableReader sstable)
+    {
+        Preconditions.checkArgument(managesSSTable(sstable), "Attempting to add sstable from wrong holder");
+        managers.get(router.getIndexForSSTable(sstable)).addSSTable(sstable);
     }
 
     AbstractCompactionTask getNextRepairFinishedTask()
@@ -237,11 +244,12 @@ public class PendingRepairHolder extends AbstractStrategyHolder
     public SSTableMultiWriter createSSTableMultiWriter(Descriptor descriptor,
                                                        long keyCount,
                                                        long repairedAt,
-                                                       UUID pendingRepair,
+                                                       TimeUUID pendingRepair,
                                                        boolean isTransient,
-                                                       MetadataCollector collector,
+                                                       IntervalSet<CommitLogPosition> commitLogPositions,
+                                                       int sstableLevel,
                                                        SerializationHeader header,
-                                                       Collection<Index> indexes,
+                                                       Collection<Index.Group> indexGroups,
                                                        LifecycleNewTracker lifecycleNewTracker)
     {
         Preconditions.checkArgument(repairedAt == ActiveRepairService.UNREPAIRED_SSTABLE,
@@ -255,9 +263,10 @@ public class PendingRepairHolder extends AbstractStrategyHolder
                                                  repairedAt,
                                                  pendingRepair,
                                                  isTransient,
-                                                 collector,
+                                                 commitLogPositions,
+                                                 sstableLevel,
                                                  header,
-                                                 indexes,
+                                                 indexGroups,
                                                  lifecycleNewTracker);
     }
 
@@ -272,7 +281,7 @@ public class PendingRepairHolder extends AbstractStrategyHolder
         return -1;
     }
 
-    public boolean hasDataForSession(UUID sessionID)
+    public boolean hasDataForSession(TimeUUID sessionID)
     {
         return Iterables.any(managers, prm -> prm.hasDataForSession(sessionID));
     }
@@ -281,5 +290,19 @@ public class PendingRepairHolder extends AbstractStrategyHolder
     public boolean containsSSTable(SSTableReader sstable)
     {
         return Iterables.any(managers, prm -> prm.containsSSTable(sstable));
+    }
+
+    @Override
+    public int getEstimatedRemainingTasks()
+    {
+        int tasks = 0;
+        for (PendingRepairManager manager : managers)
+            tasks += manager.getEstimatedRemainingTasks();
+        return tasks;
+    }
+
+    public boolean hasPendingRepairSSTable(TimeUUID sessionID, SSTableReader sstable)
+    {
+        return Iterables.any(managers, prm -> prm.hasPendingRepairSSTable(sessionID, sstable));
     }
 }

@@ -19,6 +19,7 @@
 package org.apache.cassandra.service.reads.range;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
@@ -41,7 +42,7 @@ import org.apache.cassandra.exceptions.UnavailableException;
 import org.apache.cassandra.locator.EndpointsForRange;
 import org.apache.cassandra.locator.Replica;
 import org.apache.cassandra.locator.ReplicaPlan;
-import org.apache.cassandra.metrics.ClientRequestMetrics;
+import org.apache.cassandra.metrics.ClientRangeRequestMetrics;
 import org.apache.cassandra.net.Message;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.service.StorageProxy;
@@ -49,22 +50,29 @@ import org.apache.cassandra.service.reads.DataResolver;
 import org.apache.cassandra.service.reads.ReadCallback;
 import org.apache.cassandra.service.reads.repair.ReadRepair;
 import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.utils.AbstractIterator;
 import org.apache.cassandra.utils.CloseableIterator;
 
-class RangeCommandIterator extends AbstractIterator<RowIterator> implements PartitionIterator
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
+
+@VisibleForTesting
+public class RangeCommandIterator extends AbstractIterator<RowIterator> implements PartitionIterator
 {
     private static final Logger logger = LoggerFactory.getLogger(RangeCommandIterator.class);
 
-    private static final ClientRequestMetrics rangeMetrics = new ClientRequestMetrics("RangeSlice");
+    public static final ClientRangeRequestMetrics rangeMetrics = new ClientRangeRequestMetrics("RangeSlice");
 
-    private final CloseableIterator<ReplicaPlan.ForRangeRead> replicaPlans;
-    private final int totalRangeCount;
-    private final PartitionRangeReadCommand command;
-    private final boolean enforceStrictLiveness;
+    final CloseableIterator<ReplicaPlan.ForRangeRead> replicaPlans;
+    final int totalRangeCount;
+    final PartitionRangeReadCommand command;
+    final boolean enforceStrictLiveness;
+    final Dispatcher.RequestTime requestTime;
 
-    private final long startTime;
-    private final long queryStartNanoTime;
+    int rangesQueried;
+    int batchesRequested = 0;
+
+
     private DataLimits.Counter counter;
     private PartitionIterator sentQueryIterator;
 
@@ -73,24 +81,20 @@ class RangeCommandIterator extends AbstractIterator<RowIterator> implements Part
     // The two following "metric" are maintained to improve the concurrencyFactor
     // when it was not good enough initially.
     private int liveReturned;
-    private int rangesQueried;
-    private int batchesRequested = 0;
 
     RangeCommandIterator(CloseableIterator<ReplicaPlan.ForRangeRead> replicaPlans,
                          PartitionRangeReadCommand command,
                          int concurrencyFactor,
                          int maxConcurrencyFactor,
                          int totalRangeCount,
-                         long queryStartNanoTime)
+                         Dispatcher.RequestTime requestTime)
     {
         this.replicaPlans = replicaPlans;
         this.command = command;
         this.concurrencyFactor = concurrencyFactor;
         this.maxConcurrencyFactor = maxConcurrencyFactor;
         this.totalRangeCount = totalRangeCount;
-        this.queryStartNanoTime = queryStartNanoTime;
-
-        startTime = System.nanoTime();
+        this.requestTime = requestTime;
         enforceStrictLiveness = command.metadata().enforceStrictLiveness();
     }
 
@@ -123,11 +127,13 @@ class RangeCommandIterator extends AbstractIterator<RowIterator> implements Part
         catch (UnavailableException e)
         {
             rangeMetrics.unavailables.mark();
+            StorageProxy.logRequestException(e, Collections.singleton(command));
             throw e;
         }
         catch (ReadTimeoutException e)
         {
             rangeMetrics.timeouts.mark();
+            StorageProxy.logRequestException(e, Collections.singleton(command));
             throw e;
         }
         catch (ReadAbortException e)
@@ -165,8 +171,9 @@ class RangeCommandIterator extends AbstractIterator<RowIterator> implements Part
         int remainingRows = limit - liveReturned;
         float rowsPerRange = (float) liveReturned / (float) rangesQueried;
         int concurrencyFactor = Math.max(1, Math.min(maxConcurrencyFactor, Math.round(remainingRows / rowsPerRange)));
-        logger.trace("Didn't get enough response rows; actual rows per range: {}; remaining rows: {}, new concurrent requests: {}",
-                     rowsPerRange, remainingRows, concurrencyFactor);
+        if (logger.isTraceEnabled())
+            logger.trace("Didn't get enough response rows; actual rows per range: {}; remaining rows: {}, new concurrent requests: {}",
+                         rowsPerRange, remainingRows, concurrencyFactor);
         return concurrencyFactor;
     }
 
@@ -190,15 +197,15 @@ class RangeCommandIterator extends AbstractIterator<RowIterator> implements Part
 
         ReplicaPlan.SharedForRangeRead sharedReplicaPlan = ReplicaPlan.shared(replicaPlan);
         ReadRepair<EndpointsForRange, ReplicaPlan.ForRangeRead> readRepair =
-                ReadRepair.create(command, sharedReplicaPlan, queryStartNanoTime);
+                ReadRepair.create(command, sharedReplicaPlan, requestTime);
         DataResolver<EndpointsForRange, ReplicaPlan.ForRangeRead> resolver =
-                new DataResolver<>(rangeCommand, sharedReplicaPlan, readRepair, queryStartNanoTime, trackRepairedStatus);
+                new DataResolver<>(rangeCommand, sharedReplicaPlan, readRepair, requestTime, trackRepairedStatus);
         ReadCallback<EndpointsForRange, ReplicaPlan.ForRangeRead> handler =
-                new ReadCallback<>(resolver, rangeCommand, sharedReplicaPlan, queryStartNanoTime);
+                new ReadCallback<>(resolver, rangeCommand, sharedReplicaPlan, requestTime);
 
         if (replicaPlan.contacts().size() == 1 && replicaPlan.contacts().get(0).isSelf())
         {
-            Stage.READ.execute(new StorageProxy.LocalReadRunnable(rangeCommand, handler, trackRepairedStatus));
+            Stage.READ.execute(new StorageProxy.LocalReadRunnable(rangeCommand, handler, requestTime, trackRepairedStatus));
         }
         else
         {
@@ -206,7 +213,7 @@ class RangeCommandIterator extends AbstractIterator<RowIterator> implements Part
             {
                 Tracing.trace("Enqueuing request to {}", replica);
                 ReadCommand command = replica.isFull() ? rangeCommand : rangeCommand.copyAsTransientQuery(replica);
-                Message<ReadCommand> message = command.createMessage(trackRepairedStatus && replica.isFull());
+                Message<ReadCommand> message = command.createMessage(trackRepairedStatus && replica.isFull(), requestTime);
                 MessagingService.instance().sendWithCallback(message, replica.endpoint(), handler);
             }
         }
@@ -214,7 +221,7 @@ class RangeCommandIterator extends AbstractIterator<RowIterator> implements Part
         return new SingleRangeResponse(resolver, handler, readRepair);
     }
 
-    private PartitionIterator sendNextRequests()
+    PartitionIterator sendNextRequests()
     {
         List<PartitionIterator> concurrentQueries = new ArrayList<>(concurrencyFactor);
         List<ReadRepair<?, ?>> readRepairs = new ArrayList<>(concurrencyFactor);
@@ -225,7 +232,6 @@ class RangeCommandIterator extends AbstractIterator<RowIterator> implements Part
             {
                 ReplicaPlan.ForRangeRead replicaPlan = replicaPlans.next();
 
-                @SuppressWarnings("resource") // response will be closed by concatAndBlockOnRepair, or in the catch block below
                 SingleRangeResponse response = query(replicaPlan, i == 0);
                 concurrentQueries.add(response);
                 readRepairs.add(response.getReadRepair());
@@ -262,8 +268,11 @@ class RangeCommandIterator extends AbstractIterator<RowIterator> implements Part
         }
         finally
         {
-            long latency = System.nanoTime() - startTime;
+            // We track latency based on request processing time, since the amount of time that request spends in the queue
+            // is not a representative metric of replica performance.
+            long latency = nanoTime() - requestTime.startedAtNanos();
             rangeMetrics.addNano(latency);
+            rangeMetrics.roundTrips.update(batchesRequested);
             Keyspace.openAndGetStore(command.metadata()).metric.coordinatorScanLatency.update(latency, TimeUnit.NANOSECONDS);
         }
     }

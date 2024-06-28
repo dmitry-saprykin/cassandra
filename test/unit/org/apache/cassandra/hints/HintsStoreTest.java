@@ -19,7 +19,6 @@
 package org.apache.cassandra.hints;
 
 import java.io.Closeable;
-import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
@@ -31,20 +30,27 @@ import java.util.concurrent.TimeUnit;
 
 import com.google.common.collect.ImmutableMap;
 import com.google.common.util.concurrent.Uninterruptibles;
+import org.junit.Assert;
 import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.SchemaLoader;
-import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.db.RowUpdateBuilder;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.schema.KeyspaceParams;
+import org.hamcrest.Matchers;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
 
 import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
-import static junit.framework.Assert.*;
 
 public class HintsStoreTest
 {
@@ -56,7 +62,7 @@ public class HintsStoreTest
     @Before
     public void testSetup() throws IOException
     {
-        directory = Files.createTempDirectory(null).toFile();
+        directory = new File(Files.createTempDirectory(null));
         directory.deleteOnExit();
         hostId = UUID.randomUUID();
     }
@@ -107,12 +113,13 @@ public class HintsStoreTest
 
     /**
      * Test multiple threads delete hints files.
-     * It could happens when hint services is running a removal process, meanwhile operator issues a NodeTool command to delete.
+     * It could happen when hint service is running a removal process, meanwhile operator issues a NodeTool command to delete.
      *
      * Thread contends and delete part of the files in the store. The final effect should all files get deleted.
      */
     @Test
-    public void testConcurrentDeleteExpiredHints() throws Exception {
+    public void testConcurrentDeleteExpiredHints() throws Exception
+    {
         final long now = System.currentTimeMillis();
         for (int i = 100; i >= 0; i--)
         {
@@ -137,6 +144,28 @@ public class HintsStoreTest
         assertFalse("All hints files should be deleted", store.hasFiles());
     }
 
+    @Test
+    public void testPendingHintsInfo() throws Exception
+    {
+        HintsStore store = HintsCatalog.load(directory, ImmutableMap.of()).get(hostId);
+        assertNull(store.getPendingHintsInfo());
+
+        final long t1 = 10;
+        HintsDescriptor d1 = new HintsDescriptor(hostId, t1);
+        writeHints(directory, d1, 100, t1);
+        long d1Size = d1.hintsFileSize(directory);
+        store = HintsCatalog.load(directory, ImmutableMap.of()).get(hostId);
+        assertEquals(new PendingHintsInfo(store.hostId, 1, t1, t1, d1Size, 0, 0),
+                     store.getPendingHintsInfo());
+        final long t2 = t1 + 1;
+        HintsDescriptor d2 = new HintsDescriptor(hostId, t2);
+        writeHints(directory, d2, 100, t2);
+        long d2Size = d2.hintsFileSize(directory);
+        store = HintsCatalog.load(directory, ImmutableMap.of()).get(hostId);
+        assertEquals(new PendingHintsInfo(store.hostId, 2, t1, t2, d1Size + d2Size, 0, 0),
+                     store.getPendingHintsInfo());
+    }
+
     private long writeHints(File directory, HintsDescriptor descriptor, int hintsCount, long hintCreationTime) throws IOException
     {
         try (HintsWriter writer = HintsWriter.create(directory, descriptor))
@@ -149,6 +178,7 @@ public class HintsStoreTest
             }
             FileUtils.clean(buffer);
         }
+        Assert.assertThat(descriptor.hintsFileSize(directory), Matchers.greaterThan(0L));
         return new File(directory, descriptor.fileName()).lastModified(); // hint file last modified time
     }
 

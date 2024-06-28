@@ -20,11 +20,19 @@
  */
 package org.apache.cassandra.db.lifecycle;
 
-import java.io.File;
-import java.io.FilenameFilter;
+
 import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.function.BiPredicate;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -33,7 +41,9 @@ import java.util.zip.CRC32;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.SSTable;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.io.util.PathUtils;
 import org.apache.cassandra.utils.FBUtilities;
 
 /**
@@ -151,7 +161,7 @@ final class LogRecord
 
     public static LogRecord make(Type type, SSTable table)
     {
-        String absoluteTablePath = absolutePath(table.descriptor.baseFilename());
+        String absoluteTablePath = absolutePath(table.descriptor.baseFile());
         return make(type, getExistingFiles(absoluteTablePath), table.getAllFilePaths().size(), absoluteTablePath);
     }
 
@@ -160,7 +170,7 @@ final class LogRecord
         // contains a mapping from sstable absolute path (everything up until the 'Data'/'Index'/etc part of the filename) to the sstable
         Map<String, SSTable> absolutePaths = new HashMap<>();
         for (SSTableReader table : tables)
-            absolutePaths.put(absolutePath(table.descriptor.baseFilename()), table);
+            absolutePaths.put(absolutePath(table.descriptor.baseFile()), table);
 
         // maps sstable base file name to the actual files on disk
         Map<String, List<File>> existingFiles = getExistingFiles(absolutePaths.keySet());
@@ -175,9 +185,9 @@ final class LogRecord
         return records;
     }
 
-    private static String absolutePath(String baseFilename)
+    private static String absolutePath(File baseFile)
     {
-        return FileUtils.getCanonicalPath(baseFilename + Component.separator);
+        return baseFile.withSuffix(String.valueOf(Component.separator)).canonicalPath();
     }
 
     public LogRecord withExistingFiles(List<File> existingFiles)
@@ -283,8 +293,8 @@ final class LogRecord
 
     public static List<File> getExistingFiles(String absoluteFilePath)
     {
-        Path path = Paths.get(absoluteFilePath);
-        File[] files = path.getParent().toFile().listFiles((dir, name) -> name.startsWith(path.getFileName().toString()));
+        File file = new File(absoluteFilePath);
+        File[] files = file.parent().tryList((dir, name) -> name.startsWith(file.name()));
         // files may be null if the directory does not exist yet, e.g. when tracking new files
         return files == null ? Collections.emptyList() : Arrays.asList(files);
     }
@@ -302,13 +312,13 @@ final class LogRecord
         Map<File, TreeSet<String>> dirToFileNamePrefix = new HashMap<>();
         for (String absolutePath : absoluteFilePaths)
         {
-            Path fullPath = Paths.get(absolutePath);
+            Path fullPath = new File(absolutePath).toPath();
             Path path = fullPath.getParent();
             if (path != null)
-                dirToFileNamePrefix.computeIfAbsent(path.toFile(), (k) -> new TreeSet<>()).add(fullPath.getFileName().toString());
+                dirToFileNamePrefix.computeIfAbsent(new File(path), (k) -> new TreeSet<>()).add(fullPath.getFileName().toString());
         }
 
-        FilenameFilter ff = (dir, name) -> {
+        BiPredicate<File, String> ff = (dir, name) -> {
             TreeSet<String> dirSet = dirToFileNamePrefix.get(dir);
             // if the set contains a prefix of the current file name, the file name we have here should sort directly
             // after the prefix in the tree set, which means we can use 'floor' to get the prefix (returns the largest
@@ -317,7 +327,7 @@ final class LogRecord
             String baseName = dirSet.floor(name);
             if (baseName != null && name.startsWith(baseName))
             {
-                String absolutePath = new File(dir, baseName).getPath();
+                String absolutePath = new File(dir, baseName).path();
                 fileMap.computeIfAbsent(absolutePath, k -> new ArrayList<>()).add(new File(dir, name));
             }
             return false;
@@ -325,7 +335,7 @@ final class LogRecord
 
         // populate the file map:
         for (File f : dirToFileNamePrefix.keySet())
-            f.listFiles(ff);
+            f.tryList(ff);
 
         return fileMap;
     }
@@ -338,14 +348,12 @@ final class LogRecord
 
     String fileName()
     {
-        return absolutePath.isPresent() ? Paths.get(absolutePath.get()).getFileName().toString() : "";
+        return absolutePath.isPresent() ? new File(absolutePath.get()).name() : "";
     }
 
     boolean isInFolder(Path folder)
     {
-        return absolutePath.isPresent()
-               ? FileUtils.isContained(folder.toFile(), Paths.get(absolutePath.get()).toFile())
-               : false;
+        return absolutePath.isPresent() && PathUtils.isContained(folder, new File(absolutePath.get()).toPath());
     }
 
     String absolutePath()

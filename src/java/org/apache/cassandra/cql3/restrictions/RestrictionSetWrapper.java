@@ -18,20 +18,20 @@
 package org.apache.cassandra.cql3.restrictions;
 
 import java.util.List;
-import java.util.Set;
 
 import org.apache.commons.lang3.builder.ToStringBuilder;
 import org.apache.commons.lang3.builder.ToStringStyle;
 
-import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.db.filter.RowFilter;
+import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.IndexRegistry;
+import org.apache.cassandra.schema.ColumnMetadata;
 
 /**
- * A <code>RestrictionSet</code> wrapper that can be extended to allow to modify the <code>RestrictionSet</code>
- * behaviour without breaking its immutability. Sub-classes should be immutables.
+ * A {@link RestrictionSet} wrapper that can be extended to allow to modify the {@code RestrictionSet}
+ * behaviour without breaking its immutability. Subclasses should be immutable.
  */
 class RestrictionSetWrapper implements Restrictions
 {
@@ -45,21 +45,33 @@ class RestrictionSetWrapper implements Restrictions
         this.restrictions = restrictions;
     }
 
-    public void addRowFilterTo(RowFilter filter,
+    public void addToRowFilter(RowFilter filter,
                                IndexRegistry indexRegistry,
                                QueryOptions options)
     {
-        restrictions.addRowFilterTo(filter, indexRegistry, options);
+        restrictions.addToRowFilter(filter, indexRegistry, options);
     }
 
-    public List<ColumnMetadata> getColumnDefs()
+    public List<ColumnMetadata> columns()
     {
-        return restrictions.getColumnDefs();
+        return restrictions.columns();
     }
 
     public void addFunctionsTo(List<Function> functions)
     {
         restrictions.addFunctionsTo(functions);
+    }
+
+    @Override
+    public boolean isRestrictedByEquals(ColumnMetadata column)
+    {
+        return restrictions.isRestrictedByEquals(column);
+    }
+
+    @Override
+    public boolean isRestrictedByEqualsOrIN(ColumnMetadata column)
+    {
+        return restrictions.isRestrictedByEqualsOrIN(column);
     }
 
     public boolean isEmpty()
@@ -74,27 +86,35 @@ class RestrictionSetWrapper implements Restrictions
 
     public boolean hasSupportingIndex(IndexRegistry indexRegistry)
     {
-        return restrictions.hasSupportingIndex(indexRegistry);
+        return restrictions.hasSupportingIndex(indexRegistry.listIndexes());
     }
 
-    public ColumnMetadata getFirstColumn()
+    @Override
+    public Index findSupportingIndex(Iterable<Index> indexes)
     {
-        return restrictions.getFirstColumn();
+        return restrictions.findSupportingIndex(indexes);
     }
 
-    public ColumnMetadata getLastColumn()
+    @Override
+    public boolean needsFiltering(Index.Group indexGroup)
     {
-        return restrictions.getLastColumn();
+        return restrictions.needsFiltering(indexGroup);
     }
 
-    public boolean hasIN()
+    @Override
+    public boolean needsFilteringOrIndexing()
     {
-        return restrictions.hasIN();
+        return restrictions.needsFilteringOrIndexing();
     }
 
-    public boolean hasContains()
+    public ColumnMetadata firstColumn()
     {
-        return restrictions.hasContains();
+        return restrictions.firstColumn();
+    }
+
+    public ColumnMetadata lastColumn()
+    {
+        return restrictions.lastColumn();
     }
 
     public boolean hasSlice()
@@ -102,16 +122,22 @@ class RestrictionSetWrapper implements Restrictions
         return restrictions.hasSlice();
     }
 
-    public boolean hasOnlyEqualityRestrictions()
+    @Override
+    public boolean hasIN()
     {
-        return restrictions.hasOnlyEqualityRestrictions();
+        return restrictions.hasIN();
     }
 
-    public Set<Restriction> getRestrictions(ColumnMetadata columnDef)
+    public boolean hasOnlyEqualityRestrictions()
     {
-        return restrictions.getRestrictions(columnDef);
+        for (ColumnMetadata column : columns())
+        {
+            if (!isRestrictedByEqualsOrIN(column))
+                return false;
+        }
+        return true;
     }
-    
+
     @Override
     public String toString()
     {

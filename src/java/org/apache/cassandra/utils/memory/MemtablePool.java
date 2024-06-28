@@ -29,8 +29,11 @@ import com.codahale.metrics.Gauge;
 import com.codahale.metrics.Timer;
 import org.apache.cassandra.metrics.CassandraMetricsRegistry;
 import org.apache.cassandra.metrics.DefaultNameFactory;
+import org.apache.cassandra.metrics.MetricNameFactory;
 import org.apache.cassandra.utils.concurrent.WaitQueue;
 import org.apache.cassandra.utils.ExecutorUtils;
+
+import static org.apache.cassandra.utils.concurrent.WaitQueue.newWaitQueue;
 
 
 /**
@@ -39,6 +42,7 @@ import org.apache.cassandra.utils.ExecutorUtils;
  */
 public abstract class MemtablePool
 {
+    public static final String TYPE_NAME = "MemtablePool";
     final MemtableCleanerThread<?> cleaner;
 
     // the total memory used by this pool
@@ -48,7 +52,7 @@ public abstract class MemtablePool
     public final Timer blockedOnAllocating;
     public final Gauge<Long> numPendingTasks;
 
-    final WaitQueue hasRoom = new WaitQueue();
+    final WaitQueue hasRoom = newWaitQueue();
 
     MemtablePool(long maxOnHeapMemory, long maxOffHeapMemory, float cleanThreshold, MemtableCleaner cleaner)
     {
@@ -57,8 +61,7 @@ public abstract class MemtablePool
         this.onHeap = getSubPool(maxOnHeapMemory, cleanThreshold);
         this.offHeap = getSubPool(maxOffHeapMemory, cleanThreshold);
         this.cleaner = getCleaner(cleaner);
-        this.cleaner.start();
-        DefaultNameFactory nameFactory = new DefaultNameFactory("MemtablePool");
+        MetricNameFactory nameFactory = new DefaultNameFactory(TYPE_NAME);
         blockedOnAllocating = CassandraMetricsRegistry.Metrics.timer(nameFactory.createMetricName("BlockedOnAllocation"));
         numPendingTasks = CassandraMetricsRegistry.Metrics.register(nameFactory.createMetricName("PendingFlushTasks"),
                                                                     () -> (long) this.cleaner.numPendingTasks());
@@ -80,7 +83,7 @@ public abstract class MemtablePool
         ExecutorUtils.shutdownNowAndWait(timeout, unit, cleaner);
     }
 
-    public abstract MemtableAllocator newAllocator();
+    public abstract MemtableAllocator newAllocator(String table);
 
     public boolean needsCleaning()
     {
@@ -190,7 +193,7 @@ public abstract class MemtablePool
 
         void released(long size)
         {
-            assert size >= 0;
+            assert size >= 0 : "Negative released: " + size;
             adjustAllocated(-size);
             hasRoom.signalAll();
         }

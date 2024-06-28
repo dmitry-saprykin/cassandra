@@ -23,9 +23,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.regex.Pattern;
 
-import org.apache.cassandra.cql3.Term;
-import org.apache.cassandra.serializers.TypeSerializer;
-import org.apache.cassandra.serializers.BytesSerializer;
+import org.apache.cassandra.cql3.terms.Term;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
@@ -41,6 +39,12 @@ public abstract class AbstractCompositeType extends AbstractType<ByteBuffer>
     protected AbstractCompositeType()
     {
         super(ComparisonType.CUSTOM);
+    }
+
+    @Override
+    public boolean allowsEmpty()
+    {
+        return true;
     }
 
     public <VL, VR> int compareCustom(VL left, ValueAccessor<VL> accessorL, VR right, ValueAccessor<VR> accessorR)
@@ -59,7 +63,7 @@ public abstract class AbstractCompositeType extends AbstractType<ByteBuffer>
         int offsetL = startingOffset(isStaticL);
         int offsetR = startingOffset(isStaticR);
 
-        while (!accessorL.isEmptyFromOffset(left, offsetL) && !accessorR.isEmptyFromOffset(right, offsetL))
+        while (!accessorL.isEmptyFromOffset(left, offsetL) && !accessorR.isEmptyFromOffset(right, offsetR))
         {
             AbstractType<?> comparator = getComparator(i, left, accessorL, right, accessorR, offsetL, offsetR);
             offsetL += getComparatorSize(i, left, accessorL, offsetL);
@@ -208,8 +212,8 @@ public abstract class AbstractCompositeType extends AbstractType<ByteBuffer>
     public ByteBuffer fromString(String source)
     {
         List<String> parts = split(source);
-        List<ByteBuffer> components = new ArrayList<ByteBuffer>(parts.size());
-        List<ParsedComparator> comparators = new ArrayList<ParsedComparator>(parts.size());
+        List<ByteBuffer> components = new ArrayList<>(parts.size());
+        List<ParsedComparator> comparators = new ArrayList<>(parts.size());
         int totalLength = 0, i = 0;
         boolean lastByteIsOne = false;
         boolean lastByteIsMinusOne = false;
@@ -232,6 +236,7 @@ public abstract class AbstractCompositeType extends AbstractType<ByteBuffer>
             part = p.getRemainingPart();
 
             ByteBuffer component = type.fromString(unescape(part));
+            type.validate(component);
             totalLength += p.getComparatorSerializedSize() + 2 + component.remaining() + 1;
             components.add(component);
             comparators.add(p);
@@ -244,7 +249,7 @@ public abstract class AbstractCompositeType extends AbstractType<ByteBuffer>
         {
             comparators.get(i).serializeComparator(bb);
             ByteBufferUtil.writeShortLength(bb, component.remaining());
-            bb.put(component); // it's ok to consume component as we won't use it anymore
+            bb.put(component.duplicate()); // it's not ok to consume component as we did not create it (CASSANDRA-14752)
             bb.put((byte)0);
             ++i;
         }
@@ -266,6 +271,7 @@ public abstract class AbstractCompositeType extends AbstractType<ByteBuffer>
     @Override
     public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
+        // TODO: suport toJSONString (CASSANDRA-18177)
         throw new UnsupportedOperationException();
     }
 
@@ -289,7 +295,7 @@ public abstract class AbstractCompositeType extends AbstractType<ByteBuffer>
 
             if (accessor.sizeFromOffset(input, offset) < 2)
                 throw new MarshalException("Not enough bytes to read value size of component " + i);
-            int length = accessor.getShort(input, offset);
+            int length = accessor.getUnsignedShort(input, offset);
             offset += 2;
 
             if (accessor.sizeFromOffset(input, offset) < length)
@@ -311,11 +317,6 @@ public abstract class AbstractCompositeType extends AbstractType<ByteBuffer>
     }
 
     public abstract ByteBuffer decompose(Object... objects);
-
-    public TypeSerializer<ByteBuffer> getSerializer()
-    {
-        return BytesSerializer.instance;
-    }
 
     abstract protected <V> int getComparatorSize(int i, V value, ValueAccessor<V> accessor, int offset);
     /**

@@ -20,12 +20,12 @@ package org.apache.cassandra.tools.nodetool;
 
 import org.junit.BeforeClass;
 import org.junit.Test;
-import org.junit.runner.RunWith;
 
-import org.apache.cassandra.OrderedJUnit4ClassRunner;
-import org.apache.cassandra.SchemaLoader;
+import org.apache.cassandra.auth.AuthCacheService;
 import org.apache.cassandra.auth.AuthTestUtils;
 import org.apache.cassandra.auth.AuthenticatedUser;
+import org.apache.cassandra.auth.IRoleManager;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.tools.ToolRunner;
 
@@ -34,22 +34,17 @@ import static org.apache.cassandra.auth.AuthTestUtils.ROLE_B;
 import static org.apache.cassandra.auth.AuthTestUtils.getNetworkPermissionsReadCount;
 import static org.assertj.core.api.Assertions.assertThat;
 
-@RunWith(OrderedJUnit4ClassRunner.class)
 public class InvalidateNetworkPermissionsCacheTest extends CQLTester
 {
     @BeforeClass
     public static void setup() throws Exception
     {
-        SchemaLoader.prepareServer();
-        AuthTestUtils.LocalCassandraRoleManager roleManager = new AuthTestUtils.LocalCassandraRoleManager();
-        SchemaLoader.setupAuth(roleManager,
-                new AuthTestUtils.LocalPasswordAuthenticator(),
-                new AuthTestUtils.LocalCassandraAuthorizer(),
-                new AuthTestUtils.LocalCassandraNetworkAuthorizer());
-
-        roleManager.createRole(AuthenticatedUser.SYSTEM_USER, ROLE_A, AuthTestUtils.getLoginRoleOprions());
-        roleManager.createRole(AuthenticatedUser.SYSTEM_USER, ROLE_B, AuthTestUtils.getLoginRoleOprions());
-
+        CQLTester.requireAuthentication();
+        IRoleManager roleManager = DatabaseDescriptor.getRoleManager();
+        roleManager.createRole(AuthenticatedUser.SYSTEM_USER, ROLE_A, AuthTestUtils.getLoginRoleOptions());
+        roleManager.createRole(AuthenticatedUser.SYSTEM_USER, ROLE_B, AuthTestUtils.getLoginRoleOptions());
+        AuthCacheService.initializeAndRegisterCaches();
+        requireNetwork();
         startJMXServer();
     }
 

@@ -21,7 +21,6 @@ package org.apache.cassandra.db.view;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Iterator;
-import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -29,10 +28,8 @@ import java.util.concurrent.atomic.AtomicLong;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Function;
 import com.google.common.base.Objects;
-import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterators;
 import com.google.common.collect.PeekingIterator;
-import com.google.common.util.concurrent.Futures;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -59,9 +56,12 @@ import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.io.sstable.ReducingKeyIterator;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.service.StorageProxy;
+import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.utils.UUIDGen;
+import org.apache.cassandra.utils.TimeUUID;
 import org.apache.cassandra.utils.concurrent.Refs;
+
+import static org.apache.cassandra.utils.TimeUUID.Generator.nextTimeUUID;
 
 public class ViewBuilderTask extends CompactionInfo.Holder implements Callable<Long>
 {
@@ -72,7 +72,7 @@ public class ViewBuilderTask extends CompactionInfo.Holder implements Callable<L
     private final ColumnFamilyStore baseCfs;
     private final View view;
     private final Range<Token> range;
-    private final UUID compactionId;
+    private final TimeUUID compactionId;
     private volatile Token prevToken;
     private volatile long keysBuilt = 0;
     private volatile boolean isStopped = false;
@@ -84,12 +84,11 @@ public class ViewBuilderTask extends CompactionInfo.Holder implements Callable<L
         this.baseCfs = baseCfs;
         this.view = view;
         this.range = range;
-        this.compactionId = UUIDGen.getTimeUUID();
+        this.compactionId = nextTimeUUID();
         this.prevToken = lastToken;
         this.keysBuilt = keysBuilt;
     }
 
-    @SuppressWarnings("resource")
     private void buildKey(DecoratedKey key)
     {
         ReadQuery selectQuery = view.getReadQuery();
@@ -100,7 +99,7 @@ public class ViewBuilderTask extends CompactionInfo.Holder implements Callable<L
             return;
         }
 
-        int nowInSec = FBUtilities.nowInSeconds();
+        long nowInSec = FBUtilities.nowInSeconds();
         SinglePartitionReadCommand command = view.getSelectStatement().internalReadForView(key, nowInSec);
 
         // We're rebuilding everything from what's on disk, so we read everything, consider that as new updates
@@ -111,11 +110,11 @@ public class ViewBuilderTask extends CompactionInfo.Holder implements Callable<L
              UnfilteredRowIterator data = UnfilteredPartitionIterators.getOnlyElement(command.executeLocally(orderGroup), command))
         {
             Iterator<Collection<Mutation>> mutations = baseCfs.keyspace.viewManager
-                                                       .forTable(baseCfs.metadata.id)
+                                                       .forTable(baseCfs.metadata.get())
                                                        .generateViewUpdates(Collections.singleton(view), data, empty, nowInSec, true);
 
             AtomicLong noBase = new AtomicLong(Long.MAX_VALUE);
-            mutations.forEachRemaining(m -> StorageProxy.mutateMV(key.getKey(), m, true, noBase, System.nanoTime()));
+            mutations.forEachRemaining(m -> StorageProxy.mutateMV(key.getKey(), m, true, noBase, Dispatcher.RequestTime.forImmediateExecution()));
         }
     }
 
@@ -135,7 +134,7 @@ public class ViewBuilderTask extends CompactionInfo.Holder implements Callable<L
          */
         boolean schemaConverged = Gossiper.instance.waitForSchemaAgreement(10, TimeUnit.SECONDS, () -> this.isStopped);
         if (!schemaConverged)
-            logger.warn("Failed to get schema to converge before building view {}.{}", baseCfs.keyspace.getName(), view.name);
+            logger.warn("Failed to get schema to converge before building view {}.{}", baseCfs.getKeyspaceName(), view.name);
 
         Function<org.apache.cassandra.db.lifecycle.View, Iterable<SSTableReader>> function;
         function = org.apache.cassandra.db.lifecycle.View.select(SSTableSet.CANONICAL, s -> range.intersects(s.getBounds()));
@@ -175,7 +174,7 @@ public class ViewBuilderTask extends CompactionInfo.Holder implements Callable<L
 
     private void finish()
     {
-        String ksName = baseCfs.keyspace.getName();
+        String ksName = baseCfs.getKeyspaceName();
         if (!isStopped)
         {
             // Save the completed status using the end of the range as last token. This way it will be possible for

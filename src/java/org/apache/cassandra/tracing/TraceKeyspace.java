@@ -21,11 +21,14 @@ import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.*;
 
+import com.google.common.collect.ImmutableSet;
+
+import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.cql3.statements.schema.CreateTableStatement;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.db.rows.Row;
-import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.schema.SchemaConstants;
@@ -33,15 +36,17 @@ import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.Tables;
 import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.utils.UUIDGen;
 
 import static java.lang.String.format;
+import static org.apache.cassandra.utils.TimeUUID.Generator.nextTimeUUID;
 
 public final class TraceKeyspace
 {
     private TraceKeyspace()
     {
     }
+
+    public static final int DEFAULT_RF = CassandraRelevantProperties.SYSTEM_TRACES_DEFAULT_RF.getInt();
 
     /**
      * Generation is used as a timestamp for automatic table creation on startup.
@@ -62,34 +67,33 @@ public final class TraceKeyspace
 
     public static final String SESSIONS = "sessions";
     public static final String EVENTS = "events";
+    public static final Set<String> TABLE_NAMES = ImmutableSet.of(SESSIONS, EVENTS);
 
+    public static final String SESSIONS_CQL = "CREATE TABLE IF NOT EXISTS %s ("
+                                              + "session_id uuid,"
+                                              + "command text,"
+                                              + "client inet,"
+                                              + "coordinator inet,"
+                                              + "coordinator_port int,"
+                                              + "duration int,"
+                                              + "parameters map<text, text>,"
+                                              + "request text,"
+                                              + "started_at timestamp,"
+                                              + "PRIMARY KEY ((session_id)))";
     private static final TableMetadata Sessions =
-        parse(SESSIONS,
-                "tracing sessions",
-                "CREATE TABLE %s ("
-                + "session_id uuid,"
-                + "command text,"
-                + "client inet,"
-                + "coordinator inet,"
-                + "coordinator_port int,"
-                + "duration int,"
-                + "parameters map<text, text>,"
-                + "request text,"
-                + "started_at timestamp,"
-                + "PRIMARY KEY ((session_id)))");
+        parse(SESSIONS, "tracing sessions", SESSIONS_CQL);
 
+    public static final String EVENTS_CQL = "CREATE TABLE IF NOT EXISTS %s ("
+                                            + "session_id uuid,"
+                                            + "event_id timeuuid,"
+                                            + "activity text,"
+                                            + "source inet,"
+                                            + "source_port int,"
+                                            + "source_elapsed int,"
+                                            + "thread text,"
+                                            + "PRIMARY KEY ((session_id), event_id))";
     private static final TableMetadata Events =
-        parse(EVENTS,
-                "tracing events",
-                "CREATE TABLE %s ("
-                + "session_id uuid,"
-                + "event_id timeuuid,"
-                + "activity text,"
-                + "source inet,"
-                + "source_port int,"
-                + "source_elapsed int,"
-                + "thread text,"
-                + "PRIMARY KEY ((session_id), event_id))");
+        parse(EVENTS, "tracing events", EVENTS_CQL);
 
     private static TableMetadata parse(String table, String description, String cql)
     {
@@ -102,7 +106,7 @@ public final class TraceKeyspace
 
     public static KeyspaceMetadata metadata()
     {
-        return KeyspaceMetadata.create(SchemaConstants.TRACE_KEYSPACE_NAME, KeyspaceParams.simple(2), Tables.of(Sessions, Events));
+        return KeyspaceMetadata.create(SchemaConstants.TRACE_KEYSPACE_NAME, KeyspaceParams.simple(Math.max(DEFAULT_RF, DatabaseDescriptor.getDefaultKeyspaceRF())), Tables.of(Sessions, Events));
     }
 
     static Mutation makeStartSessionMutation(ByteBuffer sessionId,
@@ -117,10 +121,9 @@ public final class TraceKeyspace
         Row.SimpleBuilder rb = builder.row();
         rb.ttl(ttl)
           .add("client", client)
-          .add("coordinator", FBUtilities.getBroadcastAddressAndPort().address);
-        if (!Gossiper.instance.hasMajorVersion3Nodes())
-            rb.add("coordinator_port", FBUtilities.getBroadcastAddressAndPort().port);
-        rb.add("request", request)
+          .add("coordinator", FBUtilities.getBroadcastAddressAndPort().getAddress())
+          .add("coordinator_port", FBUtilities.getBroadcastAddressAndPort().getPort())
+          .add("request", request)
           .add("started_at", new Date(startedAt))
           .add("command", command)
           .appendAll("parameters", parameters);
@@ -140,14 +143,13 @@ public final class TraceKeyspace
     static Mutation makeEventMutation(ByteBuffer sessionId, String message, int elapsed, String threadName, int ttl)
     {
         PartitionUpdate.SimpleBuilder builder = PartitionUpdate.simpleBuilder(Events, sessionId);
-        Row.SimpleBuilder rowBuilder = builder.row(UUIDGen.getTimeUUID())
+        Row.SimpleBuilder rowBuilder = builder.row(nextTimeUUID())
                                               .ttl(ttl);
 
         rowBuilder.add("activity", message)
-                  .add("source", FBUtilities.getBroadcastAddressAndPort().address);
-        if (!Gossiper.instance.hasMajorVersion3Nodes())
-            rowBuilder.add("source_port", FBUtilities.getBroadcastAddressAndPort().port);
-        rowBuilder.add("thread", threadName);
+                  .add("source", FBUtilities.getBroadcastAddressAndPort().getAddress())
+                  .add("source_port", FBUtilities.getBroadcastAddressAndPort().getPort())
+                  .add("thread", threadName);
 
         if (elapsed >= 0)
             rowBuilder.add("source_elapsed", elapsed);

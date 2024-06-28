@@ -18,15 +18,16 @@
 
 package org.apache.cassandra.db.compaction;
 
-import java.util.concurrent.TimeUnit;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
+import org.apache.cassandra.Util;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
@@ -34,6 +35,7 @@ import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.Throwables;
 import org.jboss.byteman.contrib.bmunit.BMRule;
 import org.jboss.byteman.contrib.bmunit.BMRules;
 import org.jboss.byteman.contrib.bmunit.BMUnitRunner;
@@ -53,7 +55,7 @@ public class CompactionsBytemanTest extends CQLTester
     @Test
     @BMRules(rules = { @BMRule(name = "One SSTable too big for remaining disk space test",
     targetClass = "Directories",
-    targetMethod = "hasAvailableDiskSpace",
+    targetMethod = "hasDiskSpaceForCompactionsAndStreams",
     condition = "not flagged(\"done\")",
     action = "flag(\"done\"); return false;") } )
     public void testSSTableNotEnoughDiskSpaceForCompactionGetsDropped() throws Throwable
@@ -78,7 +80,7 @@ public class CompactionsBytemanTest extends CQLTester
     @Test
     @BMRules(rules = { @BMRule(name = "No disk space with expired SSTables test",
     targetClass = "Directories",
-    targetMethod = "hasAvailableDiskSpace",
+    targetMethod = "hasDiskSpaceForCompactionsAndStreams",
     action = "return false;") } )
     public void testExpiredSSTablesStillGetDroppedWithNoDiskSpace() throws Throwable
     {
@@ -101,7 +103,7 @@ public class CompactionsBytemanTest extends CQLTester
     @Test(expected = RuntimeException.class)
     @BMRules(rules = { @BMRule(name = "No disk space with expired SSTables test",
     targetClass = "Directories",
-    targetMethod = "hasAvailableDiskSpace",
+    targetMethod = "hasDiskSpaceForCompactionsAndStreams",
     action = "return false;") } )
     public void testRuntimeExceptionWhenNoDiskSpaceForCompaction() throws Throwable
     {
@@ -118,8 +120,8 @@ public class CompactionsBytemanTest extends CQLTester
             targetClass = "CompactionManager",
             targetMethod = "submitBackground",
             targetLocation = "AT INVOKE java.util.concurrent.Future.isCancelled",
-            condition = "!$cfs.keyspace.getName().contains(\"system\")",
-            action = "Thread.sleep(1000)")
+            condition = "!$cfs.getKeyspaceName().contains(\"system\")",
+            action = "Thread.sleep(5000)")
     public void testCompactingCFCounting() throws Throwable
     {
         createTable("CREATE TABLE %s (k INT, c INT, v INT, PRIMARY KEY (k, c))");
@@ -127,9 +129,10 @@ public class CompactionsBytemanTest extends CQLTester
         cfs.enableAutoCompaction();
 
         execute("INSERT INTO %s (k, c, v) VALUES (?, ?, ?)", 0, 1, 1);
-        assertEquals(0, CompactionManager.instance.compactingCF.count(cfs));
-        cfs.forceBlockingFlush();
+        Util.spinAssertEquals(true, () -> CompactionManager.instance.compactingCF.count(cfs) == 0, 5);
+        Util.flush(cfs);
 
+        Util.spinAssertEquals(true, () -> CompactionManager.instance.compactingCF.count(cfs) == 0, 5);
         FBUtilities.waitOnFutures(CompactionManager.instance.submitBackground(cfs));
         assertEquals(0, CompactionManager.instance.compactingCF.count(cfs));
     }
@@ -145,7 +148,7 @@ public class CompactionsBytemanTest extends CQLTester
         {
             execute("INSERT INTO %s (id, val) values (2, 'immortal')");
         }
-        cfs.forceBlockingFlush();
+        Util.flush(cfs);
     }
 
     private void createLowGCGraceTable(){
@@ -192,7 +195,7 @@ public class CompactionsBytemanTest extends CQLTester
             {
                 execute("insert into %s (k, c, v) values (?, ?, ?)", i, j, i*j);
             }
-            cfs.forceBlockingFlush();
+            Util.flush(cfs);
         }
         cfs.getCompactionStrategyManager().mutateRepaired(cfs.getLiveSSTables(), System.currentTimeMillis(), null, false);
         for (int i = 0; i < 5; i++)
@@ -201,7 +204,7 @@ public class CompactionsBytemanTest extends CQLTester
             {
                 execute("insert into %s (k, c, v) values (?, ?, ?)", i, j, i*j);
             }
-            cfs.forceBlockingFlush();
+            Util.flush(cfs);
         }
 
         assertTrue(cfs.getTracker().getCompacting().isEmpty());
@@ -214,7 +217,7 @@ public class CompactionsBytemanTest extends CQLTester
         }
         catch (RuntimeException t)
         {
-            if (!(t.getCause().getCause() instanceof CompactionInterruptedException))
+            if (!Throwables.isCausedBy(t, CompactionInterruptedException.class::isInstance))
                 throw t;
             //expected
         }

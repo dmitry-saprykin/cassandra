@@ -47,6 +47,7 @@ import org.apache.cassandra.transport.messages.PrepareMessage;
 import org.apache.cassandra.transport.messages.QueryMessage;
 import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.utils.MD5Digest;
+import org.apache.cassandra.utils.ReflectionUtils;
 
 import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
 
@@ -66,7 +67,7 @@ public class MessagePayloadTest extends CQLTester
             cqlQueryHandlerField = ClientState.class.getDeclaredField("cqlQueryHandler");
             cqlQueryHandlerField.setAccessible(true);
 
-            Field modifiersField = Field.class.getDeclaredField("modifiers");
+            Field modifiersField = ReflectionUtils.getModifiersField();
             modifiersAccessible = modifiersField.isAccessible();
             modifiersField.setAccessible(true);
             modifiersField.setInt(cqlQueryHandlerField, cqlQueryHandlerField.getModifiers() & ~Modifier.FINAL);
@@ -84,7 +85,7 @@ public class MessagePayloadTest extends CQLTester
             return;
         try
         {
-            Field modifiersField = Field.class.getDeclaredField("modifiers");
+            Field modifiersField = ReflectionUtils.getModifiersField();
             modifiersField.setAccessible(true);
             modifiersField.setInt(cqlQueryHandlerField, cqlQueryHandlerField.getModifiers() | Modifier.FINAL);
 
@@ -170,7 +171,7 @@ public class MessagePayloadTest extends CQLTester
                 payloadEquals(respMap, executeResponse.getCustomPayload());
 
                 BatchMessage batchMessage = new BatchMessage(BatchStatement.Type.UNLOGGED,
-                                                             Collections.<Object>singletonList("INSERT INTO atable (pk,v) VALUES (1, 'foo')"),
+                                                             Collections.<Object>singletonList("INSERT INTO " + KEYSPACE + ".atable (pk,v) VALUES (1, 'foo')"),
                                                              Collections.singletonList(Collections.<ByteBuffer>emptyList()),
                                                              queryOptions);
                 reqMap = Collections.singletonMap("foo", bytes(45));
@@ -404,16 +405,17 @@ public class MessagePayloadTest extends CQLTester
             return result;
         }
 
+        @Override
         public ResultMessage process(CQLStatement statement,
                                      QueryState state,
                                      QueryOptions options,
                                      Map<String, ByteBuffer> customPayload,
-                                     long queryStartNanoTime)
+                                     Dispatcher.RequestTime requestTime)
                                             throws RequestExecutionException, RequestValidationException
         {
             if (customPayload != null)
                 requestPayload = customPayload;
-            ResultMessage result = QueryProcessor.instance.process(statement, state, options, customPayload, queryStartNanoTime);
+            ResultMessage result = QueryProcessor.instance.process(statement, state, options, customPayload, requestTime);
             if (customPayload != null)
             {
                 result.setCustomPayload(responsePayload);
@@ -422,16 +424,17 @@ public class MessagePayloadTest extends CQLTester
             return result;
         }
 
+        @Override
         public ResultMessage processBatch(BatchStatement statement,
                                           QueryState state,
                                           BatchQueryOptions options,
                                           Map<String, ByteBuffer> customPayload,
-                                          long queryStartNanoTime)
+                                          Dispatcher.RequestTime requestTime)
                                                   throws RequestExecutionException, RequestValidationException
         {
             if (customPayload != null)
                 requestPayload = customPayload;
-            ResultMessage result = QueryProcessor.instance.processBatch(statement, state, options, customPayload, queryStartNanoTime);
+            ResultMessage result = QueryProcessor.instance.processBatch(statement, state, options, customPayload, requestTime);
             if (customPayload != null)
             {
                 result.setCustomPayload(responsePayload);
@@ -444,12 +447,12 @@ public class MessagePayloadTest extends CQLTester
                                              QueryState state,
                                              QueryOptions options,
                                              Map<String, ByteBuffer> customPayload,
-                                             long queryStartNanoTime)
+                                             Dispatcher.RequestTime requestTime)
                                                     throws RequestExecutionException, RequestValidationException
         {
             if (customPayload != null)
                 requestPayload = customPayload;
-            ResultMessage result = QueryProcessor.instance.processPrepared(statement, state, options, customPayload, queryStartNanoTime);
+            ResultMessage result = QueryProcessor.instance.processPrepared(statement, state, options, customPayload, requestTime);
             if (customPayload != null)
             {
                 result.setCustomPayload(responsePayload);

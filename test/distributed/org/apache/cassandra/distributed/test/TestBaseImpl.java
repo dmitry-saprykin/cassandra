@@ -22,28 +22,50 @@ import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 import com.google.common.collect.ImmutableSet;
-
 import org.junit.After;
 import org.junit.BeforeClass;
 
 import org.apache.cassandra.cql3.Duration;
-import org.apache.cassandra.db.marshal.*;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.BooleanType;
+import org.apache.cassandra.db.marshal.ByteType;
+import org.apache.cassandra.db.marshal.BytesType;
+import org.apache.cassandra.db.marshal.DecimalType;
+import org.apache.cassandra.db.marshal.DoubleType;
+import org.apache.cassandra.db.marshal.DurationType;
+import org.apache.cassandra.db.marshal.FloatType;
+import org.apache.cassandra.db.marshal.InetAddressType;
+import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.db.marshal.IntegerType;
+import org.apache.cassandra.db.marshal.LongType;
+import org.apache.cassandra.db.marshal.ShortType;
+import org.apache.cassandra.db.marshal.TimestampType;
+import org.apache.cassandra.db.marshal.TupleType;
+import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.db.marshal.UUIDType;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.api.ICluster;
 import org.apache.cassandra.distributed.api.IInstanceConfig;
 import org.apache.cassandra.distributed.api.IInvokableInstance;
 import org.apache.cassandra.distributed.shared.DistributedTestBase;
 
-import static org.apache.cassandra.config.CassandraRelevantProperties.BOOTSTRAP_SCHEMA_DELAY_MS;
+import static org.apache.cassandra.config.CassandraRelevantProperties.JOIN_RING;
+import static org.apache.cassandra.config.CassandraRelevantProperties.RESET_BOOTSTRAP_PROGRESS;
+import static org.apache.cassandra.config.CassandraRelevantProperties.SKIP_GC_INSPECTOR;
 import static org.apache.cassandra.distributed.action.GossipHelper.withProperty;
 
+// checkstyle: suppress below 'blockSystemPropertyUsage'
 public class TestBaseImpl extends DistributedTestBase
 {
     public static final Object[][] EMPTY_ROWS = new Object[0][];
@@ -58,6 +80,7 @@ public class TestBaseImpl extends DistributedTestBase
     public static void beforeClass() throws Throwable
     {
         ICluster.setup();
+        SKIP_GC_INSPECTOR.setBoolean(true);
     }
 
     @Override
@@ -98,10 +121,26 @@ public class TestBaseImpl extends DistributedTestBase
 
     public static ByteBuffer tuple(Object... values)
     {
-        ByteBuffer[] bbs = new ByteBuffer[values.length];
-        for (int i = 0; i < values.length; i++)
-            bbs[i] = makeByteBuffer(values[i]);
-        return TupleType.buildValue(bbs);
+        List<AbstractType<?>> types = new ArrayList<>(values.length);
+        List<ByteBuffer> bbs = new ArrayList<>(values.length);
+        for (Object value : values)
+        {
+            AbstractType type = typeFor(value);
+            types.add(type);
+            bbs.add(value == null ? null : type.decompose(value));
+        }
+        TupleType tupleType = new TupleType(types);
+        return tupleType.pack(bbs);
+    }
+
+    public static String batch(String... queries)
+    {
+        StringBuilder sb = new StringBuilder();
+        sb.append("BEGIN UNLOGGED BATCH\n");
+        for (String q : queries)
+            sb.append(q).append(";\n");
+        sb.append("APPLY BATCH;");
+        return sb.toString();
     }
 
     protected void bootstrapAndJoinNode(Cluster cluster)
@@ -109,9 +148,11 @@ public class TestBaseImpl extends DistributedTestBase
         IInstanceConfig config = cluster.newInstanceConfig();
         config.set("auto_bootstrap", true);
         IInvokableInstance newInstance = cluster.bootstrap(config);
-        withProperty(BOOTSTRAP_SCHEMA_DELAY_MS.getKey(), Integer.toString(90 * 1000),
-                     () -> withProperty("cassandra.join_ring", false, () -> newInstance.startup(cluster)));
+        RESET_BOOTSTRAP_PROGRESS.setBoolean(false);
+        withProperty(JOIN_RING, false,
+                     () -> newInstance.startup(cluster));
         newInstance.nodetoolResult("join").asserts().success();
+        newInstance.nodetoolResult("cms", "describe").asserts().success(); // just make sure we're joined, remove later
     }
 
     @SuppressWarnings("unchecked")
@@ -180,9 +221,20 @@ public class TestBaseImpl extends DistributedTestBase
     {
         // These keyspaces are under replicated by default, so must be updated when doing a multi-node cluster;
         // else bootstrap will fail with 'Unable to find sufficient sources for streaming range <range> in keyspace <name>'
+        Map<String, Long> dcCounts = cluster.stream()
+                                            .map(i -> i.config().localDatacenter())
+                                            .collect(Collectors.groupingBy(Function.identity(), Collectors.counting()));
+        String replica = "{'class': 'NetworkTopologyStrategy'";
+        for (Map.Entry<String, Long> e : dcCounts.entrySet())
+        {
+            String dc = e.getKey();
+            int rf = Math.min(e.getValue().intValue(), 3);
+            replica += ", '" + dc + "': " + rf;
+        }
+        replica += "}";
         for (String ks : Arrays.asList("system_auth", "system_traces"))
         {
-            cluster.schemaChange("ALTER KEYSPACE " + ks + " WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': " + Math.min(cluster.size(), 3) + "}");
+            cluster.schemaChange("ALTER KEYSPACE " + ks + " WITH REPLICATION = " + replica);
         }
 
         // in real live repair is needed in this case, but in the test case it doesn't matter if the tables loose

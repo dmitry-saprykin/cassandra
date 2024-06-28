@@ -33,14 +33,16 @@ import java.util.concurrent.TimeUnit;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterators;
 import com.google.common.collect.PeekingIterator;
-import com.google.common.primitives.Ints;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.Config;
+import org.apache.cassandra.io.sstable.SSTableIdFactory;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.utils.FBUtilities;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.TEST_STRICT_LCS_CHECKS;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 
 /**
  * Handles the leveled manifest generations
@@ -50,7 +52,7 @@ import org.apache.cassandra.utils.FBUtilities;
 class LeveledGenerations
 {
     private static final Logger logger = LoggerFactory.getLogger(LeveledGenerations.class);
-    private final boolean strictLCSChecksTest = Boolean.getBoolean(Config.PROPERTY_PREFIX + "test.strict_lcs_checks");
+    private final boolean strictLCSChecksTest = TEST_STRICT_LCS_CHECKS.getBoolean();
     // It includes L0, i.e. we support [L0 - L8] levels
     static final int MAX_LEVEL_COUNT = 9;
 
@@ -68,14 +70,14 @@ class LeveledGenerations
      */
     private final Map<SSTableReader, SSTableReader> allSSTables = new HashMap<>();
     private final Set<SSTableReader> l0 = new HashSet<>();
-    private static long lastOverlapCheck = System.nanoTime();
+    private static long lastOverlapCheck = nanoTime();
     // note that since l0 is broken out, levels[0] represents L1:
     private final TreeSet<SSTableReader> [] levels = new TreeSet[MAX_LEVEL_COUNT - 1];
 
     private static final Comparator<SSTableReader> nonL0Comparator = (o1, o2) -> {
-        int cmp = SSTableReader.sstableComparator.compare(o1, o2);
+        int cmp = SSTableReader.firstKeyComparator.compare(o1, o2);
         if (cmp == 0)
-            cmp = Ints.compare(o1.descriptor.generation, o2.descriptor.generation);
+            cmp = SSTableIdFactory.COMPARATOR.compare(o1.descriptor.id, o2.descriptor.id);
         return cmp;
     };
 
@@ -152,8 +154,8 @@ class LeveledGenerations
             SSTableReader after = level.ceiling(sstable);
             SSTableReader before = level.floor(sstable);
 
-            if (before != null && before.last.compareTo(sstable.first) >= 0 ||
-                after != null && after.first.compareTo(sstable.last) <= 0)
+            if (before != null && before.getLast().compareTo(sstable.getFirst()) >= 0 ||
+                after != null && after.getFirst().compareTo(sstable.getLast()) <= 0)
             {
                 sendToL0(sstable);
             }
@@ -262,7 +264,7 @@ class LeveledGenerations
         while (tail.hasNext())
         {
             SSTableReader potentialPivot = tail.peek();
-            if (potentialPivot.first.compareTo(lastCompactedSSTable.last) > 0)
+            if (potentialPivot.getFirst().compareTo(lastCompactedSSTable.getLast()) > 0)
             {
                 pivot = potentialPivot;
                 break;
@@ -310,17 +312,17 @@ class LeveledGenerations
      */
     private void maybeVerifyLevels()
     {
-        if (!strictLCSChecksTest || System.nanoTime() - lastOverlapCheck <= TimeUnit.NANOSECONDS.convert(5, TimeUnit.SECONDS))
+        if (!strictLCSChecksTest || nanoTime() - lastOverlapCheck <= TimeUnit.NANOSECONDS.convert(5, TimeUnit.SECONDS))
             return;
         logger.info("LCS verifying levels");
-        lastOverlapCheck = System.nanoTime();
+        lastOverlapCheck = nanoTime();
         for (int i = 1; i < levelCount(); i++)
         {
             SSTableReader prev = null;
             for (SSTableReader sstable : get(i))
             {
                 // no overlap:
-                assert prev == null || prev.last.compareTo(sstable.first) < 0;
+                assert prev == null || prev.getLast().compareTo(sstable.getFirst()) < 0;
                 prev = sstable;
                 // make sure it does not exist in any other level:
                 for (int j = 0; j < levelCount(); j++)

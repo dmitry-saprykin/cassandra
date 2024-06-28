@@ -26,19 +26,20 @@ import com.google.common.util.concurrent.FutureCallback;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.MoreExecutors;
 
+import org.apache.cassandra.io.sstable.format.big.BigFormatPartitionWriter;
 import org.apache.cassandra.locator.RangesAtEndpoint;
 import org.junit.BeforeClass;
 import org.junit.Test;
-import org.junit.runner.RunWith;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.junit.Assert;
-import org.apache.cassandra.OrderedJUnit4ClassRunner;
+
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
 import org.apache.cassandra.db.streaming.CassandraOutgoingFile;
 import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.QueryProcessor;
@@ -55,6 +56,7 @@ import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.TimeUUID;
 import org.apache.cassandra.utils.concurrent.Refs;
 
 import static org.apache.cassandra.SchemaLoader.compositeIndexCFMD;
@@ -63,7 +65,6 @@ import static org.apache.cassandra.SchemaLoader.standardCFMD;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.fail;
 
-@RunWith(OrderedJUnit4ClassRunner.class)
 public class StreamingTransferTest
 {
     private static final Logger logger = LoggerFactory.getLogger(StreamingTransferTest.class);
@@ -88,6 +89,7 @@ public class StreamingTransferTest
     public static void defineSchema() throws Exception
     {
         SchemaLoader.prepareServer();
+        MessagingService.instance().waitUntilListeningUnchecked();
         StorageService.instance.initServer();
 
         createKeyspace(KEYSPACE1,
@@ -118,7 +120,7 @@ public class StreamingTransferTest
     public void testEmptyStreamPlan() throws Exception
     {
         StreamResultFuture futureResult = new StreamPlan(StreamOperation.OTHER).execute();
-        final UUID planId = futureResult.planId;
+        final TimeUUID planId = futureResult.planId;
         Futures.addCallback(futureResult, new FutureCallback<StreamState>()
         {
             public void onSuccess(StreamState result)
@@ -150,7 +152,7 @@ public class StreamingTransferTest
                                                   .requestRanges(LOCAL, KEYSPACE2, RangesAtEndpoint.toDummyList(ranges), RangesAtEndpoint.toDummyList(Collections.emptyList()))
                                                   .execute();
 
-        UUID planId = futureResult.planId;
+        TimeUUID planId = futureResult.planId;
         StreamState result = futureResult.get();
         assert planId.equals(result.planId);
         assert result.streamOperation == StreamOperation.OTHER;
@@ -176,7 +178,7 @@ public class StreamingTransferTest
         long timestamp = 1234;
         for (int i = 1; i <= 3; i++)
             mutator.mutate("key" + i, "col" + i, timestamp);
-        cfs.forceBlockingFlush();
+        Util.flush(cfs);
         Util.compactAll(cfs, Integer.MAX_VALUE).get();
         assertEquals(1, cfs.getLiveSSTables().size());
 
@@ -241,13 +243,13 @@ public class StreamingTransferTest
         List<Range<Token>> ranges = new ArrayList<>();
         // wrapped range
         ranges.add(new Range<Token>(p.getToken(ByteBufferUtil.bytes("key1")), p.getToken(ByteBufferUtil.bytes("key0"))));
-        StreamPlan streamPlan = new StreamPlan(StreamOperation.OTHER).transferRanges(LOCAL, cfs.keyspace.getName(), RangesAtEndpoint.toDummyList(ranges), cfs.getTableName());
+        StreamPlan streamPlan = new StreamPlan(StreamOperation.OTHER).transferRanges(LOCAL, cfs.getKeyspaceName(), RangesAtEndpoint.toDummyList(ranges), cfs.getTableName());
         streamPlan.execute().get();
 
         //cannot add ranges after stream session is finished
         try
         {
-            streamPlan.transferRanges(LOCAL, cfs.keyspace.getName(), RangesAtEndpoint.toDummyList(ranges), cfs.getTableName());
+            streamPlan.transferRanges(LOCAL, cfs.getKeyspaceName(), RangesAtEndpoint.toDummyList(ranges), cfs.getTableName());
             fail("Should have thrown exception");
         }
         catch (RuntimeException e)
@@ -296,7 +298,7 @@ public class StreamingTransferTest
     {
         final Keyspace keyspace = Keyspace.open(KEYSPACE1);
         final ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_INDEX);
-
+        cfs.disableAutoCompaction();
         List<String> keys = createAndTransfer(cfs, new Mutator()
         {
             public void mutate(String key, String col, long timestamp) throws Exception
@@ -342,13 +344,13 @@ public class StreamingTransferTest
 
         // add columns of size slightly less than column_index_size to force insert column index
         updates.clustering(1)
-                .add("val", ByteBuffer.wrap(new byte[DatabaseDescriptor.getColumnIndexSize() - 64]))
+                .add("val", ByteBuffer.wrap(new byte[DatabaseDescriptor.getColumnIndexSize(BigFormatPartitionWriter.DEFAULT_GRANULARITY) - 64]))
                 .build()
                 .apply();
 
         updates = new RowUpdateBuilder(cfs.metadata(), FBUtilities.timestampMicros(), key);
         updates.clustering(6)
-                .add("val", ByteBuffer.wrap(new byte[DatabaseDescriptor.getColumnIndexSize()]))
+                .add("val", ByteBuffer.wrap(new byte[DatabaseDescriptor.getColumnIndexSize(BigFormatPartitionWriter.DEFAULT_GRANULARITY)]))
                 .build()
                 .apply();
 
@@ -364,7 +366,7 @@ public class StreamingTransferTest
                 .build()
                 .apply();
 
-        cfs.forceBlockingFlush();
+        Util.flush(cfs);
 
         SSTableReader sstable = cfs.getLiveSSTables().iterator().next();
         cfs.clearUnsafe();
@@ -556,7 +558,7 @@ public class StreamingTransferTest
         // write a lot more data so the data is spread in more than 1 chunk.
         for (int i = 1; i <= 6000; i++)
             mutator.mutate("key" + i, "col" + i, System.currentTimeMillis());
-        cfs.forceBlockingFlush();
+        Util.flush(cfs);
         Util.compactAll(cfs, Integer.MAX_VALUE).get();
         SSTableReader sstable = cfs.getLiveSSTables().iterator().next();
         cfs.clearUnsafe();

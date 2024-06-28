@@ -45,6 +45,7 @@ import static org.apache.cassandra.transport.BurnTestUtil.SizeCaps;
 import static org.apache.cassandra.transport.BurnTestUtil.generateQueryMessage;
 import static org.apache.cassandra.transport.BurnTestUtil.generateQueryStatement;
 import static org.apache.cassandra.transport.BurnTestUtil.generateRows;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 import static org.assertj.core.api.Assertions.assertThat;
 
 public class DriverBurnTest extends CQLTester
@@ -62,7 +63,7 @@ public class DriverBurnTest extends CQLTester
             }
         };
 
-        requireNetwork((builder) -> builder.withPipelineConfigurator(configurator));
+        requireNetwork(builder -> builder.withPipelineConfigurator(configurator), builder -> {});
     }
 
     @Test
@@ -77,7 +78,7 @@ public class DriverBurnTest extends CQLTester
             {
                 QueryMessage queryMessage = QueryMessage.codec.decode(body, version);
                 return new QueryMessage(queryMessage.query, queryMessage.options) {
-                    protected Message.Response execute(QueryState state, long queryStartNanoTime, boolean traceRequest)
+                    protected Message.Response execute(QueryState state, Dispatcher.RequestTime requestTime, boolean traceRequest)
                     {
                         try
                         {
@@ -88,7 +89,7 @@ public class DriverBurnTest extends CQLTester
                         catch (NumberFormatException e)
                         {
                             // for the requests driver issues under the hood
-                            return super.execute(state, queryStartNanoTime, traceRequest);
+                            return super.execute(state, requestTime, traceRequest);
                         }
                     }
                 };
@@ -337,7 +338,7 @@ public class DriverBurnTest extends CQLTester
             {
                 QueryMessage queryMessage = QueryMessage.codec.decode(body, version);
                 return new QueryMessage(queryMessage.query, queryMessage.options) {
-                    protected Message.Response execute(QueryState state, long queryStartNanoTime, boolean traceRequest)
+                    protected Message.Response execute(QueryState state, Dispatcher.RequestTime requestTime, boolean traceRequest)
                     {
                         try
                         {
@@ -347,7 +348,7 @@ public class DriverBurnTest extends CQLTester
                         catch (NumberFormatException e)
                         {
                             // for the requests driver issues under the hood
-                            return super.execute(state, queryStartNanoTime, traceRequest);
+                            return super.execute(state, requestTime, traceRequest);
                         }
                     }
                 };
@@ -385,10 +386,10 @@ public class DriverBurnTest extends CQLTester
 
                         for (int j = 0; j < perThread; j++)
                         {
-                            long startNanos = System.nanoTime();
+                            long startNanos = nanoTime();
                             ResultSetFuture future = session.executeAsync(request);
                             future.addListener(() -> {
-                                long diff = System.nanoTime() - startNanos;
+                                long diff = nanoTime() - startNanos;
                                 if (measure.get())
                                 {
                                     lock.lock();

@@ -20,11 +20,10 @@ package org.apache.cassandra.tools.nodetool;
 
 import java.util.Arrays;
 
+import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
-import org.junit.runner.RunWith;
 
-import org.apache.cassandra.OrderedJUnit4ClassRunner;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.locator.SimpleSnitch;
 import org.apache.cassandra.service.StorageService;
@@ -33,7 +32,6 @@ import org.apache.cassandra.utils.FBUtilities;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-@RunWith(OrderedJUnit4ClassRunner.class)
 public class RingTest extends CQLTester
 {
     private static String token;
@@ -158,7 +156,7 @@ public class RingTest extends CQLTester
     {
         // Bad KS
         ToolRunner.ToolResult tool = ToolRunner.invokeNodetool("ring", "mockks");
-        tool.assertOnCleanExit();
+        Assert.assertEquals(1, tool.getExitCode());
         assertThat(tool.getStdout()).contains("The keyspace mockks, does not exist");
 
         // Good KS

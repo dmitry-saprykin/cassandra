@@ -17,6 +17,7 @@
  */
 package org.apache.cassandra.dht;
 
+import java.io.IOException;
 import java.io.Serializable;
 import java.util.*;
 import java.util.function.Predicate;
@@ -25,6 +26,12 @@ import com.google.common.collect.Iterables;
 import org.apache.commons.lang3.ObjectUtils;
 
 import org.apache.cassandra.db.PartitionPosition;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.tcm.ClusterMetadata;
+import org.apache.cassandra.tcm.serialization.MetadataSerializer;
+import org.apache.cassandra.tcm.serialization.Version;
 import org.apache.cassandra.utils.Pair;
 
 /**
@@ -38,6 +45,7 @@ import org.apache.cassandra.utils.Pair;
  */
 public class Range<T extends RingPosition<T>> extends AbstractBounds<T> implements Comparable<Range<T>>, Serializable
 {
+    public static final Serializer serializer = new Serializer();
     public static final long serialVersionUID = 1L;
 
     public Range(T left, T right)
@@ -221,6 +229,39 @@ public class Range<T extends RingPosition<T>> extends AbstractBounds<T> implemen
         return Collections.unmodifiableSet(intersection);
     }
 
+    /**
+     * Returns the intersection of this range with the provided one, assuming neither are wrapping.
+     *
+     * @param that the other range to return the intersection with. It must not be wrapping.
+     * @return the intersection of {@code this} and {@code that}, or {@code null} if both ranges don't intersect.
+     */
+    public Range<T> intersectionNonWrapping(Range<T> that)
+    {
+        assert !isTrulyWrapAround() : "wraparound " + this;
+        assert !that.isTrulyWrapAround() : "wraparound " + that;
+
+        if (left.compareTo(that.left) < 0)
+        {
+            if (right.isMinimum() || (!that.right.isMinimum() && right.compareTo(that.right) >= 0))
+                return that;  // this contains that.
+
+            if (right.compareTo(that.left) <= 0)
+                return null;  // this is fully before that.
+
+            return new Range<>(that.left, right);
+        }
+        else
+        {
+            if (that.right.isMinimum() || (!right.isMinimum() && that.right.compareTo(right) >= 0))
+                return this;  // that contains this.
+
+            if (that.right.compareTo(left) <= 0)
+                return null;  // that is fully before this.
+
+            return new Range<>(left, that.right);
+        }
+    }
+
     public Pair<AbstractBounds<T>, AbstractBounds<T>> split(T position)
     {
         assert contains(position) || left.equals(position);
@@ -260,6 +301,29 @@ public class Range<T extends RingPosition<T>> extends AbstractBounds<T> implemen
     public static <T extends RingPosition<T>> boolean isWrapAround(T left, T right)
     {
        return left.compareTo(right) >= 0;
+    }
+
+    /**
+     * Checks if the range truly wraps around.
+     *
+     * This exists only because {@link #isWrapAround()} is a tad dumb and return true if right is the minimum token,
+     * no matter what left is, but for most intent and purposes, such range doesn't truly warp around (unwrap produces
+     * the identity in this case).
+     * <p>
+     * Also note that it could be that the remaining uses of {@link #isWrapAround()} could be replaced by this method,
+     * but that is to be checked carefully at some other time (Sylvain).
+     * <p>
+     * The one thing this method guarantees is that if it's true, then {@link #unwrap()} will return a list with
+     * exactly 2 ranges, never one.
+     */
+    public boolean isTrulyWrapAround()
+    {
+        return isTrulyWrapAround(left, right);
+    }
+
+    public static <T extends RingPosition<T>> boolean isTrulyWrapAround(T left, T right)
+    {
+        return isWrapAround(left, right) && !right.isMinimum();
     }
 
     /**
@@ -483,7 +547,7 @@ public class Range<T extends RingPosition<T>> extends AbstractBounds<T> implemen
      * Given a list of unwrapped ranges sorted by left position, return an
      * equivalent list of ranges but with no overlapping ranges.
      */
-    private static <T extends RingPosition<T>> List<Range<T>> deoverlap(List<Range<T>> ranges)
+    public static <T extends RingPosition<T>> List<Range<T>> deoverlap(List<Range<T>> ranges)
     {
         if (ranges.isEmpty())
             return ranges;
@@ -624,6 +688,26 @@ public class Range<T extends RingPosition<T>> extends AbstractBounds<T> implemen
                                                        lastRange.intersects(range),
                                                        ranges));
             }
+        }
+    }
+
+    public static class Serializer implements MetadataSerializer<Range<Token>>
+    {
+        private static final int SERDE_VERSION = MessagingService.VERSION_40;
+
+        public void serialize(Range<Token> t, DataOutputPlus out, Version version) throws IOException
+        {
+            tokenSerializer.serialize(t, out, SERDE_VERSION);
+        }
+
+        public Range<Token> deserialize(DataInputPlus in, Version version) throws IOException
+        {
+            return (Range<Token>) tokenSerializer.deserialize(in, ClusterMetadata.current().partitioner, SERDE_VERSION);
+        }
+
+        public long serializedSize(Range<Token> t, Version version)
+        {
+            return tokenSerializer.serializedSize(t, SERDE_VERSION);
         }
     }
 }

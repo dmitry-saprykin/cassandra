@@ -33,6 +33,9 @@ import org.apache.cassandra.db.marshal.LongType;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.bytecomparable.ByteComparable;
+import org.apache.cassandra.utils.bytecomparable.ByteSource;
+import org.apache.cassandra.utils.bytecomparable.ByteSourceInverse;
 import org.apache.cassandra.utils.MurmurHash;
 import org.apache.cassandra.utils.ObjectSizes;
 
@@ -51,7 +54,7 @@ public class Murmur3Partitioner implements IPartitioner
     private static final int HEAP_SIZE = (int) ObjectSizes.measureDeep(MINIMUM);
 
     public static final Murmur3Partitioner instance = new Murmur3Partitioner();
-    public static final AbstractType<?> partitionOrdering = new PartitionerDefinedOrder(instance);
+    public static final PartitionerDefinedOrder partitionOrdering = new PartitionerDefinedOrder(instance);
 
     private final Splitter splitter = new Splitter(this)
     {
@@ -144,7 +147,7 @@ public class Murmur3Partitioner implements IPartitioner
     {
         static final long serialVersionUID = -5833580143318243006L;
 
-        final long token;
+        public final long token;
 
         public LongToken(long token)
         {
@@ -177,6 +180,12 @@ public class Murmur3Partitioner implements IPartitioner
         }
 
         @Override
+        public ByteSource asComparableBytes(ByteComparable.Version version)
+        {
+            return ByteSource.of(token);
+        }
+
+        @Override
         public IPartitioner getPartitioner()
         {
             return instance;
@@ -195,6 +204,12 @@ public class Murmur3Partitioner implements IPartitioner
         }
 
         @Override
+        public long getLongValue()
+        {
+            return token;
+        }
+
+        @Override
         public double size(Token next)
         {
             LongToken n = (LongToken) next;
@@ -204,9 +219,19 @@ public class Murmur3Partitioner implements IPartitioner
         }
 
         @Override
-        public Token increaseSlightly()
+        public LongToken nextValidToken()
         {
             return new LongToken(token + 1);
+        }
+
+        public LongToken decreaseSlightly()
+        {
+            return new LongToken(token - 1);
+        }
+
+        public static ByteBuffer keyForToken(long token)
+        {
+            return keyForToken(new LongToken(token));
         }
 
         /**
@@ -216,7 +241,7 @@ public class Murmur3Partitioner implements IPartitioner
         public static ByteBuffer keyForToken(LongToken token)
         {
             ByteBuffer result = ByteBuffer.allocate(16);
-            long[] inv = MurmurHash.inv_hash3_x64_128(new long[] {token.token, 0L});
+            long[] inv = MurmurHash.inv_hash3_x64_128(new long[]{ token.token, 0L });
             result.putLong(inv[0]).putLong(inv[1]).position(0);
             return result;
         }
@@ -284,7 +309,7 @@ public class Murmur3Partitioner implements IPartitioner
             throw new RuntimeException("No nodes present in the cluster. Has this node finished starting up?");
         // 1-case
         if (sortedTokens.size() == 1)
-            ownerships.put(i.next(), new Float(1.0));
+            ownerships.put(i.next(), 1.0F);
         // n-case
         else
         {
@@ -316,6 +341,12 @@ public class Murmur3Partitioner implements IPartitioner
 
     private final Token.TokenFactory tokenFactory = new Token.TokenFactory()
     {
+        public Token fromComparableBytes(ByteSource.Peekable comparableBytes, ByteComparable.Version version)
+        {
+            long tokenData = ByteSourceInverse.getSignedLong(comparableBytes);
+            return new LongToken(tokenData);
+        }
+
         public ByteBuffer toByteArray(Token token)
         {
             LongToken longToken = (LongToken) token;
@@ -394,6 +425,11 @@ public class Murmur3Partitioner implements IPartitioner
     public AbstractType<?> partitionOrdering()
     {
         return partitionOrdering;
+    }
+
+    public AbstractType<?> partitionOrdering(AbstractType<?> partitionKeyType)
+    {
+        return partitionOrdering.withPartitionKeyType(partitionKeyType);
     }
 
     public Optional<Splitter> splitter()

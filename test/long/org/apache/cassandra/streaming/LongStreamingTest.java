@@ -18,17 +18,18 @@
 
 package org.apache.cassandra.streaming;
 
-import java.io.File;
 import java.io.IOException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
 import com.google.common.io.Files;
+
+import org.apache.cassandra.ServerTestUtils;
+import org.apache.cassandra.io.util.File;
 import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
-import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
@@ -37,6 +38,7 @@ import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.io.sstable.CQLSSTableWriter;
 import org.apache.cassandra.io.sstable.SSTableLoader;
 import org.apache.cassandra.locator.Replica;
+import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.schema.CompressionParams;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.TableMetadataRef;
@@ -44,6 +46,7 @@ import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.OutputHandler;
 
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 import static org.junit.Assert.assertEquals;
 
 public class LongStreamingTest
@@ -52,14 +55,15 @@ public class LongStreamingTest
     public static void setup() throws Exception
     {
         DatabaseDescriptor.daemonInitialization();
+        ServerTestUtils.prepareServerNoRegister();
 
-        SchemaLoader.cleanupAndLeaveDirs();
         Keyspace.setInitialized();
+        MessagingService.instance().waitUntilListeningUnchecked();
         StorageService.instance.initServer();
 
         StorageService.instance.setCompactionThroughputMbPerSec(0);
-        StorageService.instance.setStreamThroughputMbPerSec(0);
-        StorageService.instance.setInterDCStreamThroughputMbPerSec(0);
+        StorageService.instance.setStreamThroughputMbitPerSec(0);
+        StorageService.instance.setInterDCStreamThroughputMbitPerSec(0);
     }
 
     @Test
@@ -79,9 +83,9 @@ public class LongStreamingTest
         String KS = useSstableCompression ? "sstable_compression_ks" : "stream_compression_ks";
         String TABLE = "table1";
 
-        File tempdir = Files.createTempDir();
-        File dataDir = new File(tempdir.getAbsolutePath() + File.separator + KS + File.separator + TABLE);
-        assert dataDir.mkdirs();
+        File tempdir = new File(Files.createTempDir());
+        File dataDir = new File(tempdir.absolutePath() + File.pathSeparator() + KS + File.pathSeparator() + TABLE);
+        assert dataDir.tryCreateDirectories();
 
         String schema = "CREATE TABLE " + KS + '.'  + TABLE + "  ("
                         + "  k int PRIMARY KEY,"
@@ -99,20 +103,20 @@ public class LongStreamingTest
         Assert.assertEquals(useSstableCompression, compressionParams.isEnabled());
 
 
-        long start = System.nanoTime();
+        long start = nanoTime();
 
         for (int i = 0; i < 10_000_000; i++)
             writer.addRow(i, "test1", 24);
 
         writer.close();
-        System.err.println(String.format("Writer finished after %d seconds....", TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - start)));
+        System.err.println(String.format("Writer finished after %d seconds....", TimeUnit.NANOSECONDS.toSeconds(nanoTime() - start)));
 
-        File[] dataFiles = dataDir.listFiles((dir, name) -> name.endsWith("-Data.db"));
-        long dataSize = 0l;
+        File[] dataFiles = dataDir.tryList((dir, name) -> name.endsWith("-Data.db"));
+        long dataSizeInBytes = 0l;
         for (File file : dataFiles)
         {
-            System.err.println("File : "+file.getAbsolutePath());
-            dataSize += file.length();
+            System.err.println("File : "+file.absolutePath());
+            dataSizeInBytes += file.length();
         }
 
         SSTableLoader loader = new SSTableLoader(dataDir, new SSTableLoader.Client()
@@ -132,13 +136,13 @@ public class LongStreamingTest
             }
         }, new OutputHandler.SystemOutput(false, false));
 
-        start = System.nanoTime();
+        start = nanoTime();
         loader.stream().get();
 
-        long millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
-        System.err.println(String.format("Finished Streaming in %.2f seconds: %.2f Mb/sec",
+        long millis = TimeUnit.NANOSECONDS.toMillis(nanoTime() - start);
+        System.err.println(String.format("Finished Streaming in %.2f seconds: %.2f MiBsec",
                                          millis/1000d,
-                                         (dataSize / (1 << 20) / (millis / 1000d)) * 8));
+                                         (dataSizeInBytes / (1 << 20) / (millis / 1000d)) * 8));
 
 
         //Stream again
@@ -159,23 +163,23 @@ public class LongStreamingTest
             }
         }, new OutputHandler.SystemOutput(false, false));
 
-        start = System.nanoTime();
+        start = nanoTime();
         loader.stream().get();
 
-        millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
-        System.err.println(String.format("Finished Streaming in %.2f seconds: %.2f Mb/sec",
+        millis = TimeUnit.NANOSECONDS.toMillis(nanoTime() - start);
+        System.err.println(String.format("Finished Streaming in %.2f seconds: %.2f MiBsec",
                                          millis/1000d,
-                                         (dataSize / (1 << 20) / (millis / 1000d)) * 8));
+                                         (dataSizeInBytes / (1 << 20) / (millis / 1000d)) * 8));
 
 
         //Compact them both
-        start = System.nanoTime();
+        start = nanoTime();
         Keyspace.open(KS).getColumnFamilyStore(TABLE).forceMajorCompaction();
-        millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+        millis = TimeUnit.NANOSECONDS.toMillis(nanoTime() - start);
 
-        System.err.println(String.format("Finished Compacting in %.2f seconds: %.2f Mb/sec",
+        System.err.println(String.format("Finished Compacting in %.2f seconds: %.2f MiBsec",
                                          millis / 1000d,
-                                         (dataSize * 2 / (1 << 20) / (millis / 1000d)) * 8));
+                                         (dataSizeInBytes * 2 / (1 << 20) / (millis / 1000d)) * 8));
 
         UntypedResultSet rs = QueryProcessor.executeInternal("SELECT * FROM " + KS + '.'  + TABLE + " limit 100;");
         assertEquals(100, rs.size());

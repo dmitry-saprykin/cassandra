@@ -18,12 +18,12 @@
  */
 package org.apache.cassandra.db;
 
-import java.io.File;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 
+import org.apache.cassandra.io.util.File;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.BeforeClass;
@@ -61,6 +61,7 @@ public class RecoveryManagerMissingHeaderTest
     {
         DatabaseDescriptor.setCommitLogCompression(commitLogCompression);
         DatabaseDescriptor.setEncryptionContext(encryptionContext);
+        DatabaseDescriptor.initializeCommitLogDiskAccessMode();
     }
 
     @Parameters()
@@ -112,9 +113,9 @@ public class RecoveryManagerMissingHeaderTest
         keyspace2.getColumnFamilyStore("Standard3").clearUnsafe();
 
         // nuke the header
-        for (File file : new File(DatabaseDescriptor.getCommitLogLocation()).listFiles())
+        for (File file : new File(DatabaseDescriptor.getCommitLogLocation()).tryList())
         {
-            if (file.getName().endsWith(".header"))
+            if (file.name().endsWith(".header"))
                 FileUtils.deleteWithConfirm(file);
         }
 

@@ -19,15 +19,19 @@ package org.apache.cassandra.cql3.restrictions;
 
 import java.util.*;
 
+import javax.annotation.Nullable;
+
+import com.google.common.collect.RangeSet;
+
+import org.apache.cassandra.db.guardrails.Guardrails;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.cql3.QueryOptions;
-import org.apache.cassandra.cql3.statements.Bound;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.IndexRegistry;
-import org.apache.cassandra.utils.btree.BTreeSet;
+import org.apache.cassandra.service.ClientState;
 
 import static org.apache.cassandra.cql3.statements.RequestValidations.checkFalse;
 import static org.apache.cassandra.cql3.statements.RequestValidations.invalidRequest;
@@ -40,21 +44,16 @@ final class ClusteringColumnRestrictions extends RestrictionSetWrapper
     /**
      * The composite type.
      */
-    protected final ClusteringComparator comparator;
+    private final ClusteringComparator comparator;
 
     /**
      * <code>true</code> if filtering is allowed for this restriction, <code>false</code> otherwise
      */
     private final boolean allowFiltering;
 
-    public ClusteringColumnRestrictions(TableMetadata table)
-    {
-        this(table, false);
-    }
-
     public ClusteringColumnRestrictions(TableMetadata table, boolean allowFiltering)
     {
-        this(table.comparator, new RestrictionSet(), allowFiltering);
+        this(table.comparator, RestrictionSet.empty(), allowFiltering);
     }
 
     private ClusteringColumnRestrictions(ClusteringComparator comparator,
@@ -66,16 +65,18 @@ final class ClusteringColumnRestrictions extends RestrictionSetWrapper
         this.allowFiltering = allowFiltering;
     }
 
-    public ClusteringColumnRestrictions mergeWith(Restriction restriction) throws InvalidRequestException
+    public ClusteringColumnRestrictions mergeWith(Restriction restriction, @Nullable IndexRegistry indexRegistry) throws InvalidRequestException
     {
         SingleRestriction newRestriction = (SingleRestriction) restriction;
         RestrictionSet newRestrictionSet = restrictions.addRestriction(newRestriction);
 
-        if (!isEmpty() && !allowFiltering)
+        if (!isEmpty() && !allowFiltering && (indexRegistry == null || !newRestriction.hasSupportingIndex(indexRegistry)))
         {
             SingleRestriction lastRestriction = restrictions.lastRestriction();
-            ColumnMetadata lastRestrictionStart = lastRestriction.getFirstColumn();
-            ColumnMetadata newRestrictionStart = restriction.getFirstColumn();
+            assert lastRestriction != null;
+
+            ColumnMetadata lastRestrictionStart = lastRestriction.firstColumn();
+            ColumnMetadata newRestrictionStart = restriction.firstColumn();
 
             checkFalse(lastRestriction.isSlice() && newRestrictionStart.position() > lastRestrictionStart.position(),
                        "Clustering column \"%s\" cannot be restricted (preceding column \"%s\" is restricted by a non-EQ relation)",
@@ -91,31 +92,27 @@ final class ClusteringColumnRestrictions extends RestrictionSetWrapper
         return new ClusteringColumnRestrictions(this.comparator, newRestrictionSet, allowFiltering);
     }
 
-    private boolean hasMultiColumnSlice()
+    public NavigableSet<Clustering<?>> valuesAsClustering(QueryOptions options, ClientState state) throws InvalidRequestException
     {
-        for (SingleRestriction restriction : restrictions)
-        {
-            if (restriction.isMultiColumn() && restriction.isSlice())
-                return true;
-        }
-        return false;
-    }
-
-    public NavigableSet<Clustering<?>> valuesAsClustering(QueryOptions options) throws InvalidRequestException
-    {
-        MultiCBuilder builder = MultiCBuilder.create(comparator, hasIN());
+        MultiCBuilder builder = new MultiCBuilder(comparator);
         for (SingleRestriction r : restrictions)
         {
-            r.appendTo(builder, options);
+            List<ClusteringElements> values = r.values(options);
+            builder.extend(values);
+
+            // If values is greater than 1 we know that the restriction is an IN
+            if (values.size() > 1 && Guardrails.inSelectCartesianProduct.enabled(state))
+                Guardrails.inSelectCartesianProduct.guard(builder.buildSize(), "clustering key", false, state);
+
             if (builder.hasMissingElements())
                 break;
         }
         return builder.build();
     }
 
-    public NavigableSet<ClusteringBound<?>> boundsAsClustering(Bound bound, QueryOptions options) throws InvalidRequestException
+    public Slices slices(QueryOptions options) throws InvalidRequestException
     {
-        MultiCBuilder builder = MultiCBuilder.create(comparator, hasIN() || hasMultiColumnSlice());
+        MultiCBuilder builder = new MultiCBuilder(comparator);
         int keyPosition = 0;
 
         for (SingleRestriction r : restrictions)
@@ -125,39 +122,21 @@ final class ClusteringColumnRestrictions extends RestrictionSetWrapper
 
             if (r.isSlice())
             {
-                r.appendBoundTo(builder, bound, options);
-                return builder.buildBoundForSlice(bound.isStart(),
-                                                  r.isInclusive(bound),
-                                                  r.isInclusive(bound.reverse()),
-                                                  r.getColumnDefs());
+                RangeSet<ClusteringElements> rangeSet = ClusteringElements.all();
+                r.restrict(rangeSet, options);
+                return builder.extend(rangeSet).buildSlices();
             }
 
-            r.appendBoundTo(builder, bound, options);
+            builder.extend(r.values(options));
 
             if (builder.hasMissingElements())
-                return BTreeSet.empty(comparator);
+                break;
 
-            keyPosition = r.getLastColumn().position() + 1;
+            keyPosition = r.lastColumn().position() + 1;
         }
 
         // Everything was an equal (or there was nothing)
-        return builder.buildBound(bound.isStart(), true);
-    }
-
-    /**
-     * Checks if any of the underlying restriction is a CONTAINS or CONTAINS KEY.
-     *
-     * @return <code>true</code> if any of the underlying restriction is a CONTAINS or CONTAINS KEY,
-     * <code>false</code> otherwise
-     */
-    public final boolean hasContains()
-    {
-        for (SingleRestriction restriction : restrictions)
-        {
-            if (restriction.isContains())
-                return true;
-        }
-        return false;
+        return builder.buildSlices();
     }
 
     /**
@@ -166,7 +145,7 @@ final class ClusteringColumnRestrictions extends RestrictionSetWrapper
      * @return <code>true</code> if any of the underlying restriction is a slice restrictions,
      * <code>false</code> otherwise
      */
-    public final boolean hasSlice()
+    public boolean hasSlice()
     {
         for (SingleRestriction restriction : restrictions)
         {
@@ -182,7 +161,7 @@ final class ClusteringColumnRestrictions extends RestrictionSetWrapper
      * @return <code>true</code> if any underlying restrictions require filtering, <code>false</code>
      * otherwise
      */
-    public final boolean needFiltering()
+    public boolean needFiltering()
     {
         int position = 0;
 
@@ -192,13 +171,13 @@ final class ClusteringColumnRestrictions extends RestrictionSetWrapper
                 return true;
 
             if (!restriction.isSlice())
-                position = restriction.getLastColumn().position() + 1;
+                position = restriction.lastColumn().position() + 1;
         }
-        return hasContains();
+        return false;
     }
 
     @Override
-    public void addRowFilterTo(RowFilter filter,
+    public void addToRowFilter(RowFilter filter,
                                IndexRegistry indexRegistry,
                                QueryOptions options) throws InvalidRequestException
     {
@@ -209,18 +188,17 @@ final class ClusteringColumnRestrictions extends RestrictionSetWrapper
             // We ignore all the clustering columns that can be handled by slices.
             if (handleInFilter(restriction, position) || restriction.hasSupportingIndex(indexRegistry))
             {
-                restriction.addRowFilterTo(filter, indexRegistry, options);
+                restriction.addToRowFilter(filter, indexRegistry, options);
                 continue;
             }
 
             if (!restriction.isSlice())
-                position = restriction.getLastColumn().position() + 1;
+                position = restriction.lastColumn().position() + 1;
         }
     }
 
     private boolean handleInFilter(SingleRestriction restriction, int index)
     {
-        return restriction.isContains() || restriction.isLIKE() || index != restriction.getFirstColumn().position();
+        return restriction.needsFilteringOrIndexing() || index != restriction.firstColumn().position();
     }
-
 }

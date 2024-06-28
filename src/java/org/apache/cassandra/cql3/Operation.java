@@ -20,6 +20,12 @@ package org.apache.cassandra.cql3;
 import java.util.List;
 
 import org.apache.cassandra.cql3.functions.Function;
+import org.apache.cassandra.cql3.terms.Constants;
+import org.apache.cassandra.cql3.terms.Lists;
+import org.apache.cassandra.cql3.terms.Maps;
+import org.apache.cassandra.cql3.terms.Sets;
+import org.apache.cassandra.cql3.terms.Term;
+import org.apache.cassandra.cql3.terms.UserTypes;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.exceptions.InvalidRequestException;
@@ -97,7 +103,7 @@ public abstract class Operation
      * This can be one of:
      *   - Setting a value: c = v
      *   - Setting an element of a collection: c[x] = v
-     *   - An addition/subtraction to a variable: c = c +/- v (where v can be a collection literal)
+     *   - An addition/subtraction to a variable: c = c +/- v (where v can be a collection literal, scalar, or string)
      *   - An prepend operation: c = v + c
      */
     public interface RawUpdate
@@ -112,9 +118,11 @@ public abstract class Operation
          *
          * @param metadata
          * @param receiver the column this operation applies to.
+         * @param canReadExistingState whether the update depends on existing state
+         *                 
          * @return the prepared update operation.
          */
-        public Operation prepare(TableMetadata metadata, ColumnMetadata receiver) throws InvalidRequestException;
+        public Operation prepare(TableMetadata metadata, ColumnMetadata receiver, boolean canReadExistingState) throws InvalidRequestException;
 
         /**
          * @return whether this operation can be applied alongside the {@code
@@ -161,7 +169,7 @@ public abstract class Operation
             this.value = value;
         }
 
-        public Operation prepare(TableMetadata metadata, ColumnMetadata receiver) throws InvalidRequestException
+        public Operation prepare(TableMetadata metadata, ColumnMetadata receiver, boolean canReadExistingState) throws InvalidRequestException
         {
             Term v = value.prepare(metadata.keyspace, receiver);
 
@@ -213,7 +221,7 @@ public abstract class Operation
             this.value = value;
         }
 
-        public Operation prepare(TableMetadata metadata, ColumnMetadata receiver) throws InvalidRequestException
+        public Operation prepare(TableMetadata metadata, ColumnMetadata receiver, boolean canReadExistingState) throws InvalidRequestException
         {
             if (!(receiver.type instanceof CollectionType))
                 throw new InvalidRequestException(String.format("Invalid operation (%s) for non collection column %s", toString(receiver), receiver.name));
@@ -260,7 +268,7 @@ public abstract class Operation
             this.value = value;
         }
 
-        public Operation prepare(TableMetadata metadata, ColumnMetadata receiver) throws InvalidRequestException
+        public Operation prepare(TableMetadata metadata, ColumnMetadata receiver, boolean canReadExistingState) throws InvalidRequestException
         {
             if (!receiver.type.isUDT())
                 throw new InvalidRequestException(String.format("Invalid operation (%s) for non-UDT column %s", toString(receiver), receiver.name));
@@ -298,15 +306,23 @@ public abstract class Operation
             this.value = value;
         }
 
-        public Operation prepare(TableMetadata metadata, ColumnMetadata receiver) throws InvalidRequestException
+        public Operation prepare(TableMetadata metadata, ColumnMetadata receiver, boolean canReadExistingState) throws InvalidRequestException
         {
             if (!(receiver.type instanceof CollectionType))
             {
                 if (receiver.type instanceof TupleType)
                     throw new InvalidRequestException(String.format("Invalid operation (%s) for tuple column %s", toString(receiver), receiver.name));
 
-                if (!(receiver.type instanceof CounterColumnType))
-                    throw new InvalidRequestException(String.format("Invalid operation (%s) for non counter column %s", toString(receiver), receiver.name));
+                if (canReadExistingState)
+                {
+                    if (!(receiver.type instanceof NumberType<?>) && !(receiver.type instanceof StringType))
+                        throw new InvalidRequestException(String.format("Invalid operation (%s) for non-numeric and non-text type %s", toString(receiver), receiver.name));
+                }
+                else
+                {
+                    if (!(receiver.type instanceof CounterColumnType))
+                        throw new InvalidRequestException(String.format("Invalid operation (%s) for non counter column %s", toString(receiver), receiver.name));
+                }
                 return new Constants.Adder(receiver, value.prepare(metadata.keyspace, receiver));
             }
             else if (!(receiver.type.isMultiCell()))
@@ -354,7 +370,7 @@ public abstract class Operation
             this.value = value;
         }
 
-        public Operation prepare(TableMetadata metadata, ColumnMetadata receiver) throws InvalidRequestException
+        public Operation prepare(TableMetadata metadata, ColumnMetadata receiver, boolean canReadExistingState) throws InvalidRequestException
         {
             if (!(receiver.type instanceof CollectionType))
             {
@@ -411,7 +427,7 @@ public abstract class Operation
             this.value = value;
         }
 
-        public Operation prepare(TableMetadata metadata, ColumnMetadata receiver) throws InvalidRequestException
+        public Operation prepare(TableMetadata metadata, ColumnMetadata receiver, boolean canReadExistingState) throws InvalidRequestException
         {
             Term v = value.prepare(metadata.keyspace, receiver);
 

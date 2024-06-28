@@ -36,7 +36,9 @@ import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.metrics.CassandraMetricsRegistry;
 import org.apache.cassandra.metrics.TableMetrics;
 import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 
@@ -46,12 +48,19 @@ import static org.junit.Assert.*;
 public class ColumnFamilyMetricTest
 {
     @BeforeClass
-    public static void defineSchema()
+    public static void defineSchema() throws Exception
     {
         SchemaLoader.prepareServer();
         SchemaLoader.createKeyspace("Keyspace1",
                                     KeyspaceParams.simple(1),
                                     SchemaLoader.standardCFMD("Keyspace1", "Standard2"));
+
+        // we need this to properly initialize various static fields in the whole system
+        // since for the unit tests automatic schema flushing is disabled, the first flush may happen unexpectedly
+        // late - after the whole system is already running, and some static fields may remain uninitialized
+        // OTOH, late initialization of them may have creepy effects (for example NPEs in static initializers)
+        // disclaimer: this is not a proper way to fix that
+        StorageService.instance.forceKeyspaceFlush(SchemaConstants.SYSTEM_KEYSPACE_NAME, ColumnFamilyStore.FlushReason.UNIT_TESTS);
     }
 
     @Test
@@ -70,7 +79,7 @@ public class ColumnFamilyMetricTest
         {
             applyMutation(cfs.metadata(), String.valueOf(j), ByteBufferUtil.EMPTY_BYTE_BUFFER, FBUtilities.timestampMicros());
         }
-        cfs.forceBlockingFlush();
+        Util.flush(cfs);
         Collection<SSTableReader> sstables = cfs.getLiveSSTables();
         long size = 0;
         for (SSTableReader reader : sstables)
@@ -152,7 +161,7 @@ public class ColumnFamilyMetricTest
             applyMutation(store.metadata(), "1", bytes(1), FBUtilities.timestampMicros());
 
             // Flushing first SSTable
-            store.forceBlockingFlush();
+            Util.flush(store);
 
             long[] estimatedColumnCountHistogram = store.metric.estimatedColumnCountHistogram.getValue();
             assertNumberOfNonZeroValue(estimatedColumnCountHistogram, 1);
@@ -165,7 +174,7 @@ public class ColumnFamilyMetricTest
             applyMutation(store.metadata(), "2", bytes(2), FBUtilities.timestampMicros());
 
             // Flushing second SSTable
-            store.forceBlockingFlush();
+            Util.flush(store);
 
             estimatedColumnCountHistogram = store.metric.estimatedColumnCountHistogram.getValue();
             assertNumberOfNonZeroValue(estimatedColumnCountHistogram, 1);

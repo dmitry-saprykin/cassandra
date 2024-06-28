@@ -25,6 +25,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.zip.CRC32;
 
 import com.google.common.annotations.VisibleForTesting;
+import org.apache.cassandra.io.util.File;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -99,7 +100,7 @@ public class CommitLogReader
             {
                 if (shouldSkip(file))
                 {
-                    logger.info("Skipping playback of empty log: {}", file.getName());
+                    logger.info("Skipping playback of empty log: {}", file.name());
                 }
                 else
                 {
@@ -172,7 +173,7 @@ public class CommitLogReader
                                      boolean tolerateTruncation) throws IOException
     {
         // just transform from the file name (no reading of headers) to determine version
-        CommitLogDescriptor desc = CommitLogDescriptor.fromFileName(file.getName());
+        CommitLogDescriptor desc = CommitLogDescriptor.fromFileName(file.name());
 
         try(RandomAccessReader reader = RandomAccessReader.open(file))
         {
@@ -263,7 +264,7 @@ public class CommitLogReader
     private boolean shouldSkipSegmentId(File file, CommitLogDescriptor desc, CommitLogPosition minPosition)
     {
         logger.debug("Reading {} (CL version {}, messaging version {}, compression {})",
-            file.getPath(),
+            file.path(),
             desc.version,
             desc.getMessagingVersion(),
             desc.compression);
@@ -300,8 +301,7 @@ public class CommitLogReader
         while (statusTracker.shouldContinue() && reader.getFilePointer() < end && !reader.isEOF())
         {
             long mutationStart = reader.getFilePointer();
-            if (logger.isTraceEnabled())
-                logger.trace("Reading mutation at {}", mutationStart);
+            logger.trace("Reading mutation at {}", mutationStart);
 
             long claimedCRC32;
             int serializedSize;
@@ -323,7 +323,9 @@ public class CommitLogReader
                 serializedSize = reader.readInt();
                 if (serializedSize == LEGACY_END_OF_SEGMENT_MARKER)
                 {
-                    logger.trace("Encountered end of segment marker at {}", reader.getFilePointer());
+                    if (logger.isTraceEnabled())
+                        logger.trace("Encountered end of segment marker at {}", reader.getFilePointer());
+
                     statusTracker.requestTermination();
                     return;
                 }
@@ -470,8 +472,10 @@ public class CommitLogReader
         }
 
         if (logger.isTraceEnabled())
-            logger.trace("Read mutation for {}.{}: {}", mutation.getKeyspaceName(), mutation.key(),
-                         "{" + StringUtils.join(mutation.getPartitionUpdates().iterator(), ", ") + "}");
+            logger.trace("Read mutation for {}.{}: {{}}",
+                         mutation.getKeyspaceName(),
+                         mutation.key(),
+                         StringUtils.join(mutation.getPartitionUpdates().iterator(), ", "));
 
         if (shouldReplay)
             handler.handleMutation(mutation, size, entryLocation, desc);

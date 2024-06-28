@@ -19,6 +19,7 @@ package org.apache.cassandra.cql3.restrictions;
 
 import java.util.List;
 
+import org.apache.cassandra.index.Index;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.functions.Function;
@@ -30,28 +31,32 @@ import org.apache.cassandra.index.IndexRegistry;
  */
 public interface Restriction
 {
-    public default boolean isOnToken()
+    /**
+     * Checks if this restriction is a token restriction.
+     * @return {@code true} if this restriction is a token restriction, {@code false} otherwise
+     */
+    default boolean isOnToken()
     {
         return false;
     }
 
     /**
-     * Returns the definition of the first column.
-     * @return the definition of the first column.
+     * Returns the column metadata in position order.
+     * @return the column metadata in position order.
      */
-    public ColumnMetadata getFirstColumn();
+    List<ColumnMetadata> columns();
 
     /**
-     * Returns the definition of the last column.
-     * @return the definition of the last column.
+     * Returns the metadata of the first column.
+     * @return the metadata of the first column.
      */
-    public ColumnMetadata getLastColumn();
+    ColumnMetadata firstColumn();
 
     /**
-     * Returns the column definitions in position order.
-     * @return the column definitions in position order.
+     * Returns the metadata of the last column.
+     * @return the metadata of the last column.
      */
-    public List<ColumnMetadata> getColumnDefs();
+    ColumnMetadata lastColumn();
 
     /**
      * Adds all functions (native and user-defined) used by any component of the restriction
@@ -61,12 +66,38 @@ public interface Restriction
     void addFunctionsTo(List<Function> functions);
 
     /**
+     * Checks if this restriction requires filtering or indexing.
+     * @return {@code true} if the restriction will require either filtering or indexing, {@code false} otherwise.
+     */
+    boolean needsFilteringOrIndexing();
+
+    /**
+     * Returns whether this restriction would need filtering if the specified index group were used.
+     * Find the first index supporting this restriction.
+     *
+     * @param indexGroup an index group
+     * @return {@code true} if this would need filtering if {@code indexGroup} were used, {@code false} otherwise
+     */
+    boolean needsFiltering(Index.Group indexGroup);
+
+    /**
      * Check if the restriction is on indexed columns.
      *
-     * @param indexRegistry the index registry
-     * @return <code>true</code> if the restriction is on indexed columns, <code>false</code>
+     * @param indexes the available indexes
+     * @return <code>true</code> if the restriction is on indexed columns, <code>false</code> otherwise
      */
-    public boolean hasSupportingIndex(IndexRegistry indexRegistry);
+    default boolean hasSupportingIndex(Iterable<Index> indexes)
+    {
+        return findSupportingIndex(indexes) != null;
+    }
+
+    /**
+     * Find the first index supporting this restriction.
+     *
+     * @param indexes the available indexes
+     * @return an {@code Index} if the restriction is on indexed columns, {@code null} otherwise.
+     */
+    Index findSupportingIndex(Iterable<Index> indexes);
 
     /**
      * Adds to the specified row filter the expressions corresponding to this <code>Restriction</code>.
@@ -75,7 +106,7 @@ public interface Restriction
      * @param indexRegistry the index registry
      * @param options the query options
      */
-    public void addRowFilterTo(RowFilter filter,
-                               IndexRegistry indexRegistry,
-                               QueryOptions options);
+    void addToRowFilter(RowFilter filter,
+                        IndexRegistry indexRegistry,
+                        QueryOptions options);
 }

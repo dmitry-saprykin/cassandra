@@ -32,8 +32,8 @@ import org.apache.cassandra.utils.concurrent.OpOrder;
 
 /**
 + * The SlabAllocator is a bump-the-pointer allocator that allocates
-+ * large (1MB) global regions and then doles them out to threads that
-+ * request smaller sized (up to 128kb) slices into the array.
++ * large (1MiB) global regions and then doles them out to threads that
++ * request smaller sized (up to 128KiB) slices into the array.
  * <p></p>
  * The purpose of this class is to combat heap fragmentation in long lived
  * objects: by ensuring that all allocations with similar lifetimes
@@ -142,7 +142,8 @@ public class SlabAllocator extends MemtableBufferAllocator
                 if (!allocateOnHeapOnly)
                     offHeapRegions.add(region);
                 regionCount.incrementAndGet();
-                logger.trace("{} regions now allocated in {}", regionCount, this);
+                if (logger.isTraceEnabled())
+                    logger.trace("{} regions now allocated in {}", regionCount, this);
                 return region;
             }
 
@@ -152,9 +153,9 @@ public class SlabAllocator extends MemtableBufferAllocator
         }
     }
 
-    protected AbstractAllocator allocator(OpOrder.Group writeOp)
+    public Cloner cloner(OpOrder.Group writeOp)
     {
-        return new ContextAllocator(writeOp, this);
+        return allocator(writeOp);
     }
 
     /**

@@ -20,6 +20,8 @@ package org.apache.cassandra.index.sasi.plan;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 
+import javax.annotation.Nullable;
+
 import com.google.common.collect.Sets;
 
 import org.apache.cassandra.db.ColumnFamilyStore;
@@ -32,7 +34,6 @@ import org.apache.cassandra.db.filter.DataLimits;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
-import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.sasi.SASIIndex;
 import org.apache.cassandra.index.sasi.SSTableIndex;
 import org.apache.cassandra.index.sasi.TermIterator;
@@ -48,6 +49,8 @@ import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.Pair;
+
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 
 public class QueryController
 {
@@ -65,7 +68,7 @@ public class QueryController
         this.command = command;
         this.range = command.dataRange();
         this.executionQuota = TimeUnit.MILLISECONDS.toNanos(timeQuotaMs);
-        this.executionStart = System.nanoTime();
+        this.executionStart = nanoTime();
     }
 
     public TableMetadata metadata()
@@ -88,12 +91,11 @@ public class QueryController
         return cfs.metadata().partitionKeyType;
     }
 
+    @Nullable
     public ColumnIndex getIndex(RowFilter.Expression expression)
     {
-        Optional<Index> index = cfs.indexManager.getBestIndexFor(expression);
-        return index.isPresent() ? ((SASIIndex) index.get()).getIndex() : null;
+        return cfs.indexManager.getBestIndexFor(expression, SASIIndex.class).map(SASIIndex::getIndex).orElse(null);
     }
-
 
     public UnfilteredRowIterator getPartition(DecoratedKey key, ReadExecutionController executionController)
     {
@@ -141,7 +143,6 @@ public class QueryController
 
         for (Map.Entry<Expression, Set<SSTableIndex>> e : view)
         {
-            @SuppressWarnings("resource") // RangeIterators are closed by releaseIndexes
             RangeIterator<Long, Token> index = TermIterator.build(e.getKey(), e.getValue());
 
             builder.add(index);
@@ -154,7 +155,7 @@ public class QueryController
 
     public void checkpoint()
     {
-	long executionTime = (System.nanoTime() - executionStart);
+	long executionTime = (nanoTime() - executionStart);
 
         if (executionTime >= executionQuota)
             throw new TimeQuotaExceededException(
@@ -252,7 +253,7 @@ public class QueryController
     {
         return Sets.filter(indexes, index -> {
             SSTableReader sstable = index.getSSTable();
-            return range.startKey().compareTo(sstable.last) <= 0 && (range.stopKey().isMinimum() || sstable.first.compareTo(range.stopKey()) <= 0);
+            return range.startKey().compareTo(sstable.getLast()) <= 0 && (range.stopKey().isMinimum() || sstable.getFirst().compareTo(range.stopKey()) <= 0);
         });
     }
 }

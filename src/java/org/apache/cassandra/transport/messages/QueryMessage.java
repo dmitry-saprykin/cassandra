@@ -30,10 +30,13 @@ import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.transport.CBUtil;
+import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.transport.Message;
 import org.apache.cassandra.transport.ProtocolException;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.JVMStabilityInspector;
+
+import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
 
 /**
  * A CQL query
@@ -90,7 +93,13 @@ public class QueryMessage extends Message.Request
     }
 
     @Override
-    protected Message.Response execute(QueryState state, long queryStartNanoTime, boolean traceRequest)
+    protected boolean isTrackable()
+    {
+        return true;
+    }
+
+    @Override
+    protected Message.Response execute(QueryState state, Dispatcher.RequestTime requestTime, boolean traceRequest)
     {
         CQLStatement statement = null;
         try
@@ -101,11 +110,11 @@ public class QueryMessage extends Message.Request
             if (traceRequest)
                 traceQuery(state);
 
-            long queryStartTime = System.currentTimeMillis();
+            long queryStartTime = currentTimeMillis();
 
             QueryHandler queryHandler = ClientState.getCQLQueryHandler();
             statement = queryHandler.parse(query, state, options);
-            Message.Response response = queryHandler.process(statement, state, options, getCustomPayload(), queryStartNanoTime);
+            Message.Response response = queryHandler.process(statement, state, options, getCustomPayload(), requestTime);
             QueryEvents.instance.notifyQuerySuccess(statement, query, options, state, queryStartTime, response);
 
             if (options.skipMetadata() && response instanceof ResultMessage.Rows)
@@ -140,6 +149,7 @@ public class QueryMessage extends Message.Request
     @Override
     public String toString()
     {
-        return String.format("QUERY %s [pageSize = %d]", query, options.getPageSize());
+        return String.format("QUERY %s [pageSize = %d] at consistency %s", 
+                             query, options.getPageSize(), options.getConsistency());
     }
 }

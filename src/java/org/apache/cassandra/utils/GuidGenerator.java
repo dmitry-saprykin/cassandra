@@ -22,6 +22,7 @@ import java.security.SecureRandom;
 import java.util.Random;
 
 import static org.apache.cassandra.config.CassandraRelevantProperties.JAVA_SECURITY_EGD;
+import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
 
 public class GuidGenerator
 {
@@ -33,7 +34,7 @@ public class GuidGenerator
     {
         if (!JAVA_SECURITY_EGD.isPresent())
         {
-            System.setProperty("java.security.egd", "file:/dev/urandom");
+            JAVA_SECURITY_EGD.setString("file:/dev/urandom");
         }
         mySecureRand = new SecureRandom();
         long secureInitializer = mySecureRand.nextLong();
@@ -90,7 +91,7 @@ public class GuidGenerator
 
     public static ByteBuffer guidAsBytes()
     {
-        return guidAsBytes(myRand, s_id, System.currentTimeMillis());
+        return guidAsBytes(myRand, s_id, currentTimeMillis());
     }
 
     /*

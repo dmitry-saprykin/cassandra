@@ -17,7 +17,6 @@
  */
 package org.apache.cassandra.cql3.statements.schema;
 
-import java.util.HashSet;
 import java.util.Set;
 
 import com.google.common.collect.ImmutableSet;
@@ -31,17 +30,16 @@ import org.apache.cassandra.auth.DataResource;
 import org.apache.cassandra.auth.FunctionResource;
 import org.apache.cassandra.auth.IResource;
 import org.apache.cassandra.auth.Permission;
-import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLStatement;
+import org.apache.cassandra.db.guardrails.Guardrails;
 import org.apache.cassandra.exceptions.AlreadyExistsException;
 import org.apache.cassandra.locator.LocalStrategy;
-import org.apache.cassandra.schema.KeyspaceMetadata;
+import org.apache.cassandra.locator.SimpleStrategy;
+import org.apache.cassandra.schema.*;
 import org.apache.cassandra.schema.KeyspaceParams.Option;
-import org.apache.cassandra.schema.Keyspaces;
 import org.apache.cassandra.schema.Keyspaces.KeyspacesDiff;
-import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.service.ClientState;
-import org.apache.cassandra.service.ClientWarn;
+import org.apache.cassandra.tcm.ClusterMetadata;
 import org.apache.cassandra.transport.Event.SchemaChange;
 import org.apache.cassandra.transport.Event.SchemaChange.Change;
 
@@ -51,7 +49,7 @@ public final class CreateKeyspaceStatement extends AlterSchemaStatement
 
     private final KeyspaceAttributes attrs;
     private final boolean ifNotExists;
-    private final HashSet<String> clientWarnings = new HashSet<>();
+    private String expandedCql;
 
     public CreateKeyspaceStatement(String keyspaceName, KeyspaceAttributes attrs, boolean ifNotExists)
     {
@@ -60,17 +58,26 @@ public final class CreateKeyspaceStatement extends AlterSchemaStatement
         this.ifNotExists = ifNotExists;
     }
 
-    public Keyspaces apply(Keyspaces schema)
+    @Override
+    public String cql()
     {
-        if (ClientWarn.instance.get() == null)
-            ClientWarn.instance.captureWarnings();
-        int previousNumWarnings = ClientWarn.instance.numWarnings();
+        if (expandedCql != null)
+            return expandedCql;
+        return super.cql();
+    }
 
+    @Override
+    public Keyspaces apply(ClusterMetadata metadata)
+    {
         attrs.validate();
 
         if (!attrs.hasOption(Option.REPLICATION))
             throw ire("Missing mandatory option '%s'", Option.REPLICATION);
 
+        if (attrs.getReplicationStrategyClass() != null && attrs.getReplicationStrategyClass().equals(SimpleStrategy.class.getSimpleName()))
+            Guardrails.simpleStrategyEnabled.ensureEnabled("SimpleStrategy", state);
+
+        Keyspaces schema = metadata.schema.getKeyspaces();
         if (schema.containsKeyspace(keyspaceName))
         {
             if (ifNotExists)
@@ -79,19 +86,20 @@ public final class CreateKeyspaceStatement extends AlterSchemaStatement
             throw new AlreadyExistsException(keyspaceName);
         }
 
-        KeyspaceMetadata keyspace = KeyspaceMetadata.create(keyspaceName, attrs.asNewKeyspaceParams());
+        KeyspaceMetadata keyspaceMetadata = KeyspaceMetadata.create(keyspaceName, attrs.asNewKeyspaceParams());
 
-        if (keyspace.params.replication.klass.equals(LocalStrategy.class))
+        if (keyspaceMetadata.params.replication.klass.equals(LocalStrategy.class))
             throw ire("Unable to use given strategy class: LocalStrategy is reserved for internal use.");
 
-        keyspace.params.validate(keyspaceName);
-        Keyspaces keyspaces = schema.withAddedOrUpdated(keyspace);
+        if (keyspaceMetadata.params.replication.isMeta())
+            throw ire("Can not create a keyspace with MetaReplicationStrategy");
 
-        int newNumWarnings = ClientWarn.instance.numWarnings();
-        if (newNumWarnings > previousNumWarnings)
-            clientWarnings.addAll(ClientWarn.instance.getWarnings().subList(previousNumWarnings, newNumWarnings));
+        keyspaceMetadata.params.validate(keyspaceName, state, metadata);
+        keyspaceMetadata.replicationStrategy.validateExpectedOptions(metadata);
 
-        return keyspaces;
+        this.expandedCql = keyspaceMetadata.toCqlString(false, true, ifNotExists);
+
+        return schema.withAddedOrUpdated(keyspaceMetadata);
     }
 
     SchemaChange schemaChangeEvent(KeyspacesDiff diff)
@@ -122,18 +130,12 @@ public final class CreateKeyspaceStatement extends AlterSchemaStatement
     }
 
     @Override
-    Set<String> clientWarnings(KeyspacesDiff diff)
+    public void validate(ClientState state)
     {
-        int keyspaceCount = Schema.instance.getKeyspaces().size();
-        if (keyspaceCount > DatabaseDescriptor.keyspaceCountWarnThreshold())
-        {
-            String msg = String.format("Cluster already contains %d keyspaces. Having a large number of keyspaces will significantly slow down schema dependent cluster operations.",
-                                       keyspaceCount);
-            logger.warn(msg);
-            clientWarnings.add(msg);
-        }
+        super.validate(state);
 
-        return clientWarnings;
+        // Guardrail on number of keyspaces
+        Guardrails.keyspaces.guard(Schema.instance.getUserKeyspaces().size() + 1, keyspaceName, false, state);
     }
 
     public static final class Raw extends CQLStatement.Raw

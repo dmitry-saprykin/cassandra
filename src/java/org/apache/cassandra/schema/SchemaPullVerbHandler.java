@@ -17,21 +17,19 @@
  */
 package org.apache.cassandra.schema;
 
-import java.util.Collection;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.net.IVerbHandler;
 import org.apache.cassandra.net.Message;
-import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.net.NoPayload;
 
 /**
  * Sends it's current schema state in form of mutations in response to the remote node's request.
  * Such a request is made when one of the nodes, by means of Gossip, detects schema disagreement in the ring.
+ * @deprecated See CEP-21
  */
+@Deprecated(since = "CEP-21")
 public final class SchemaPullVerbHandler implements IVerbHandler<NoPayload>
 {
     public static final SchemaPullVerbHandler instance = new SchemaPullVerbHandler();
@@ -40,8 +38,6 @@ public final class SchemaPullVerbHandler implements IVerbHandler<NoPayload>
 
     public void doVerb(Message<NoPayload> message)
     {
-        logger.trace("Received schema pull request from {}", message.from());
-        Message<Collection<Mutation>> response = message.responseWith(SchemaKeyspace.convertSchemaToMutations());
-        MessagingService.instance().send(response, message.from());
+        logger.warn("Schema pull request from {} ignored - please upgrade", message.from());
     }
 }

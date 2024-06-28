@@ -33,8 +33,8 @@ import java.util.Properties;
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
 
-import junit.framework.AssertionFailedError;
-import junit.framework.Test;
+import junit.framework.AssertionFailedError;  // checkstyle: permit this import
+import junit.framework.Test;  // checkstyle: permit this import
 
 import org.apache.tools.ant.BuildException;
 import org.apache.tools.ant.taskdefs.optional.junit.IgnoredTestListener;
@@ -50,6 +50,10 @@ import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.Text;
 
+import static org.apache.cassandra.config.CassandraRelevantProperties.TEST_CASSANDRA_SUITENAME;
+import static org.apache.cassandra.config.CassandraRelevantProperties.TEST_CASSANDRA_TESTTAG;
+import static org.apache.cassandra.config.CassandraRelevantProperties.SUN_JAVA_COMMAND;
+import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
 
 /**
  * Prints XML output of the test to a specified Writer.
@@ -72,7 +76,7 @@ public class CassandraXMLJUnitResultFormatter implements JUnitResultFormatter, X
         }
     }
 
-    private static final String tag = System.getProperty("cassandra.testtag", "");
+    private static final String tag = TEST_CASSANDRA_TESTTAG.getString();
 
     /*
      * Set the property for the test suite name so that log configuration can pick it up
@@ -80,9 +84,9 @@ public class CassandraXMLJUnitResultFormatter implements JUnitResultFormatter, X
      */
     static
     {
-        String command = System.getProperty("sun.java.command");
+        String command = SUN_JAVA_COMMAND.getString();
         String args[] = command.split(" ");
-        System.setProperty("suitename", args[1]);
+        TEST_CASSANDRA_SUITENAME.setString(args[1]);
     }
 
     /**
@@ -104,6 +108,9 @@ public class CassandraXMLJUnitResultFormatter implements JUnitResultFormatter, X
      * individual fields.
      */
     private final Hashtable<String, Element> testElements = new Hashtable<String, Element>();
+
+    private Element propsElement;
+    private Element systemOutputElement;
 
     /**
      * tests that failed.
@@ -138,12 +145,12 @@ public class CassandraXMLJUnitResultFormatter implements JUnitResultFormatter, X
 
     /** {@inheritDoc}. */
     public void setSystemOutput(final String out) {
-        formatOutput(SYSTEM_OUT, out);
+        systemOutputElement = formatOutput(SYSTEM_OUT, out);
     }
 
     /** {@inheritDoc}. */
     public void setSystemError(final String out) {
-        formatOutput(SYSTEM_ERR, out);
+        rootElement.appendChild(formatOutput(SYSTEM_ERR, out));
     }
 
     /**
@@ -166,8 +173,7 @@ public class CassandraXMLJUnitResultFormatter implements JUnitResultFormatter, X
         rootElement.setAttribute(HOSTNAME, getHostname());
 
         // Output properties
-        final Element propsElement = doc.createElement(PROPERTIES);
-        rootElement.appendChild(propsElement);
+        propsElement = doc.createElement(PROPERTIES);
         final Properties props = suite.getProperties();
         if (props != null) {
             final Enumeration e = props.propertyNames();
@@ -208,8 +214,14 @@ public class CassandraXMLJUnitResultFormatter implements JUnitResultFormatter, X
         rootElement.setAttribute(ATTR_FAILURES, "" + suite.failureCount());
         rootElement.setAttribute(ATTR_ERRORS, "" + suite.errorCount());
         rootElement.setAttribute(ATTR_SKIPPED, "" + suite.skipCount());
-        rootElement.setAttribute(
-            ATTR_TIME, "" + (suite.getRunTime() / ONE_SECOND));
+        rootElement.setAttribute(ATTR_TIME, "" + (suite.getRunTime() / ONE_SECOND));
+        if (suite.failureCount() > 0 || suite.errorCount() > 0)
+        {
+            // only include properties and system-out if there's failure/error
+            rootElement.appendChild(propsElement);
+            if (null != systemOutputElement)
+                rootElement.appendChild(systemOutputElement);
+        }
         if (out != null) {
             Writer wri = null;
             try {
@@ -240,7 +252,7 @@ public class CassandraXMLJUnitResultFormatter implements JUnitResultFormatter, X
      * @param t the test.
      */
     public void startTest(final Test t) {
-        testStarts.put(createDescription(t), System.currentTimeMillis());
+        testStarts.put(createDescription(t), currentTimeMillis());
     }
 
     private static String createDescription(final Test test) throws BuildException {
@@ -284,7 +296,7 @@ public class CassandraXMLJUnitResultFormatter implements JUnitResultFormatter, X
 
         final Long l = testStarts.get(createDescription(test));
         currentTest.setAttribute(ATTR_TIME,
-            "" + ((System.currentTimeMillis() - l) / ONE_SECOND));
+            "" + ((currentTimeMillis() - l) / ONE_SECOND));
     }
 
     /**
@@ -347,10 +359,10 @@ public class CassandraXMLJUnitResultFormatter implements JUnitResultFormatter, X
         nested.appendChild(trace);
     }
 
-    private void formatOutput(final String type, final String output) {
+    private Element formatOutput(final String type, final String output) {
         final Element nested = doc.createElement(type);
-        rootElement.appendChild(nested);
         nested.appendChild(doc.createCDATASection(output));
+        return nested;
     }
 
     public void testIgnored(final Test test) {

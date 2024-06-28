@@ -17,33 +17,55 @@
  */
 package org.apache.cassandra.db.lifecycle;
 
-import java.io.File;
 import java.nio.file.Path;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.IdentityHashMap;
+import java.util.List;
+import java.util.Set;
 import java.util.function.BiPredicate;
+
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Predicate;
-import com.google.common.collect.*;
-
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Lists;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.io.sstable.SSTable;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.format.SSTableReader.UniqueIdentifier;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.Throwables;
+import org.apache.cassandra.utils.TimeUUID;
 import org.apache.cassandra.utils.concurrent.Transactional;
 
 import static com.google.common.base.Functions.compose;
-import static com.google.common.base.Predicates.*;
+import static com.google.common.base.Predicates.in;
 import static com.google.common.collect.ImmutableSet.copyOf;
-import static com.google.common.collect.Iterables.*;
+import static com.google.common.collect.Iterables.concat;
+import static com.google.common.collect.Iterables.getFirst;
+import static com.google.common.collect.Iterables.transform;
 import static java.util.Collections.singleton;
-import static org.apache.cassandra.db.lifecycle.Helpers.*;
+import static org.apache.cassandra.db.lifecycle.Helpers.abortObsoletion;
+import static org.apache.cassandra.db.lifecycle.Helpers.checkNotReplaced;
+import static org.apache.cassandra.db.lifecycle.Helpers.concatUniq;
+import static org.apache.cassandra.db.lifecycle.Helpers.emptySet;
+import static org.apache.cassandra.db.lifecycle.Helpers.filterIn;
+import static org.apache.cassandra.db.lifecycle.Helpers.filterOut;
+import static org.apache.cassandra.db.lifecycle.Helpers.markObsolete;
+import static org.apache.cassandra.db.lifecycle.Helpers.orIn;
+import static org.apache.cassandra.db.lifecycle.Helpers.prepareForObsoletion;
+import static org.apache.cassandra.db.lifecycle.Helpers.select;
+import static org.apache.cassandra.db.lifecycle.Helpers.selectFirst;
+import static org.apache.cassandra.db.lifecycle.Helpers.setReplaced;
 import static org.apache.cassandra.db.lifecycle.View.updateCompacting;
 import static org.apache.cassandra.db.lifecycle.View.updateLiveSet;
 import static org.apache.cassandra.utils.Throwables.maybeFail;
@@ -142,7 +164,7 @@ public class LifecycleTransaction extends Transactional.AbstractTransactional im
     public static LifecycleTransaction offline(OperationType operationType, Iterable<SSTableReader> readers)
     {
         // if offline, for simplicity we just use a dummy tracker
-        Tracker dummy = new Tracker(null, false);
+        Tracker dummy = Tracker.newDummyTracker();
         dummy.addInitialSSTables(readers);
         dummy.apply(updateCompacting(emptySet(), readers));
         return new LifecycleTransaction(dummy, operationType, readers);
@@ -151,20 +173,18 @@ public class LifecycleTransaction extends Transactional.AbstractTransactional im
     /**
      * construct an empty Transaction with no existing readers
      */
-    @SuppressWarnings("resource") // log closed during postCleanup
     public static LifecycleTransaction offline(OperationType operationType)
     {
-        Tracker dummy = new Tracker(null, false);
+        Tracker dummy = Tracker.newDummyTracker();
         return new LifecycleTransaction(dummy, new LogTransaction(operationType, dummy), Collections.emptyList());
     }
 
-    @SuppressWarnings("resource") // log closed during postCleanup
-    LifecycleTransaction(Tracker tracker, OperationType operationType, Iterable<SSTableReader> readers)
+    LifecycleTransaction(Tracker tracker, OperationType operationType, Iterable<? extends SSTableReader> readers)
     {
         this(tracker, new LogTransaction(operationType, tracker), readers);
     }
 
-    LifecycleTransaction(Tracker tracker, LogTransaction log, Iterable<SSTableReader> readers)
+    LifecycleTransaction(Tracker tracker, LogTransaction log, Iterable<? extends SSTableReader> readers)
     {
         this.tracker = tracker;
         this.log = log;
@@ -187,7 +207,7 @@ public class LifecycleTransaction extends Transactional.AbstractTransactional im
         return log.type();
     }
 
-    public UUID opId()
+    public TimeUUID opId()
     {
         return log.id();
     }
@@ -327,8 +347,7 @@ public class LifecycleTransaction extends Transactional.AbstractTransactional im
     }
     private Throwable checkpoint(Throwable accumulate)
     {
-        if (logger.isTraceEnabled())
-            logger.trace("Checkpointing staged {}", staged);
+        logger.trace("Checkpointing staged {}", staged);
 
         if (staged.isEmpty())
             return accumulate;
@@ -455,7 +474,7 @@ public class LifecycleTransaction extends Transactional.AbstractTransactional im
     private List<SSTableReader> restoreUpdatedOriginals()
     {
         Iterable<SSTableReader> torestore = filterIn(originals, logged.update, logged.obsolete);
-        return ImmutableList.copyOf(transform(torestore, (reader) -> current(reader).cloneWithRestoredStart(reader.first)));
+        return ImmutableList.copyOf(transform(torestore, (reader) -> current(reader).cloneWithRestoredStart(reader.getFirst())));
     }
 
     /**

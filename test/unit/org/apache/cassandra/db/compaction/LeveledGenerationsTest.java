@@ -37,7 +37,7 @@ import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.schema.MockSchema;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
-import static junit.framework.Assert.assertFalse;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.fail;
 
@@ -47,7 +47,6 @@ public class LeveledGenerationsTest extends CQLTester
     public static void setUp()
     {
         DatabaseDescriptor.daemonInitialization();
-        MockSchema.cleanup();
     }
 
     @Test
@@ -167,8 +166,8 @@ public class LeveledGenerationsTest extends CQLTester
     {
         List<SSTableReader> drained = Lists.newArrayList(iter);
         assertEquals(expectedCount, drained.size());
-        assertEquals(dk(first).getToken(), first(drained).first.getToken());
-        assertEquals(dk(last).getToken(), last(drained).first.getToken()); // we sort by first token, so this is the first token of the last sstable in iter
+        assertEquals(dk(first).getToken(), first(drained).getFirst().getToken());
+        assertEquals(dk(last).getToken(), last(drained).getFirst().getToken()); // we sort by first token, so this is the first token of the last sstable in iter
     }
 
     private SSTableReader last(Iterable<SSTableReader> iter)
@@ -194,6 +193,6 @@ public class LeveledGenerationsTest extends CQLTester
 
     private void print(SSTableReader sstable)
     {
-        System.out.println(String.format("%d %s %s %d", sstable.descriptor.generation, sstable.first, sstable.last, sstable.getSSTableLevel()));
+        System.out.println(String.format("%d %s %s %d", sstable.descriptor.id, sstable.getFirst(), sstable.getLast(), sstable.getSSTableLevel()));
     }
 }

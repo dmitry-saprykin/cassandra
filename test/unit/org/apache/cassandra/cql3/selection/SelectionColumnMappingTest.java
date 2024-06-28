@@ -40,6 +40,7 @@ import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 import static java.util.Arrays.asList;
+import static org.apache.cassandra.ServerTestUtils.daemonInitialization;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
@@ -54,8 +55,8 @@ public class SelectionColumnMappingTest extends CQLTester
     @BeforeClass
     public static void setUpClass()     // overrides CQLTester.setUpClass()
     {
+        daemonInitialization();
         DatabaseDescriptor.setPartitionerUnsafe(ByteOrderedPartitioner.instance);
-
         prepareServer();
     }
 
@@ -227,14 +228,14 @@ public class SelectionColumnMappingTest extends CQLTester
 
     private void testFunction() throws Throwable
     {
-        // a function such as intasblob(<col>) is represented in ResultSet.Metadata
+        // a function such as int_as_blob(<col>) is represented in ResultSet.Metadata
         // by a ColumnSpecification with the function name plus args and the type set
         // to the function's return type
-        ColumnSpecification fnSpec = columnSpecification("system.intasblob(v1)", BytesType.instance);
+        ColumnSpecification fnSpec = columnSpecification("system.int_as_blob(v1)", BytesType.instance);
         SelectionColumnMapping expected = SelectionColumnMapping.newMapping()
                                                                 .addMapping(fnSpec, columnDefinition("v1"));
 
-        verify(expected, "SELECT intasblob(v1) FROM %s");
+        verify(expected, "SELECT int_as_blob(v1) FROM %s");
     }
 
     private void testNoArgFunction() throws Throwable
@@ -326,7 +327,7 @@ public class SelectionColumnMappingTest extends CQLTester
         SelectionColumnMapping expected = SelectionColumnMapping.newMapping()
                                                                 .addMapping(fnSpec, columnDefinition("v1"));
 
-        verify(expected, "SELECT intasblob(v1) AS fn_alias FROM %s");
+        verify(expected, "SELECT int_as_blob(v1) AS fn_alias FROM %s");
     }
 
     public void testNoArgumentFunction() throws Throwable
@@ -341,19 +342,19 @@ public class SelectionColumnMappingTest extends CQLTester
     public void testNestedFunctionsWithArguments() throws Throwable
     {
         SelectionColumns expected = SelectionColumnMapping.newMapping()
-                                                          .addMapping(columnSpecification("system.blobasint(system.intasblob(v1))",
+                                                          .addMapping(columnSpecification("system.blob_as_int(system.int_as_blob(v1))",
                                                                                           Int32Type.instance),
                                                                       columnDefinition("v1"));
-        verify(expected, "SELECT blobasint(intasblob(v1)) FROM %s");
+        verify(expected, "SELECT blob_as_int(int_as_blob(v1)) FROM %s");
     }
 
     public void testNestedFunctions() throws Throwable
     {
         SelectionColumns expected = SelectionColumnMapping.newMapping()
-                                                          .addMapping(columnSpecification("system.tounixtimestamp(system.now())",
+                                                          .addMapping(columnSpecification("system.to_unix_timestamp(system.now())",
                                                                                           LongType.instance),
                                                                       NULL_DEF);
-        verify(expected, "SELECT tounixtimestamp(now()) FROM %s");
+        verify(expected, "SELECT to_unix_timestamp(now()) FROM %s");
     }
 
     public void testDuplicateFunctionsWithoutAliases() throws Throwable
@@ -361,11 +362,11 @@ public class SelectionColumnMappingTest extends CQLTester
         // where duplicate functions are present, the ColumnSpecification list will
         // contain an entry per-duplicate but the mappings will be deduplicated (i.e.
         // a single mapping k/v pair regardless of the number of duplicates)
-        ColumnSpecification spec = columnSpecification("system.intasblob(v1)", BytesType.instance);
+        ColumnSpecification spec = columnSpecification("system.int_as_blob(v1)", BytesType.instance);
         SelectionColumns expected = SelectionColumnMapping.newMapping()
                                                           .addMapping(spec, columnDefinition("v1"))
                                                           .addMapping(spec, columnDefinition("v1"));
-        verify(expected, "SELECT intasblob(v1), intasblob(v1) FROM %s");
+        verify(expected, "SELECT int_as_blob(v1), int_as_blob(v1) FROM %s");
     }
 
     public void testDuplicateFunctionsWithAliases() throws Throwable
@@ -378,7 +379,7 @@ public class SelectionColumnMappingTest extends CQLTester
                                                                       columnDefinition("v1"))
                                                           .addMapping(columnSpecification("blob_2", BytesType.instance),
                                                                       columnDefinition("v1"));
-        verify(expected, "SELECT intasblob(v1) AS blob_1, intasblob(v1) AS blob_2 FROM %s");
+        verify(expected, "SELECT int_as_blob(v1) AS blob_1, int_as_blob(v1) AS blob_2 FROM %s");
     }
 
     public void testSelectDistinct() throws Throwable
@@ -534,8 +535,8 @@ public class SelectionColumnMappingTest extends CQLTester
                                                         " CREATE FUNCTION %s (a int, b int)" +
                                                         " RETURNS NULL ON NULL INPUT" +
                                                         " RETURNS int" +
-                                                        " LANGUAGE javascript" +
-                                                        " AS 'a + b'")).name;
+                                                        " LANGUAGE java" +
+                                                        " AS ' return a + b;'")).name;
 
         String aFunc = createAggregate(KEYSPACE, "int, int",
                                        " CREATE AGGREGATE %s (int)" +
@@ -547,15 +548,15 @@ public class SelectionColumnMappingTest extends CQLTester
                                         " CREATE FUNCTION %s (a int)" +
                                         " RETURNS NULL ON NULL INPUT" +
                                         " RETURNS int" +
-                                        " LANGUAGE javascript" +
-                                        " AS 'a+1'");
+                                        " LANGUAGE java" +
+                                        " AS ' return a + 1;'");
 
         String sqFunc = createFunction(KEYSPACE, "int",
                                        " CREATE FUNCTION %s (a int)" +
                                        " RETURNS NULL ON NULL INPUT" +
                                        " RETURNS int" +
-                                       " LANGUAGE javascript" +
-                                       " AS 'a*a'");
+                                       " LANGUAGE java" +
+                                       " AS ' return a * a;'");
 
         ColumnMetadata v1 = columnDefinition("v1");
         SelectionColumns expected = SelectionColumnMapping.newMapping()

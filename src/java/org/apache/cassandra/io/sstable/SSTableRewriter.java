@@ -17,38 +17,35 @@
  */
 package org.apache.cassandra.io.sstable;
 
-import java.lang.ref.WeakReference;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.function.Consumer;
 
 import com.google.common.annotations.VisibleForTesting;
 
-import org.apache.cassandra.cache.InstrumentingCache;
-import org.apache.cassandra.cache.KeyCacheKey;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.db.RowIndexEntry;
 import org.apache.cassandra.db.lifecycle.ILifecycleTransaction;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.format.SSTableWriter;
-import org.apache.cassandra.utils.NativeLibrary;
 import org.apache.cassandra.utils.concurrent.Transactional;
 
 /**
- * Wraps one or more writers as output for rewriting one or more readers: every sstable_preemptive_open_interval_in_mb
+ * Wraps one or more writers as output for rewriting one or more readers: every sstable_preemptive_open_interval
  * we look in the summary we're collecting for the latest writer for the penultimate key that we know to have been fully
  * flushed to the index file, and then double check that the key is fully present in the flushed data file.
  * Then we move the starts of each reader forwards to that point, replace them in the Tracker, and attach a runnable
  * for on-close (i.e. when all references expire) that drops the page cache prior to that key position
  *
  * hard-links are created for each partially written sstable so that readers opened against them continue to work past
- * the rename of the temporary file, which is deleted once all readers against the hard-link have been closed.
+ * renaming of the temporary file, which is deleted once all readers against the hard-link have been closed.
  * If for any reason the writer is rolled over, we immediately rename and fully expose the completed file in the Tracker.
  *
- * On abort we restore the original lower bounds to the existing readers and delete any temporary files we had in progress,
- * but leave any hard-links in place for the readers we opened to cleanup when they're finished as we would had we finished
- * successfully.
+ * On abort, we restore the original lower bounds to the existing readers and delete any temporary files we had in progress,
+ * but leave any hard-links in place for the readers we opened, and clean-up when the readers finish as we would do
+ * if we had finished successfully.
  */
 public class SSTableRewriter extends Transactional.AbstractTransactional implements Transactional
 {
@@ -62,19 +59,20 @@ public class SSTableRewriter extends Transactional.AbstractTransactional impleme
     private final ILifecycleTransaction transaction; // the readers we are rewriting (updated as they are replaced)
     private final List<SSTableReader> preparedForCommit = new ArrayList<>();
 
-    private long currentlyOpenedEarlyAt; // the position (in MB) in the target file we last (re)opened at
+    private long currentlyOpenedEarlyAt; // the position (in MiB) in the target file we last (re)opened at
+    private long bytesWritten; // the bytes written by previous writers, or zero if the current writer is the first writer
 
     private final List<SSTableWriter> writers = new ArrayList<>();
     private final boolean keepOriginals; // true if we do not want to obsolete the originals
     private final boolean eagerWriterMetaRelease; // true if the writer metadata should be released when switch is called
 
     private SSTableWriter writer;
-    private Map<DecoratedKey, RowIndexEntry> cachedKeys = new HashMap<>();
 
     // for testing (TODO: remove when have byteman setup)
     private boolean throwEarly, throwLate;
 
-    @Deprecated
+    /** @deprecated See CASSANDRA-11148 */
+    @Deprecated(since = "3.4")
     public SSTableRewriter(ILifecycleTransaction transaction, long maxAge, long preemptiveOpenInterval, boolean keepOriginals)
     {
         this(transaction, maxAge, preemptiveOpenInterval, keepOriginals, false);
@@ -106,7 +104,7 @@ public class SSTableRewriter extends Transactional.AbstractTransactional impleme
 
     private static long calculateOpenInterval(boolean shouldOpenEarly)
     {
-        long interval = DatabaseDescriptor.getSSTablePreemptiveOpenIntervalInMB() * (1L << 20);
+        long interval = DatabaseDescriptor.getSSTablePreemptiveOpenIntervalInMiB() * (1L << 20);
         if (disableEarlyOpeningForTests || !shouldOpenEarly || interval < 0)
             interval = Long.MAX_VALUE;
         return interval;
@@ -117,31 +115,29 @@ public class SSTableRewriter extends Transactional.AbstractTransactional impleme
         return writer;
     }
 
-    public RowIndexEntry append(UnfilteredRowIterator partition)
+    public long bytesWritten()
     {
-        // we do this before appending to ensure we can resetAndTruncate() safely if the append fails
+        return bytesWritten + (writer == null ? 0 : writer.getFilePointer());
+    }
+
+    public void forEachWriter(Consumer<SSTableWriter> op)
+    {
+        for (SSTableWriter writer : writers)
+            op.accept(writer);
+        if (writer != null)
+            op.accept(writer);
+    }
+
+    public AbstractRowIndexEntry append(UnfilteredRowIterator partition)
+    {
+        // we do this before appending to ensure we can resetAndTruncate() safely if appending fails
         DecoratedKey key = partition.partitionKey();
         maybeReopenEarly(key);
-        RowIndexEntry index = writer.append(partition);
-        if (DatabaseDescriptor.shouldMigrateKeycacheOnCompaction())
-        {
-            if (!transaction.isOffline() && index != null)
-            {
-                for (SSTableReader reader : transaction.originals())
-                {
-                    if (reader.getCachedPosition(key, false) != null)
-                    {
-                        cachedKeys.put(key, index);
-                        break;
-                    }
-                }
-            }
-        }
-        return index;
+        return writer.append(partition);
     }
 
     // attempts to append the row, if fails resets the writer position
-    public RowIndexEntry tryAppend(UnfilteredRowIterator partition)
+    public AbstractRowIndexEntry tryAppend(UnfilteredRowIterator partition)
     {
         writer.mark();
         try
@@ -163,20 +159,18 @@ public class SSTableRewriter extends Transactional.AbstractTransactional impleme
             {
                 for (SSTableReader reader : transaction.originals())
                 {
-                    RowIndexEntry index = reader.getPosition(key, SSTableReader.Operator.GE);
-                    NativeLibrary.trySkipCache(reader.getFilename(), 0, index == null ? 0 : index.position);
+                    reader.trySkipFileCacheBefore(key);
                 }
             }
             else
             {
-                SSTableReader reader = writer.setMaxDataAge(maxAge).openEarly();
-                if (reader != null)
-                {
+                writer.setMaxDataAge(maxAge);
+                writer.openEarly(reader -> {
                     transaction.update(reader, false);
                     currentlyOpenedEarlyAt = writer.getFilePointer();
-                    moveStarts(reader, reader.last);
+                    moveStarts(reader.getLast());
                     transaction.checkpoint();
-                }
+                });
             }
         }
     }
@@ -210,27 +204,13 @@ public class SSTableRewriter extends Transactional.AbstractTransactional impleme
      * one, the old *instance* will have reference count == 0 and if we were to start a new compaction with that old
      * instance, we would get exceptions.
      *
-     * @param newReader the rewritten reader that replaces them for this region
      * @param lowerbound if !reset, must be non-null, and marks the exclusive lowerbound of the start for each sstable
      */
-    private void moveStarts(SSTableReader newReader, DecoratedKey lowerbound)
+    private void moveStarts(DecoratedKey lowerbound)
     {
         if (transaction.isOffline() || preemptiveOpenInterval == Long.MAX_VALUE)
             return;
 
-        newReader.setupOnline();
-        List<DecoratedKey> invalidateKeys = null;
-        if (!cachedKeys.isEmpty())
-        {
-            invalidateKeys = new ArrayList<>(cachedKeys.size());
-            for (Map.Entry<DecoratedKey, RowIndexEntry> cacheKey : cachedKeys.entrySet())
-            {
-                invalidateKeys.add(cacheKey.getKey());
-                newReader.cacheKey(cacheKey.getKey(), cacheKey.getValue());
-            }
-        }
-
-        cachedKeys.clear();
         for (SSTableReader sstable : transaction.originals())
         {
             // we call getCurrentReplacement() to support multiple rewriters operating over the same source readers at once.
@@ -238,52 +218,22 @@ public class SSTableRewriter extends Transactional.AbstractTransactional impleme
             final SSTableReader latest = transaction.current(sstable);
 
             // skip any sstables that we know to already be shadowed
-            if (latest.first.compareTo(lowerbound) > 0)
+            if (latest.getFirst().compareTo(lowerbound) > 0)
                 continue;
 
-            Runnable runOnClose = invalidateKeys != null ? new InvalidateKeys(latest, invalidateKeys) : null;
-            if (lowerbound.compareTo(latest.last) >= 0)
+            if (lowerbound.compareTo(latest.getLast()) >= 0)
             {
                 if (!transaction.isObsolete(latest))
-                {
-                    if (runOnClose != null)
-                    {
-                        latest.runOnClose(runOnClose);
-                    }
                     transaction.obsolete(latest);
-                }
                 continue;
             }
 
-            DecoratedKey newStart = latest.firstKeyBeyond(lowerbound);
-            assert newStart != null;
-            SSTableReader replacement = latest.cloneWithNewStart(newStart, runOnClose);
-            transaction.update(replacement, true);
-        }
-    }
-
-    private static final class InvalidateKeys implements Runnable
-    {
-        final List<KeyCacheKey> cacheKeys = new ArrayList<>();
-        final WeakReference<InstrumentingCache<KeyCacheKey, ?>> cacheRef;
-
-        private InvalidateKeys(SSTableReader reader, Collection<DecoratedKey> invalidate)
-        {
-            this.cacheRef = new WeakReference<>(reader.getKeyCache());
-            if (cacheRef.get() != null)
+            if (!transaction.isObsolete(latest))
             {
-                for (DecoratedKey key : invalidate)
-                    cacheKeys.add(reader.getCacheKey(key));
-            }
-        }
-
-        public void run()
-        {
-            for (KeyCacheKey key : cacheKeys)
-            {
-                InstrumentingCache<KeyCacheKey, ?> cache = cacheRef.get();
-                if (cache != null)
-                    cache.remove(key);
+                DecoratedKey newStart = latest.firstKeyBeyond(lowerbound);
+                assert newStart != null;
+                SSTableReader replacement = latest.cloneWithNewStart(newStart);
+                transaction.update(replacement, true);
             }
         }
     }
@@ -291,7 +241,10 @@ public class SSTableRewriter extends Transactional.AbstractTransactional impleme
     public void switchWriter(SSTableWriter newWriter)
     {
         if (newWriter != null)
-            writers.add(newWriter.setMaxDataAge(maxAge));
+        {
+            newWriter.setMaxDataAge(maxAge);
+            writers.add(newWriter);
+        }
 
         if (eagerWriterMetaRelease && writer != null)
             writer.releaseMetadataOverhead();
@@ -310,16 +263,20 @@ public class SSTableRewriter extends Transactional.AbstractTransactional impleme
             return;
         }
 
+        // Open fully completed sstables early. This is also required for the final sstable in a set (where newWriter
+        // is null) to permit the compilation of a canonical set of sstables (see View.select).
         if (preemptiveOpenInterval != Long.MAX_VALUE)
         {
             // we leave it as a tmp file, but we open it and add it to the Tracker
-            SSTableReader reader = writer.setMaxDataAge(maxAge).openFinalEarly();
+            writer.setMaxDataAge(maxAge);
+            SSTableReader reader = writer.openFinalEarly();
             transaction.update(reader, false);
-            moveStarts(reader, reader.last);
+            moveStarts(reader.getLast());
             transaction.checkpoint();
         }
 
         currentlyOpenedEarlyAt = 0;
+        bytesWritten += writer.getFilePointer();
         writer = newWriter;
     }
 
@@ -370,7 +327,9 @@ public class SSTableRewriter extends Transactional.AbstractTransactional impleme
         for (SSTableWriter writer : writers)
         {
             assert writer.getFilePointer() > 0;
-            writer.setRepairedAt(repairedAt).setOpenResult(true).prepareToCommit();
+            writer.setRepairedAt(repairedAt);
+            writer.setOpenResult(true);
+            writer.prepareToCommit();
             SSTableReader reader = writer.finished();
             transaction.update(reader, false);
             preparedForCommit.add(reader);

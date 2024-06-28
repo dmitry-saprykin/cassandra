@@ -20,7 +20,10 @@ package org.apache.cassandra.db;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.*;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
@@ -28,20 +31,24 @@ import java.util.concurrent.TimeUnit;
 import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
+
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
-import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.db.marshal.AbstractType;
-import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.db.partitions.FilteredPartition;
+import org.apache.cassandra.db.partitions.PartitionIterator;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterators;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.index.Index;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.schema.SchemaTestUtil;
 import org.apache.cassandra.schema.TableMetadata;
-import org.apache.cassandra.schema.MigrationManager;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 
@@ -120,7 +127,7 @@ public class SecondaryIndexTest
                                       .filterOn("birthdate", Operator.EQ, 1L)
                                       .build();
 
-        Index.Searcher searcher = rc.getIndex(cfs).searcherFor(rc);
+        Index.Searcher searcher = rc.indexSearcher();
         try (ReadExecutionController executionController = rc.executionController();
              UnfilteredPartitionIterator pi = searcher.search(executionController))
         {
@@ -207,7 +214,7 @@ public class SecondaryIndexTest
 
         // verify that it's not being indexed under any other value either
         ReadCommand rc = Util.cmd(cfs).build();
-        assertNull(rc.getIndex(cfs));
+        assertNull(rc.indexSearcher());
 
         // resurrect w/ a newer timestamp
         new RowUpdateBuilder(cfs.metadata(), 2, "k1").clustering("c").add("birthdate", 1L).build().apply();;
@@ -225,13 +232,13 @@ public class SecondaryIndexTest
         // todo - checking the # of index searchers for the command is probably not the best thing to test here
         RowUpdateBuilder.deleteRow(cfs.metadata(), 3, "k1", "c").applyUnsafe();
         rc = Util.cmd(cfs).build();
-        assertNull(rc.getIndex(cfs));
+        assertNull(rc.indexSearcher());
 
         // make sure obsolete mutations don't generate an index entry
         // todo - checking the # of index searchers for the command is probably not the best thing to test here
         new RowUpdateBuilder(cfs.metadata(), 3, "k1").clustering("c").add("birthdate", 1L).build().apply();;
         rc = Util.cmd(cfs).build();
-        assertNull(rc.getIndex(cfs));
+        assertNull(rc.indexSearcher());
     }
 
     @Test
@@ -300,7 +307,7 @@ public class SecondaryIndexTest
         new RowUpdateBuilder(cfs.metadata(), 1, "k1").noRowMarker().add("birthdate", 1L).build().applyUnsafe();
 
         // force a flush, so our index isn't being read from a memtable
-        keyspace.getColumnFamilyStore(WITH_KEYS_INDEX).forceBlockingFlush();
+        Util.flushTable(keyspace, WITH_KEYS_INDEX);
 
         // now apply another update, but force the index update to be skipped
         keyspace.apply(new RowUpdateBuilder(cfs.metadata(), 2, "k1").noRowMarker().add("birthdate", 2L).build(),
@@ -356,7 +363,7 @@ public class SecondaryIndexTest
         assertIndexedOne(cfs, col, 10l);
 
         // force a flush and retry the query, so our index isn't being read from a memtable
-        keyspace.getColumnFamilyStore(cfName).forceBlockingFlush();
+        Util.flushTable(keyspace, cfName);
         assertIndexedOne(cfs, col, 10l);
 
         // now apply another update, but force the index update to be skipped
@@ -482,7 +489,7 @@ public class SecondaryIndexTest
             current.unbuild()
                    .indexes(current.indexes.with(indexDef))
                    .build();
-        MigrationManager.announceTableUpdate(updated, true);
+        SchemaTestUtil.announceTableUpdate(updated);
 
         // wait for the index to be built
         Index index = cfs.indexManager.getIndex(indexDef);
@@ -522,7 +529,7 @@ public class SecondaryIndexTest
             new RowUpdateBuilder(cfs.metadata(), 0, "k" + i).noRowMarker().add("birthdate", 1l).build().applyUnsafe();
 
         assertIndexedCount(cfs, ByteBufferUtil.bytes("birthdate"), 1l, 10);
-        cfs.forceBlockingFlush();
+        Util.flush(cfs);
         assertIndexedCount(cfs, ByteBufferUtil.bytes("birthdate"), 1l, 10);
     }
 
@@ -537,7 +544,7 @@ public class SecondaryIndexTest
         new RowUpdateBuilder(cfs.metadata(), 0, "k3").clustering("c").add("birthdate", 1L).add("notbirthdate", 3L).build().applyUnsafe();
         new RowUpdateBuilder(cfs.metadata(), 0, "k4").clustering("c").add("birthdate", 1L).add("notbirthdate", 3L).build().applyUnsafe();
 
-        cfs.forceBlockingFlush();
+        Util.flush(cfs);
         ReadCommand rc = Util.cmd(cfs)
                              .fromKeyIncl("k1")
                              .toKeyIncl("k3")
@@ -546,7 +553,7 @@ public class SecondaryIndexTest
                              .filterOn("notbirthdate", Operator.EQ, 0L)
                              .build();
 
-        assertEquals("notbirthdate_key_index", rc.indexMetadata().name);
+        assertEquals("notbirthdate_key_index", rc.indexQueryPlan().getFirst().getIndexMetadata().name);
     }
 
     private void assertIndexedNone(ColumnFamilyStore cfs, ByteBuffer col, Object val)
@@ -562,7 +569,7 @@ public class SecondaryIndexTest
         ColumnMetadata cdef = cfs.metadata().getColumn(col);
 
         ReadCommand rc = Util.cmd(cfs).filterOn(cdef.name.toString(), Operator.EQ, ((AbstractType) cdef.cellValueType()).decompose(val)).build();
-        Index.Searcher searcher = rc.getIndex(cfs).searcherFor(rc);
+        Index.Searcher searcher = rc.indexSearcher();
         if (count != 0)
             assertNotNull(searcher);
 

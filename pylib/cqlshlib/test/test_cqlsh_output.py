@@ -17,21 +17,16 @@
 # to configure behavior, define $CQL_TEST_HOST to the destination address
 # and $CQL_TEST_PORT to the associated port.
 
-from __future__ import unicode_literals, with_statement
-
 import locale
 import os
 import re
-import subprocess
 import sys
-import six
-import unittest
 
 from .basecase import (BaseTestCase, TEST_HOST, TEST_PORT,
-                       at_a_time, cqlsh, cqlshlog, dedent)
+                       at_a_time, cqlshlog, dedent)
 from .cassconnect import (cassandra_cursor, create_db, get_keyspace,
                           quote_name, remove_db, split_cql_commands,
-                          testcall_cqlsh, testrun_cqlsh)
+                          cqlsh_testcall, cqlsh_testrun)
 from .ansi_colors import (ColoredText, ansi_seq, lookup_colorcode,
                           lookup_colorname, lookup_colorletter)
 
@@ -95,7 +90,7 @@ class TestCqlshOutput(BaseTestCase):
         """
         if env is None:
             env = self.default_env
-        with testrun_cqlsh(tty=True, env=env, **kwargs) as c:
+        with cqlsh_testrun(tty=True, env=env, **kwargs) as c:
             for query, expected in queries_and_expected_outputs:
                 cqlshlog.debug('Testing %r' % (query,))
                 output = c.cmd_and_response(query).lstrip("\r\n")
@@ -124,8 +119,7 @@ class TestCqlshOutput(BaseTestCase):
         for termname in ('', 'dumb', 'vt100'):
             cqlshlog.debug('TERM=%r' % termname)
             env['TERM'] = termname
-            with testrun_cqlsh(tty=True, env=env,
-                               win_force_colors=False) as c:
+            with cqlsh_testrun(tty=True, env=env) as c:
                 c.send('select * from has_all_types;\n')
                 self.assertNoHasColors(c.read_to_next_prompt())
                 c.send('select count(*) from has_all_types;\n')
@@ -139,7 +133,7 @@ class TestCqlshOutput(BaseTestCase):
             cqlshlog.debug('TERM=%r' % termname)
             env['TERM'] = termname
             query = 'select * from has_all_types limit 1;'
-            output, result = testcall_cqlsh(prompt=None, env=env,
+            output, result = cqlsh_testcall(prompt=None, env=env,
                                             tty=False, input=query + '\n')
             output = output.splitlines()
             for line in output:
@@ -160,7 +154,7 @@ class TestCqlshOutput(BaseTestCase):
             cqlshlog.debug('TERM=%r' % termname)
             env['TERMNAME'] = termname
             env['TERM'] = termname
-            with testrun_cqlsh(tty=True, env=env) as c:
+            with cqlsh_testrun(tty=True, env=env) as c:
                 c.send('select * from has_all_types;\n')
                 self.assertHasColors(c.read_to_next_prompt())
                 c.send('select count(*) from has_all_types;\n')
@@ -313,9 +307,9 @@ class TestCqlshOutput(BaseTestCase):
         # same query should show up as empty in cql 3
         self.assertQueriesGiveColoredOutput((
             (q, """
-             num | asciicol | bigintcol | blobcol | booleancol | decimalcol | doublecol | floatcol | intcol | smallintcol | textcol | timestampcol | tinyintcol | uuidcol | varcharcol | varintcol
-             RRR   MMMMMMMM   MMMMMMMMM   MMMMMMM   MMMMMMMMMM   MMMMMMMMMM   MMMMMMMMM   MMMMMMMM   MMMMMM   MMMMMMMMMMM   MMMMMMM   MMMMMMMMMMMM   MMMMMMMMMM   MMMMMMM   MMMMMMMMMM   MMMMMMMMM
-            -----+----------+-----------+---------+------------+------------+-----------+----------+--------+-------------+---------+--------------+------------+---------+------------+-----------
+             num | asciicol | bigintcol | blobcol | booleancol | decimalcol | doublecol | durationcol | floatcol | intcol | listcol | mapcol | setcol | smallintcol | textcol | timestampcol | tinyintcol | uuidcol | varcharcol | varintcol | vectorcol
+             RRR   MMMMMMMM   MMMMMMMMM   MMMMMMM   MMMMMMMMMM   MMMMMMMMMM   MMMMMMMMM   MMMMMMMMMMM   MMMMMMMM   MMMMMM   MMMMMMM   MMMMMM   MMMMMM   MMMMMMMMMMM   MMMMMMM   MMMMMMMMMMMM   MMMMMMMMMM   MMMMMMM   MMMMMMMMMM   MMMMMMMMM   MMMMMMMMM
+            -----+----------+-----------+---------+------------+------------+-----------+-------------+----------+--------+---------+--------+--------+-------------+---------+--------------+------------+---------+------------+-----------+-----------
 
 
             (0 rows)
@@ -409,7 +403,8 @@ class TestCqlshOutput(BaseTestCase):
             """),
         ), env=env)
         try:
-            import pytz  # test only if pytz is available on PYTHONPATH
+            if sys.version_info < (3, 9):
+                import pytz  # on older versions without zoneinfo, test only if pytz is available on PYTHONPATH
             env['TZ'] = 'America/Sao_Paulo'
             self.assertQueriesGiveColoredOutput((
                 ('''select timestampcol from has_all_types where num = 0;''', """
@@ -567,8 +562,30 @@ class TestCqlshOutput(BaseTestCase):
             """, ),
         ))
 
+    def test_duration_output(self):
+        self.assertQueriesGiveColoredOutput((
+            ("select num, durationcol from has_all_types where num in (0, 1, 2, 3);", r"""
+             num | durationcol
+             RRR   MMMMMMMMMMM
+            -----+----------------
+
+               0 |            12h
+               G   GGGGGGGGGGGGGG
+               1 |         12h30m
+               G   GGGGGGGGGGGGGG
+               2 |      12h30m30s
+               G   GGGGGGGGGGGGGG
+               3 | 12h30m30s250ms
+               G   GGGGGGGGGGGGGG
+
+
+            (4 rows)
+            nnnnnnnn
+            """, ),
+        ))
+
     def test_prompt(self):
-        with testrun_cqlsh(tty=True, keyspace=None, env=self.default_env) as c:
+        with cqlsh_testrun(tty=True, keyspace=None, env=self.default_env) as c:
             self.assertTrue(c.output_header.splitlines()[-1].endswith('cqlsh> '))
 
             c.send('\n')
@@ -588,19 +605,19 @@ class TestCqlshOutput(BaseTestCase):
             outputlines = c.read_to_next_prompt().splitlines()
 
             start_index = 0
-            if c.realtty:
+            if c.tty:
                 self.assertEqual(outputlines[start_index], 'use NONEXISTENTKEYSPACE;')
                 start_index = 1
 
-            self.assertTrue(outputlines[start_index+1].endswith('cqlsh:system> '))
+            self.assertTrue(outputlines[start_index + 1].endswith('cqlsh:system> '))
             midline = ColoredText(outputlines[start_index])
             self.assertEqual(midline.plain(),
                              'InvalidRequest: Error from server: code=2200 [Invalid query] message="Keyspace \'nonexistentkeyspace\' does not exist"')
             self.assertColorFromTags(midline,
-                             "RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR")
+                                     "RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR")
 
     def test_describe_keyspace_output(self):
-        with testrun_cqlsh(tty=True, env=self.default_env) as c:
+        with cqlsh_testrun(tty=True, env=self.default_env) as c:
             ks = get_keyspace()
             qks = quote_name(ks)
             for cmd in ('describe keyspace', 'desc keyspace'):
@@ -649,6 +666,7 @@ class TestCqlshOutput(BaseTestCase):
                 booleancol boolean,
                 decimalcol decimal,
                 doublecol double,
+                durationcol duration,
                 floatcol float,
                 intcol int,
                 smallintcol smallint,
@@ -657,25 +675,32 @@ class TestCqlshOutput(BaseTestCase):
                 tinyintcol tinyint,
                 uuidcol uuid,
                 varcharcol text,
-                varintcol varint
+                varintcol varint,
+                vectorcol vector<float, 3>,
+                listcol list<text>,
+                mapcol map<text, int>,
+                setcol set<text>
             ) WITH additional_write_policy = '99p'
+                AND allow_auto_snapshot = true
                 AND bloom_filter_fp_chance = 0.01
                 AND caching = {'keys': 'ALL', 'rows_per_partition': 'NONE'}
                 AND cdc = false
                 AND comment = ''
                 AND compaction = {'class': 'org.apache.cassandra.db.compaction.SizeTieredCompactionStrategy', 'max_threshold': '32', 'min_threshold': '4'}
                 AND compression = {'chunk_length_in_kb': '16', 'class': 'org.apache.cassandra.io.compress.LZ4Compressor'}
+                AND memtable = 'default'
                 AND crc_check_chance = 1.0
                 AND default_time_to_live = 0
                 AND extensions = {}
                 AND gc_grace_seconds = 864000
+                AND incremental_backups = true
                 AND max_index_interval = 2048
                 AND memtable_flush_period_in_ms = 0
                 AND min_index_interval = 128
                 AND read_repair = 'BLOCKING'
                 AND speculative_retry = '99p';""" % quote_name(get_keyspace()))
 
-        with testrun_cqlsh(tty=True, env=self.default_env) as c:
+        with cqlsh_testrun(tty=True, env=self.default_env) as c:
             for cmdword in ('describe table', 'desc columnfamily'):
                 for semicolon in (';', ''):
                     output = c.cmd_and_response('%s has_all_types%s' % (cmdword, semicolon))
@@ -691,7 +716,7 @@ class TestCqlshOutput(BaseTestCase):
 
         ks = get_keyspace()
 
-        with testrun_cqlsh(tty=True, keyspace=None, env=self.default_env) as c:
+        with cqlsh_testrun(tty=True, keyspace=None, env=self.default_env) as c:
 
             # when not in a keyspace
             for cmdword in ('DESCRIBE COLUMNFAMILIES', 'desc tables'):
@@ -743,7 +768,7 @@ class TestCqlshOutput(BaseTestCase):
             \n
         '''
 
-        with testrun_cqlsh(tty=True, keyspace=None, env=self.default_env) as c:
+        with cqlsh_testrun(tty=True, keyspace=None, env=self.default_env) as c:
 
             # not in a keyspace
             for semicolon in ('', ';'):
@@ -760,7 +785,7 @@ class TestCqlshOutput(BaseTestCase):
                 self.assertRegex(output, output_re + ringinfo_re + '$')
 
     def test_describe_schema_output(self):
-        with testrun_cqlsh(tty=True, env=self.default_env) as c:
+        with cqlsh_testrun(tty=True, env=self.default_env) as c:
             for semicolon in ('', ';'):
                 output = c.cmd_and_response('desc full schema' + semicolon)
                 self.assertNoHasColors(output)
@@ -768,39 +793,21 @@ class TestCqlshOutput(BaseTestCase):
                 self.assertIn('VIRTUAL KEYSPACE system_virtual_schema', output)
                 self.assertIn("\nCREATE KEYSPACE system_auth WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}  AND durable_writes = true;\n",
                               output)
-                self.assertRegex(output, '.*\s*$')
+                self.assertRegex(output, r'.*\s*$')
 
     def test_show_output(self):
-        with testrun_cqlsh(tty=True, env=self.default_env) as c:
+        with cqlsh_testrun(tty=True, env=self.default_env) as c:
             output = c.cmd_and_response('show version;')
             self.assertRegex(output,
-                    '^\[cqlsh \S+ \| Cassandra \S+ \| CQL spec \S+ \| Native protocol \S+\]$')
+                             r'^\[cqlsh \S+ \| Cassandra \S+ \| CQL spec \S+ \| Native protocol \S+\]$')
 
             output = c.cmd_and_response('show host;')
             self.assertHasColors(output)
             self.assertRegex(output, '^Connected to .* at %s:%d$'
-                                             % (re.escape(TEST_HOST), TEST_PORT))
+                             % (re.escape(TEST_HOST), TEST_PORT))
 
-    @unittest.skipIf(six.PY3, 'Will not emit warning when running Python 3')
-    def test_warn_py2(self):
-        # has the warning
-        with testrun_cqlsh(tty=True, env=self.default_env) as c:
-            self.assertIn('Python 2.7 support is deprecated.', c.output_header, 'cqlsh did not output expected warning.')
-
-        # can suppress
-        env = self.default_env.copy()
-        env['CQLSH_NO_WARN_PY2'] = '1'
-        with testrun_cqlsh(tty=True, env=env) as c:
-            self.assertNotIn('Python 2.7 support is deprecated.', c.output_header, 'cqlsh did not output expected warning.')
-
-    @unittest.skipIf(six.PY2, 'Warning will be emitted when running Python 2.7')
-    def test_no_warn_py3(self):
-        with testrun_cqlsh(tty=True, env=self.default_env) as c:
-            self.assertNotIn('Python 2.7 support is deprecated.', c.output_header, 'cqlsh did not output expected warning.')
-
-    @unittest.skipIf(sys.platform == "win32", 'EOF signaling not supported on Windows')
     def test_eof_prints_newline(self):
-        with testrun_cqlsh(tty=True, env=self.default_env) as c:
+        with cqlsh_testrun(tty=True, env=self.default_env) as c:
             c.send(CONTROL_D)
             out = c.read_lines(1)[0].replace('\r', '')
             self.assertEqual(out, '\n')
@@ -810,18 +817,17 @@ class TestCqlshOutput(BaseTestCase):
 
     def test_exit_prints_no_newline(self):
         for semicolon in ('', ';'):
-            with testrun_cqlsh(tty=True, env=self.default_env) as c:
+            with cqlsh_testrun(tty=True, env=self.default_env) as c:
                 cmd = 'exit%s\n' % semicolon
                 c.send(cmd)
-                if c.realtty:
-                    out = c.read_lines(1)[0].replace('\r', '')
-                    self.assertEqual(out, cmd)
+                out = c.read_lines(1)[0].replace('\r', '')
+                self.assertEqual(out, cmd)
                 with self.assertRaises(BaseException) as cm:
                     c.read_lines(1)
                 self.assertIn(type(cm.exception), (EOFError, OSError))
 
     def test_help_types(self):
-        with testrun_cqlsh(tty=True, env=self.default_env) as c:
+        with cqlsh_testrun(tty=True, env=self.default_env) as c:
             c.cmd_and_response('help types')
 
     def test_help(self):
@@ -929,12 +935,82 @@ class TestCqlshOutput(BaseTestCase):
             """),
         ))
 
+    def test_vectors_output(self):
+        self.assertQueriesGiveColoredOutput((
+            ("SELECT vectorcol FROM has_all_types;", r"""
+             vectorcol
+             MMMMMMMMM
+            -----------------------
+
+                      [1, -2, NaN]
+                      BGBBGGBBGGGB
+                         [1, 2, 3]
+                         BGBBGBBGB
+                         [0, 0, 0]
+                         BGBBGBBGB
+                              null
+                              RRRR
+             [1e+08, 1e+08, 1e+08]
+             BGGGGGBBGGGGGBBGGGGGB
+
+            (5 rows)
+            """),
+        ))
+
     def test_expanded_output_counts_past_page(self):
         query = "PAGING 5; EXPAND ON; SELECT * FROM twenty_rows_table;"
-        output, result = testcall_cqlsh(prompt=None, env=self.default_env,
+        output, result = cqlsh_testcall(prompt=None, env=self.default_env,
                                         tty=False, input=query)
         self.assertEqual(0, result)
         # format is "@ Row 1"
         row_headers = [s for s in output.splitlines() if "@ Row" in s]
         row_ids = [int(s.split(' ')[2]) for s in row_headers]
         self.assertEqual([i for i in range(1, 21)], row_ids)
+
+    def test_quoted_output_text_in_map(self):
+        ks = get_keyspace()
+
+        query = "SELECT text_data FROM " + ks + ".escape_quotes;"
+        output, result = cqlsh_testcall(prompt=None, env=self.default_env,
+                                        tty=False, input=query)
+        self.assertEqual(0, result)
+        self.assertEqual(output.splitlines()[3].strip(), "I'm newb")
+
+        query = "SELECT map_data FROM " + ks + ".escape_quotes;"
+        output, result = cqlsh_testcall(prompt=None, env=self.default_env,
+                                        tty=False, input=query)
+        self.assertEqual(0, result)
+        self.assertEqual(output.splitlines()[3].strip(), "{1: 'I''m newb'}")
+
+    def test_quoted_output_text_in_simple_collections(self):
+        ks = get_keyspace()
+
+        # Sets
+        query = "SELECT set_data FROM " + ks + ".escape_quotes;"
+        output, result = cqlsh_testcall(prompt=None, env=self.default_env,
+                                        tty=False, input=query)
+        self.assertEqual(0, result)
+        self.assertEqual(output.splitlines()[3].strip(), "{'I''m newb'}")
+
+        # Lists
+        query = "SELECT list_data FROM " + ks + ".escape_quotes;"
+        output, result = cqlsh_testcall(prompt=None, env=self.default_env,
+                                        tty=False, input=query)
+        self.assertEqual(0, result)
+        self.assertEqual(output.splitlines()[3].strip(), "['I''m newb']")
+
+        # Tuples
+        query = "SELECT tuple_data FROM " + ks + ".escape_quotes;"
+        output, result = cqlsh_testcall(prompt=None, env=self.default_env,
+                                        tty=False, input=query)
+        self.assertEqual(0, result)
+        self.assertEqual(output.splitlines()[3].strip(), "(1, 'I''m newb')")
+
+    def test_quoted_output_text_in_udts(self):
+        ks = get_keyspace()
+
+        query = "SELECT udt_data FROM " + ks + ".escape_quotes;"
+        output, result = cqlsh_testcall(prompt=None, env=self.default_env,
+                                        tty=False, input=query)
+        self.assertEqual(0, result)
+        self.assertEqual(output.splitlines()[3].strip(), "{data: 'I''m newb'}")

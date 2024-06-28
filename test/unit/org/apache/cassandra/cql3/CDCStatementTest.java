@@ -22,15 +22,16 @@ import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import org.apache.cassandra.ServerTestUtils;
 import org.apache.cassandra.config.DatabaseDescriptor;
 
 public class CDCStatementTest extends CQLTester
 {
     @BeforeClass
-    public static void setUpClass()
+    public static void enableCDC()
     {
+        ServerTestUtils.daemonInitialization();
         DatabaseDescriptor.setCDCEnabled(true);
-        CQLTester.setUpClass();
     }
 
     @Test

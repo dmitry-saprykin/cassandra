@@ -27,8 +27,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.primitives.Ints;
-import org.apache.cassandra.transport.ClientResourceLimits.Overload;
-import org.apache.cassandra.utils.concurrent.NonBlockingRateLimiter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -38,7 +36,7 @@ import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.handler.codec.MessageToMessageDecoder;
 import io.netty.handler.codec.MessageToMessageEncoder;
 import io.netty.handler.ssl.SslContext;
-import io.netty.util.concurrent.Promise;
+import io.netty.util.concurrent.Promise; // checkstyle: permit this import
 import io.netty.util.concurrent.PromiseCombiner;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 import io.netty.util.internal.logging.Slf4JLoggerFactory;
@@ -47,11 +45,19 @@ import org.apache.cassandra.config.EncryptionOptions;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.net.*;
+import org.apache.cassandra.security.ISslContextFactory;
 import org.apache.cassandra.security.SSLFactory;
+import org.apache.cassandra.transport.ClientResourceLimits.Overload;
 import org.apache.cassandra.transport.messages.*;
+import org.apache.cassandra.utils.concurrent.NonBlockingRateLimiter;
+import org.apache.cassandra.utils.concurrent.UncheckedInterruptedException;
 
+import static org.apache.cassandra.net.SocketFactory.newSslHandler;
 import static org.apache.cassandra.transport.CQLMessageHandler.envelopeSize;
 import static org.apache.cassandra.transport.Flusher.MAX_FRAMED_PAYLOAD_SIZE;
+import static org.apache.cassandra.transport.PipelineConfigurator.SSL_FACTORY_CONTEXT_DESCRIPTION;
+import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
+import static org.apache.cassandra.utils.concurrent.BlockingQueues.newBlockingQueue;
 import static org.apache.cassandra.utils.concurrent.NonBlockingRateLimiter.NO_OP_LIMITER;
 
 public class SimpleClient implements Closeable
@@ -217,7 +223,7 @@ public class SimpleClient implements Closeable
                     .option(ChannelOption.TCP_NODELAY, true);
 
         // Configure the pipeline factory.
-        if(encryptionOptions.isEnabled())
+        if(encryptionOptions.getEnabled())
         {
             bootstrap.handler(new SecureInitializer(largeMessageThreshold));
         }
@@ -296,7 +302,7 @@ public class SimpleClient implements Closeable
         }
         catch (InterruptedException e)
         {
-            throw new RuntimeException(e);
+            throw new UncheckedInterruptedException(e);
         }
     }
 
@@ -316,10 +322,10 @@ public class SimpleClient implements Closeable
                 }
                 lastWriteFuture = channel.writeAndFlush(requests);
 
-                long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS);
+                long deadline = currentTimeMillis() + TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS);
                 for (int i = 0; i < requests.size(); i++)
                 {
-                    Message.Response msg = responseHandler.responses.poll(deadline - System.currentTimeMillis(), TimeUnit.MILLISECONDS);
+                    Message.Response msg = responseHandler.responses.poll(deadline - currentTimeMillis(), TimeUnit.MILLISECONDS);
                     if (msg == null)
                         throw new RuntimeException("timeout");
                     if (msg instanceof ErrorMessage)
@@ -338,7 +344,7 @@ public class SimpleClient implements Closeable
         }
         catch (InterruptedException e)
         {
-            throw new RuntimeException(e);
+            throw new UncheckedInterruptedException(e);
         }
     }
 
@@ -349,7 +355,7 @@ public class SimpleClient implements Closeable
 
     public static class SimpleEventHandler implements EventHandler
     {
-        public final LinkedBlockingQueue<Event> queue = new LinkedBlockingQueue<>();
+        public final BlockingQueue<Event> queue = newBlockingQueue();
 
         public void onEvent(Event event)
         {
@@ -360,6 +366,12 @@ public class SimpleClient implements Closeable
     private static class ConnectionTracker implements Connection.Tracker
     {
         public void addConnection(Channel ch, Connection connection) {}
+
+        @Override
+        public boolean isRunning()
+        {
+            return true;
+        }
     }
 
     private static class HandlerNames
@@ -410,12 +422,13 @@ public class SimpleClient implements Closeable
                     }
                     break;
                 case SUPPORTED:
+                case ERROR:
                     // just pass through
                     results.add(response);
                     break;
                 default:
                     throw new ProtocolException(String.format("Unexpected %s response expecting " +
-                                                              "READY, AUTHENTICATE or SUPPORTED",
+                                                              "READY, AUTHENTICATE, ERROR or SUPPORTED",
                                                               response.header.type));
             }
         }
@@ -440,8 +453,17 @@ public class SimpleClient implements Closeable
             FrameEncoder frameEncoder = frameEncoder(ctx);
             FrameEncoder.PayloadAllocator payloadAllocator = frameEncoder.allocator();
 
-            CQLMessageHandler.MessageConsumer<Message.Response> responseConsumer = (c, message, converter, backpressured) -> {
-                responseHandler.handleResponse(c, message);
+            CQLMessageHandler.MessageConsumer<Message.Response> responseConsumer = new CQLMessageHandler.MessageConsumer<Message.Response>()
+            {
+                public void dispatch(Channel channel, Message.Response message, Dispatcher.FlushItemConverter toFlushItem, Overload backpressure)
+                {
+                    responseHandler.handleResponse(channel, message);
+                }
+
+                public boolean hasQueueCapacity()
+                {
+                    return true;
+                }
             };
 
             CQLMessageHandler.ErrorHandler errorHandler = (error) -> {
@@ -496,6 +518,7 @@ public class SimpleClient implements Closeable
                                         responseConsumer,
                                         payloadAllocator,
                                         queueCapacity,
+                                        QueueBackpressure.NO_OP,
                                         resources,
                                         handler -> {},
                                         errorHandler,
@@ -534,7 +557,7 @@ public class SimpleClient implements Closeable
             pipeline.remove(this);
 
             Message.Response message = messageDecoder.decode(ctx.channel(), response);
-            responseConsumer.accept(channel, message, (ch, req, resp) -> null, Overload.NONE);
+            responseConsumer.dispatch(channel, message, (ch, req, resp) -> null, Overload.NONE);
         }
 
         private FrameDecoder frameDecoder(ChannelHandlerContext ctx, BufferPoolAllocator allocator)
@@ -617,9 +640,10 @@ public class SimpleClient implements Closeable
         protected void initChannel(Channel channel) throws Exception
         {
             super.initChannel(channel);
-            SslContext sslContext = SSLFactory.getOrCreateSslContext(encryptionOptions, encryptionOptions.require_client_auth,
-                                                                     SSLFactory.SocketType.CLIENT);
-            channel.pipeline().addFirst("ssl", sslContext.newHandler(channel.alloc()));
+            SslContext sslContext = SSLFactory.getOrCreateSslContext(encryptionOptions, encryptionOptions.getClientAuth(),
+                                                                     ISslContextFactory.SocketType.CLIENT, SSL_FACTORY_CONTEXT_DESCRIPTION);
+            InetSocketAddress peer = encryptionOptions.require_endpoint_verification ? new InetSocketAddress(host, port) : null;
+            channel.pipeline().addFirst("ssl", newSslHandler(channel, sslContext, peer));
         }
     }
 
@@ -651,9 +675,9 @@ public class SimpleClient implements Closeable
                 else
                     responses.put(r);
             }
-            catch (InterruptedException ie)
+            catch (InterruptedException e)
             {
-                throw new RuntimeException(ie);
+                throw new UncheckedInterruptedException(e);
             }
         }
 
@@ -737,6 +761,7 @@ public class SimpleClient implements Closeable
                     int messageSize = envelopeSize(f.header);
                     if (bufferSize + messageSize >= largeMessageThreshold)
                     {
+                        logger.trace("Sending frame of size: {}", bufferSize);
                         combiner.add(flushBuffer(ctx, buffer, bufferSize));
                         buffer = new ArrayList<>();
                         bufferSize = 0;
@@ -748,7 +773,10 @@ public class SimpleClient implements Closeable
             }
 
             if (pending)
+            {
+                logger.trace("Sending frame of size: {}", bufferSize);
                 combiner.add(flushBuffer(ctx, buffer, bufferSize));
+            }
             combiner.finish(promise);
         }
 
@@ -761,6 +789,7 @@ public class SimpleClient implements Closeable
 
             payload.finish();
             ChannelPromise release = AsyncChannelPromise.withListener(ctx, future -> {
+                logger.trace("Sent frame of size: {}", bufferSize);
                 for (Envelope e : messages)
                     e.release();
             });
@@ -806,7 +835,15 @@ public class SimpleClient implements Closeable
 
                 f.body.readerIndex(f.body.readerIndex() + remaining);
                 payload.finish();
-                futures.add(ctx.writeAndFlush(payload, ctx.newPromise()));
+                ChannelPromise promise = ctx.newPromise();
+                logger.trace("Sending frame of large message: {}", remaining);
+                futures.add(ctx.writeAndFlush(payload, promise));
+                promise.addListener(result -> {
+                    if (!result.isSuccess())
+                        logger.warn("Failed to send frame of large message, size: " + remaining, result.cause());
+                    else
+                        logger.trace("Sent frame of large message, size: {}", remaining);
+                });
             }
             f.release();
             return futures.toArray(EMPTY_FUTURES_ARRAY);

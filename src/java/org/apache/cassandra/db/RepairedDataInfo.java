@@ -36,6 +36,8 @@ import org.apache.cassandra.metrics.TableMetrics;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
+
 @NotThreadSafe
 class RepairedDataInfo
 {
@@ -110,7 +112,7 @@ class RepairedDataInfo
         return calculatedDigest;
     }
 
-    void prepare(ColumnFamilyStore cfs, int nowInSec, int oldestUnrepairedTombstone)
+    void prepare(ColumnFamilyStore cfs, long nowInSec, long oldestUnrepairedTombstone)
     {
         this.purger = new RepairedDataPurger(cfs, nowInSec, oldestUnrepairedTombstone);
         this.metrics = cfs.metric;
@@ -281,7 +283,7 @@ class RepairedDataInfo
                     return null;
 
                 long countBeforeOverreads = repairedCounter.counted();
-                long overreadStartTime = System.nanoTime();
+                long overreadStartTime = nanoTime();
                 if (currentPartition != null)
                     consumePartition(currentPartition, repairedCounter);
 
@@ -291,7 +293,7 @@ class RepairedDataInfo
 
                 // we're not actually providing any more rows, just consuming the repaired data
                 long rows = repairedCounter.counted() - countBeforeOverreads;
-                long nanos = System.nanoTime() - overreadStartTime;
+                long nanos = nanoTime() - overreadStartTime;
                 metrics.repairedDataTrackingOverreadRows.update(rows);
                 metrics.repairedDataTrackingOverreadTime.update(nanos, TimeUnit.NANOSECONDS);
                 Tracing.trace("Read {} additional rows of repaired data for tracking in {}ps", rows, TimeUnit.NANOSECONDS.toMicros(nanos));
@@ -324,8 +326,8 @@ class RepairedDataInfo
     private static class RepairedDataPurger extends PurgeFunction
     {
         RepairedDataPurger(ColumnFamilyStore cfs,
-                           int nowInSec,
-                           int oldestUnrepairedTombstone)
+                           long nowInSec,
+                           long oldestUnrepairedTombstone)
         {
             super(nowInSec,
                   cfs.gcBefore(nowInSec),

@@ -24,13 +24,14 @@ import org.apache.cassandra.audit.AuditLogEntryType;
 import org.apache.cassandra.auth.Permission;
 import org.apache.cassandra.cql3.CQLStatement;
 import org.apache.cassandra.cql3.UTName;
-import org.apache.cassandra.cql3.functions.Function;
+import org.apache.cassandra.cql3.functions.UserFunction;
 import org.apache.cassandra.db.marshal.UserType;
 import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.schema.Keyspaces.KeyspacesDiff;
 import org.apache.cassandra.schema.Keyspaces;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.tcm.ClusterMetadata;
 import org.apache.cassandra.transport.Event.SchemaChange.Change;
 import org.apache.cassandra.transport.Event.SchemaChange.Target;
 import org.apache.cassandra.transport.Event.SchemaChange;
@@ -55,10 +56,12 @@ public final class DropTypeStatement extends AlterSchemaStatement
     }
 
     // TODO: expand types into tuples in all dropped columns of all tables
-    public Keyspaces apply(Keyspaces schema)
+    @Override
+    public Keyspaces apply(ClusterMetadata metadata)
     {
         ByteBuffer name = bytes(typeName);
 
+        Keyspaces schema = metadata.schema.getKeyspaces();
         KeyspaceMetadata keyspace = schema.getNullable(keyspaceName);
 
         UserType type = null == keyspace
@@ -82,7 +85,7 @@ public final class DropTypeStatement extends AlterSchemaStatement
          * 2) other user type that can nest the one we drop and
          * 3) existing tables referencing the type (maybe in a nested way).
          */
-        Iterable<Function> functions = keyspace.functions.referencingUserType(name);
+        Iterable<UserFunction> functions = keyspace.userFunctions.referencingUserType(name);
         if (!isEmpty(functions))
         {
             throw ire("Cannot drop user type '%s.%s' as it is still used by functions %s",
@@ -120,7 +123,7 @@ public final class DropTypeStatement extends AlterSchemaStatement
 
     public void authorize(ClientState client)
     {
-        client.ensureKeyspacePermission(keyspaceName, Permission.DROP);
+        client.ensureAllTablesPermission(keyspaceName, Permission.DROP);
     }
 
     @Override

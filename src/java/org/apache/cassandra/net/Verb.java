@@ -45,12 +45,13 @@ import org.apache.cassandra.db.TruncateResponse;
 import org.apache.cassandra.db.TruncateVerbHandler;
 import org.apache.cassandra.db.TruncateRequest;
 import org.apache.cassandra.exceptions.RequestFailureReason;
-import org.apache.cassandra.gms.GossipDigestAck;
 import org.apache.cassandra.gms.GossipDigestAck2;
 import org.apache.cassandra.gms.GossipDigestAck2VerbHandler;
+import org.apache.cassandra.gms.GossipDigestAck;
 import org.apache.cassandra.gms.GossipDigestAckVerbHandler;
 import org.apache.cassandra.gms.GossipDigestSyn;
 import org.apache.cassandra.gms.GossipDigestSynVerbHandler;
+import org.apache.cassandra.gms.GossipShutdown;
 import org.apache.cassandra.gms.GossipShutdownVerbHandler;
 import org.apache.cassandra.hints.HintMessage;
 import org.apache.cassandra.hints.HintVerbHandler;
@@ -71,28 +72,54 @@ import org.apache.cassandra.repair.messages.SyncResponse;
 import org.apache.cassandra.repair.messages.SyncRequest;
 import org.apache.cassandra.repair.messages.ValidationResponse;
 import org.apache.cassandra.repair.messages.ValidationRequest;
+import org.apache.cassandra.schema.SchemaMutationsSerializer;
 import org.apache.cassandra.schema.SchemaPullVerbHandler;
 import org.apache.cassandra.schema.SchemaPushVerbHandler;
 import org.apache.cassandra.schema.SchemaVersionVerbHandler;
+import org.apache.cassandra.service.paxos.PaxosCommit;
+import org.apache.cassandra.service.paxos.PaxosCommitAndPrepare;
+import org.apache.cassandra.service.paxos.PaxosPrepare;
+import org.apache.cassandra.service.paxos.PaxosPrepareRefresh;
+import org.apache.cassandra.service.paxos.PaxosPropose;
+import org.apache.cassandra.service.paxos.PaxosRepair;
+import org.apache.cassandra.service.paxos.cleanup.PaxosCleanupHistory;
+import org.apache.cassandra.service.paxos.cleanup.PaxosCleanupRequest;
+import org.apache.cassandra.service.paxos.cleanup.PaxosCleanupResponse;
+import org.apache.cassandra.service.paxos.cleanup.PaxosCleanupComplete;
+import org.apache.cassandra.service.paxos.cleanup.PaxosStartPrepareCleanup;
+import org.apache.cassandra.service.paxos.cleanup.PaxosFinishPrepareCleanup;
+import org.apache.cassandra.streaming.DataMovement;
+import org.apache.cassandra.streaming.DataMovementVerbHandler;
+import org.apache.cassandra.tcm.Discovery;
+import org.apache.cassandra.tcm.Epoch;
+import org.apache.cassandra.tcm.FetchCMSLog;
+import org.apache.cassandra.tcm.FetchPeerLog;
+import org.apache.cassandra.tcm.migration.Election;
+import org.apache.cassandra.tcm.sequences.DataMovements;
+import org.apache.cassandra.tcm.serialization.MessageSerializers;
 import org.apache.cassandra.utils.BooleanSerializer;
 import org.apache.cassandra.service.EchoVerbHandler;
 import org.apache.cassandra.service.SnapshotVerbHandler;
 import org.apache.cassandra.service.paxos.Commit;
-import org.apache.cassandra.service.paxos.CommitVerbHandler;
+import org.apache.cassandra.service.paxos.Commit.Agreed;
 import org.apache.cassandra.service.paxos.PrepareResponse;
-import org.apache.cassandra.service.paxos.PrepareVerbHandler;
-import org.apache.cassandra.service.paxos.ProposeVerbHandler;
+import org.apache.cassandra.service.paxos.v1.PrepareVerbHandler;
+import org.apache.cassandra.service.paxos.v1.ProposeVerbHandler;
 import org.apache.cassandra.streaming.ReplicationDoneVerbHandler;
+import org.apache.cassandra.utils.ReflectionUtils;
+import org.apache.cassandra.utils.TimeUUID;
 import org.apache.cassandra.utils.UUIDSerializer;
 
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static org.apache.cassandra.concurrent.Stage.*;
-import static org.apache.cassandra.concurrent.Stage.INTERNAL_RESPONSE;
-import static org.apache.cassandra.concurrent.Stage.MISC;
 import static org.apache.cassandra.net.VerbTimeouts.*;
 import static org.apache.cassandra.net.Verb.Kind.*;
 import static org.apache.cassandra.net.Verb.Priority.*;
-import static org.apache.cassandra.schema.MigrationManager.MigrationsSerializer;
+import static org.apache.cassandra.tcm.ClusterMetadataService.commitRequestHandler;
+import static org.apache.cassandra.tcm.ClusterMetadataService.currentEpochRequestHandler;
+import static org.apache.cassandra.tcm.ClusterMetadataService.logNotifyHandler;
+import static org.apache.cassandra.tcm.ClusterMetadataService.fetchLogRequestHandler;
+import static org.apache.cassandra.tcm.ClusterMetadataService.replicationHandler;
 
 /**
  * Note that priorities except P0 are presently unused.  P0 corresponds to urgent, i.e. what used to be the "Gossip" connection.
@@ -108,14 +135,14 @@ public enum Verb
     BATCH_STORE_RSP        (65,  P1, writeTimeout,    REQUEST_RESPONSE,  () -> NoPayload.serializer,                 () -> ResponseVerbHandler.instance                             ),
     BATCH_STORE_REQ        (5,   P3, writeTimeout,    MUTATION,          () -> Batch.serializer,                     () -> BatchStoreVerbHandler.instance,      BATCH_STORE_RSP     ),
     BATCH_REMOVE_RSP       (66,  P1, writeTimeout,    REQUEST_RESPONSE,  () -> NoPayload.serializer,                 () -> ResponseVerbHandler.instance                             ),
-    BATCH_REMOVE_REQ       (6,   P3, writeTimeout,    MUTATION,          () -> UUIDSerializer.serializer,            () -> BatchRemoveVerbHandler.instance,     BATCH_REMOVE_RSP    ),
+    BATCH_REMOVE_REQ       (6,   P3, writeTimeout,    MUTATION,          () -> TimeUUID.Serializer.instance,         () -> BatchRemoveVerbHandler.instance,     BATCH_REMOVE_RSP    ),
 
     PAXOS_PREPARE_RSP      (93,  P2, writeTimeout,    REQUEST_RESPONSE,  () -> PrepareResponse.serializer,           () -> ResponseVerbHandler.instance                             ),
     PAXOS_PREPARE_REQ      (33,  P2, writeTimeout,    MUTATION,          () -> Commit.serializer,                    () -> PrepareVerbHandler.instance,         PAXOS_PREPARE_RSP   ),
     PAXOS_PROPOSE_RSP      (94,  P2, writeTimeout,    REQUEST_RESPONSE,  () -> BooleanSerializer.serializer,         () -> ResponseVerbHandler.instance                             ),
     PAXOS_PROPOSE_REQ      (34,  P2, writeTimeout,    MUTATION,          () -> Commit.serializer,                    () -> ProposeVerbHandler.instance,         PAXOS_PROPOSE_RSP   ),
     PAXOS_COMMIT_RSP       (95,  P2, writeTimeout,    REQUEST_RESPONSE,  () -> NoPayload.serializer,                 () -> ResponseVerbHandler.instance                             ),
-    PAXOS_COMMIT_REQ       (35,  P2, writeTimeout,    MUTATION,          () -> Commit.serializer,                    () -> CommitVerbHandler.instance,          PAXOS_COMMIT_RSP    ),
+    PAXOS_COMMIT_REQ       (35,  P2, writeTimeout,    MUTATION,          () -> Agreed.serializer,                    () -> PaxosCommit.requestHandler,          PAXOS_COMMIT_RSP    ),
 
     TRUNCATE_RSP           (79,  P0, truncateTimeout, REQUEST_RESPONSE,  () -> TruncateResponse.serializer,          () -> ResponseVerbHandler.instance                             ),
     TRUNCATE_REQ           (19,  P0, truncateTimeout, MUTATION,          () -> TruncateRequest.serializer,           () -> TruncateVerbHandler.instance,        TRUNCATE_RSP        ),
@@ -131,7 +158,7 @@ public enum Verb
     GOSSIP_DIGEST_SYN      (14,  P0, longTimeout,     GOSSIP,            () -> GossipDigestSyn.serializer,           () -> GossipDigestSynVerbHandler.instance                      ),
     GOSSIP_DIGEST_ACK      (15,  P0, longTimeout,     GOSSIP,            () -> GossipDigestAck.serializer,           () -> GossipDigestAckVerbHandler.instance                      ),
     GOSSIP_DIGEST_ACK2     (16,  P0, longTimeout,     GOSSIP,            () -> GossipDigestAck2.serializer,          () -> GossipDigestAck2VerbHandler.instance                     ),
-    GOSSIP_SHUTDOWN        (29,  P0, rpcTimeout,      GOSSIP,            () -> NoPayload.serializer,                 () -> GossipShutdownVerbHandler.instance                       ),
+    GOSSIP_SHUTDOWN        (29,  P0, rpcTimeout,      GOSSIP,            () -> GossipShutdown.serializer,            () -> GossipShutdownVerbHandler.instance                       ),
 
     ECHO_RSP               (91,  P0, rpcTimeout,      GOSSIP,            () -> NoPayload.serializer,                 () -> ResponseVerbHandler.instance                             ),
     ECHO_REQ               (31,  P0, rpcTimeout,      GOSSIP,            () -> NoPayload.serializer,                 () -> EchoVerbHandler.instance,            ECHO_RSP            ),
@@ -139,48 +166,99 @@ public enum Verb
     PING_REQ               (37,  P1, pingTimeout,     GOSSIP,            () -> PingRequest.serializer,               () -> PingVerbHandler.instance,            PING_RSP            ),
 
     // P1 because messages can be arbitrarily large or aren't crucial
+    @Deprecated (since = "CEP-21")
     SCHEMA_PUSH_RSP        (98,  P1, rpcTimeout,      MIGRATION,         () -> NoPayload.serializer,                 () -> ResponseVerbHandler.instance                             ),
-    SCHEMA_PUSH_REQ        (18,  P1, rpcTimeout,      MIGRATION,         () -> MigrationsSerializer.instance,        () -> SchemaPushVerbHandler.instance,      SCHEMA_PUSH_RSP     ),
-    SCHEMA_PULL_RSP        (88,  P1, rpcTimeout,      MIGRATION,         () -> MigrationsSerializer.instance,        () -> ResponseVerbHandler.instance                             ),
+    @Deprecated (since = "CEP-21")
+    SCHEMA_PUSH_REQ        (18,  P1, rpcTimeout,      MIGRATION,         () -> SchemaMutationsSerializer.instance,   () -> SchemaPushVerbHandler.instance,      SCHEMA_PUSH_RSP     ),
+    @Deprecated (since = "CEP-21")
+    SCHEMA_PULL_RSP        (88,  P1, rpcTimeout,      MIGRATION,         () -> SchemaMutationsSerializer.instance,   () -> ResponseVerbHandler.instance                             ),
+    @Deprecated (since = "CEP-21")
     SCHEMA_PULL_REQ        (28,  P1, rpcTimeout,      MIGRATION,         () -> NoPayload.serializer,                 () -> SchemaPullVerbHandler.instance,      SCHEMA_PULL_RSP     ),
     SCHEMA_VERSION_RSP     (80,  P1, rpcTimeout,      MIGRATION,         () -> UUIDSerializer.serializer,            () -> ResponseVerbHandler.instance                             ),
     SCHEMA_VERSION_REQ     (20,  P1, rpcTimeout,      MIGRATION,         () -> NoPayload.serializer,                 () -> SchemaVersionVerbHandler.instance,   SCHEMA_VERSION_RSP  ),
 
     // repair; mostly doesn't use callbacks and sends responses as their own request messages, with matching sessions by uuid; should eventually harmonize and make idiomatic
-    REPAIR_RSP             (100, P1, rpcTimeout,      REQUEST_RESPONSE,  () -> NoPayload.serializer,                 () -> ResponseVerbHandler.instance                             ),
-    VALIDATION_RSP         (102, P1, rpcTimeout,      ANTI_ENTROPY,      () -> ValidationResponse.serializer,        () -> RepairMessageVerbHandler.instance,   REPAIR_RSP          ),
-    VALIDATION_REQ         (101, P1, rpcTimeout,      ANTI_ENTROPY,      () -> ValidationRequest.serializer,         () -> RepairMessageVerbHandler.instance,   REPAIR_RSP          ),
-    SYNC_RSP               (104, P1, rpcTimeout,      ANTI_ENTROPY,      () -> SyncResponse.serializer,              () -> RepairMessageVerbHandler.instance,   REPAIR_RSP          ),
-    SYNC_REQ               (103, P1, rpcTimeout,      ANTI_ENTROPY,      () -> SyncRequest.serializer,               () -> RepairMessageVerbHandler.instance,   REPAIR_RSP          ),
-    PREPARE_MSG            (105, P1, rpcTimeout,      ANTI_ENTROPY,      () -> PrepareMessage.serializer,            () -> RepairMessageVerbHandler.instance,   REPAIR_RSP          ),
-    SNAPSHOT_MSG           (106, P1, rpcTimeout,      ANTI_ENTROPY,      () -> SnapshotMessage.serializer,           () -> RepairMessageVerbHandler.instance,   REPAIR_RSP          ),
-    CLEANUP_MSG            (107, P1, rpcTimeout,      ANTI_ENTROPY,      () -> CleanupMessage.serializer,            () -> RepairMessageVerbHandler.instance,   REPAIR_RSP          ),
-    PREPARE_CONSISTENT_RSP (109, P1, rpcTimeout,      ANTI_ENTROPY,      () -> PrepareConsistentResponse.serializer, () -> RepairMessageVerbHandler.instance,   REPAIR_RSP          ),
-    PREPARE_CONSISTENT_REQ (108, P1, rpcTimeout,      ANTI_ENTROPY,      () -> PrepareConsistentRequest.serializer,  () -> RepairMessageVerbHandler.instance,   REPAIR_RSP          ),
-    FINALIZE_PROPOSE_MSG   (110, P1, rpcTimeout,      ANTI_ENTROPY,      () -> FinalizePropose.serializer,           () -> RepairMessageVerbHandler.instance,   REPAIR_RSP          ),
-    FINALIZE_PROMISE_MSG   (111, P1, rpcTimeout,      ANTI_ENTROPY,      () -> FinalizePromise.serializer,           () -> RepairMessageVerbHandler.instance,   REPAIR_RSP          ),
-    FINALIZE_COMMIT_MSG    (112, P1, rpcTimeout,      ANTI_ENTROPY,      () -> FinalizeCommit.serializer,            () -> RepairMessageVerbHandler.instance,   REPAIR_RSP          ),
-    FAILED_SESSION_MSG     (113, P1, rpcTimeout,      ANTI_ENTROPY,      () -> FailSession.serializer,               () -> RepairMessageVerbHandler.instance,   REPAIR_RSP          ),
-    STATUS_RSP             (115, P1, rpcTimeout,      ANTI_ENTROPY,      () -> StatusResponse.serializer,            () -> RepairMessageVerbHandler.instance,   REPAIR_RSP          ),
-    STATUS_REQ             (114, P1, rpcTimeout,      ANTI_ENTROPY,      () -> StatusRequest.serializer,             () -> RepairMessageVerbHandler.instance,   REPAIR_RSP          ),
+    // for the repair messages that implement retry logic, use rpcTimeout so the single request fails faster, then retries can be used to recover
+    REPAIR_RSP             (100, P1, repairTimeout,   REQUEST_RESPONSE,  () -> NoPayload.serializer,                 () -> ResponseVerbHandler.instance                             ),
+    VALIDATION_RSP         (102, P1, repairValidationRspTimeout,    ANTI_ENTROPY,      () -> ValidationResponse.serializer,        () -> RepairMessageVerbHandler.instance(),   REPAIR_RSP          ),
+    VALIDATION_REQ         (101, P1, repairWithBackoffTimeout,      ANTI_ENTROPY,      () -> ValidationRequest.serializer,         () -> RepairMessageVerbHandler.instance(),   REPAIR_RSP          ),
+    SYNC_RSP               (104, P1, repairWithBackoffTimeout,      ANTI_ENTROPY,      () -> SyncResponse.serializer,              () -> RepairMessageVerbHandler.instance(),   REPAIR_RSP          ),
+    SYNC_REQ               (103, P1, repairWithBackoffTimeout,      ANTI_ENTROPY,      () -> SyncRequest.serializer,               () -> RepairMessageVerbHandler.instance(),   REPAIR_RSP          ),
+    PREPARE_MSG            (105, P1, repairWithBackoffTimeout,      ANTI_ENTROPY,      () -> PrepareMessage.serializer,            () -> RepairMessageVerbHandler.instance(),   REPAIR_RSP          ),
+    SNAPSHOT_MSG           (106, P1, repairWithBackoffTimeout,      ANTI_ENTROPY,      () -> SnapshotMessage.serializer,           () -> RepairMessageVerbHandler.instance(),   REPAIR_RSP          ),
+    CLEANUP_MSG            (107, P1, repairWithBackoffTimeout,      ANTI_ENTROPY,      () -> CleanupMessage.serializer,            () -> RepairMessageVerbHandler.instance(),   REPAIR_RSP          ),
+    PREPARE_CONSISTENT_RSP (109, P1, repairWithBackoffTimeout,      ANTI_ENTROPY,      () -> PrepareConsistentResponse.serializer, () -> RepairMessageVerbHandler.instance(),   REPAIR_RSP          ),
+    PREPARE_CONSISTENT_REQ (108, P1, repairWithBackoffTimeout,      ANTI_ENTROPY,      () -> PrepareConsistentRequest.serializer,  () -> RepairMessageVerbHandler.instance(),   REPAIR_RSP          ),
+    FINALIZE_PROPOSE_MSG   (110, P1, repairWithBackoffTimeout,      ANTI_ENTROPY,      () -> FinalizePropose.serializer,           () -> RepairMessageVerbHandler.instance(),   REPAIR_RSP          ),
+    FINALIZE_PROMISE_MSG   (111, P1, repairWithBackoffTimeout,      ANTI_ENTROPY,      () -> FinalizePromise.serializer,           () -> RepairMessageVerbHandler.instance(),   REPAIR_RSP          ),
+    FINALIZE_COMMIT_MSG    (112, P1, repairWithBackoffTimeout,      ANTI_ENTROPY,      () -> FinalizeCommit.serializer,            () -> RepairMessageVerbHandler.instance(),   REPAIR_RSP          ),
+    FAILED_SESSION_MSG     (113, P1, repairWithBackoffTimeout,      ANTI_ENTROPY,      () -> FailSession.serializer,               () -> RepairMessageVerbHandler.instance(),   REPAIR_RSP          ),
+    STATUS_RSP             (115, P1, repairTimeout,   ANTI_ENTROPY,      () -> StatusResponse.serializer,            () -> RepairMessageVerbHandler.instance(),   REPAIR_RSP          ),
+    STATUS_REQ             (114, P1, repairTimeout,   ANTI_ENTROPY,      () -> StatusRequest.serializer,             () -> RepairMessageVerbHandler.instance(),   REPAIR_RSP          ),
 
     REPLICATION_DONE_RSP   (82,  P0, rpcTimeout,      MISC,              () -> NoPayload.serializer,                 () -> ResponseVerbHandler.instance                             ),
     REPLICATION_DONE_REQ   (22,  P0, rpcTimeout,      MISC,              () -> NoPayload.serializer,                 () -> ReplicationDoneVerbHandler.instance, REPLICATION_DONE_RSP),
     SNAPSHOT_RSP           (87,  P0, rpcTimeout,      MISC,              () -> NoPayload.serializer,                 () -> ResponseVerbHandler.instance                             ),
     SNAPSHOT_REQ           (27,  P0, rpcTimeout,      MISC,              () -> SnapshotCommand.serializer,           () -> SnapshotVerbHandler.instance,        SNAPSHOT_RSP        ),
 
+    PAXOS2_COMMIT_REMOTE_REQ         (38, P2, writeTimeout,  MUTATION,          () -> Mutation.serializer,                     () -> MutationVerbHandler.instance,                          MUTATION_RSP                     ),
+    PAXOS2_COMMIT_REMOTE_RSP         (39, P2, writeTimeout,  REQUEST_RESPONSE,  () -> NoPayload.serializer,                    () -> ResponseVerbHandler.instance                                                            ),
+    PAXOS2_PREPARE_RSP               (50, P2, writeTimeout,  REQUEST_RESPONSE,  () -> PaxosPrepare.responseSerializer,         () -> ResponseVerbHandler.instance                                                            ),
+    PAXOS2_PREPARE_REQ               (40, P2, writeTimeout,  MUTATION,          () -> PaxosPrepare.requestSerializer,          () -> PaxosPrepare.requestHandler,                           PAXOS2_PREPARE_RSP               ),
+    PAXOS2_PREPARE_REFRESH_RSP       (51, P2, writeTimeout,  REQUEST_RESPONSE,  () -> PaxosPrepareRefresh.responseSerializer,  () -> ResponseVerbHandler.instance                                                            ),
+    PAXOS2_PREPARE_REFRESH_REQ       (41, P2, writeTimeout,  MUTATION,          () -> PaxosPrepareRefresh.requestSerializer,   () -> PaxosPrepareRefresh.requestHandler,                    PAXOS2_PREPARE_REFRESH_RSP       ),
+    PAXOS2_PROPOSE_RSP               (52, P2, writeTimeout,  REQUEST_RESPONSE,  () -> PaxosPropose.responseSerializer,         () -> ResponseVerbHandler.instance                                                            ),
+    PAXOS2_PROPOSE_REQ               (42, P2, writeTimeout,  MUTATION,          () -> PaxosPropose.requestSerializer,          () -> PaxosPropose.requestHandler,                           PAXOS2_PROPOSE_RSP               ),
+    PAXOS2_COMMIT_AND_PREPARE_RSP    (53, P2, writeTimeout,  REQUEST_RESPONSE,  () -> PaxosPrepare.responseSerializer,         () -> ResponseVerbHandler.instance                                                            ),
+    PAXOS2_COMMIT_AND_PREPARE_REQ    (43, P2, writeTimeout,  MUTATION,          () -> PaxosCommitAndPrepare.requestSerializer, () -> PaxosCommitAndPrepare.requestHandler,                  PAXOS2_COMMIT_AND_PREPARE_RSP    ),
+    PAXOS2_REPAIR_RSP                (54, P2, writeTimeout,  PAXOS_REPAIR,      () -> PaxosRepair.responseSerializer,          () -> ResponseVerbHandler.instance                                                            ),
+    PAXOS2_REPAIR_REQ                (44, P2, writeTimeout,  PAXOS_REPAIR,      () -> PaxosRepair.requestSerializer,           () -> PaxosRepair.requestHandler,                            PAXOS2_REPAIR_RSP                ),
+    PAXOS2_CLEANUP_START_PREPARE_RSP (55, P2, repairTimeout, PAXOS_REPAIR,      () -> PaxosCleanupHistory.serializer,          () -> ResponseVerbHandler.instance                                                            ),
+    PAXOS2_CLEANUP_START_PREPARE_REQ (45, P2, repairTimeout, PAXOS_REPAIR,      () -> PaxosStartPrepareCleanup.serializer,     () -> PaxosStartPrepareCleanup.verbHandler,                  PAXOS2_CLEANUP_START_PREPARE_RSP ),
+    PAXOS2_CLEANUP_RSP               (56, P2, repairTimeout, PAXOS_REPAIR,      () -> NoPayload.serializer,                    () -> ResponseVerbHandler.instance                                                            ),
+    PAXOS2_CLEANUP_REQ               (46, P2, repairTimeout, PAXOS_REPAIR,      () -> PaxosCleanupRequest.serializer,          () -> PaxosCleanupRequest.verbHandler,                       PAXOS2_CLEANUP_RSP               ),
+    PAXOS2_CLEANUP_RSP2              (57, P2, repairTimeout, PAXOS_REPAIR,      () -> PaxosCleanupResponse.serializer,         () -> PaxosCleanupResponse.verbHandler                                                        ),
+    PAXOS2_CLEANUP_FINISH_PREPARE_RSP(58, P2, repairTimeout, PAXOS_REPAIR,      () -> NoPayload.serializer,                    () -> ResponseVerbHandler.instance                                                            ),
+    PAXOS2_CLEANUP_FINISH_PREPARE_REQ(47, P2, repairTimeout, IMMEDIATE,         () -> PaxosCleanupHistory.serializer,          () -> PaxosFinishPrepareCleanup.verbHandler,                 PAXOS2_CLEANUP_FINISH_PREPARE_RSP),
+    PAXOS2_CLEANUP_COMPLETE_RSP      (59, P2, repairTimeout, PAXOS_REPAIR,      () -> NoPayload.serializer,                    () -> ResponseVerbHandler.instance                                                            ),
+    PAXOS2_CLEANUP_COMPLETE_REQ      (48, P2, repairTimeout, PAXOS_REPAIR,      () -> PaxosCleanupComplete.serializer,         () -> PaxosCleanupComplete.verbHandler,                      PAXOS2_CLEANUP_COMPLETE_RSP      ),
+
+    // transactional cluster metadata
+    TCM_COMMIT_RSP         (801, P0, rpcTimeout,      INTERNAL_METADATA,    MessageSerializers::commitResultSerializer,         () -> ResponseVerbHandler.instance                                 ),
+    TCM_COMMIT_REQ         (802, P0, rpcTimeout,      INTERNAL_METADATA,    MessageSerializers::commitSerializer,               () -> commitRequestHandler(),               TCM_COMMIT_RSP         ),
+    TCM_FETCH_CMS_LOG_RSP  (803, P0, rpcTimeout,      FETCH_LOG,            MessageSerializers::logStateSerializer,             () -> ResponseVerbHandler.instance                                 ),
+    TCM_FETCH_CMS_LOG_REQ  (804, P0, rpcTimeout,      FETCH_LOG,            () -> FetchCMSLog.serializer,                       () -> fetchLogRequestHandler(),             TCM_FETCH_CMS_LOG_RSP  ),
+    TCM_REPLICATION        (805, P0, rpcTimeout,      INTERNAL_METADATA,    MessageSerializers::logStateSerializer,             () -> replicationHandler()                                         ),
+    TCM_NOTIFY_RSP         (806, P0, rpcTimeout,      INTERNAL_METADATA,    () -> Epoch.messageSerializer,                      () -> ResponseVerbHandler.instance                                 ),
+    TCM_NOTIFY_REQ         (807, P0, rpcTimeout,      INTERNAL_METADATA,    MessageSerializers::logStateSerializer,             () -> logNotifyHandler(),                   TCM_NOTIFY_RSP         ),
+    TCM_CURRENT_EPOCH_REQ  (808, P0, rpcTimeout,      INTERNAL_METADATA,    () -> Epoch.messageSerializer,                      () -> currentEpochRequestHandler(),         TCM_NOTIFY_RSP         ),
+    TCM_INIT_MIG_RSP       (809, P0, rpcTimeout,      INTERNAL_METADATA,    MessageSerializers::metadataHolderSerializer,       () -> ResponseVerbHandler.instance                                 ),
+    TCM_INIT_MIG_REQ       (810, P0, rpcTimeout,      INTERNAL_METADATA,    () -> Election.Initiator.serializer,                () -> Election.instance.prepareHandler,     TCM_INIT_MIG_RSP       ),
+    TCM_ABORT_MIG          (811, P0, rpcTimeout,      INTERNAL_METADATA,    () -> Election.Initiator.serializer,                () -> Election.instance.abortHandler,       TCM_INIT_MIG_RSP       ),
+    TCM_DISCOVER_RSP       (812, P0, rpcTimeout,      INTERNAL_METADATA,    () -> Discovery.serializer,                         () -> ResponseVerbHandler.instance                                 ),
+    TCM_DISCOVER_REQ       (813, P0, rpcTimeout,      INTERNAL_METADATA,    () -> NoPayload.serializer,                         () -> Discovery.instance.requestHandler,    TCM_DISCOVER_RSP       ),
+    TCM_FETCH_PEER_LOG_RSP (818, P0, rpcTimeout,      FETCH_LOG,            MessageSerializers::logStateSerializer,             () -> ResponseVerbHandler.instance                                 ),
+    TCM_FETCH_PEER_LOG_REQ (819, P0, rpcTimeout,      FETCH_LOG,            () -> FetchPeerLog.serializer,                      () -> FetchPeerLog.Handler.instance,        TCM_FETCH_PEER_LOG_RSP ),
+
+    INITIATE_DATA_MOVEMENTS_RSP (814, P1, rpcTimeout, MISC, () -> NoPayload.serializer,             () -> ResponseVerbHandler.instance                                  ),
+    INITIATE_DATA_MOVEMENTS_REQ (815, P1, rpcTimeout, MISC, () -> DataMovement.serializer,          () -> DataMovementVerbHandler.instance, INITIATE_DATA_MOVEMENTS_RSP ),
+    DATA_MOVEMENT_EXECUTED_RSP  (816, P1, rpcTimeout, MISC, () -> NoPayload.serializer,             () -> ResponseVerbHandler.instance                                  ),
+    DATA_MOVEMENT_EXECUTED_REQ  (817, P1, rpcTimeout, MISC, () -> DataMovement.Status.serializer,   () -> DataMovements.instance,           DATA_MOVEMENT_EXECUTED_RSP  ),
+
     // generic failure response
     FAILURE_RSP            (99,  P0, noTimeout,       REQUEST_RESPONSE,  () -> RequestFailureReason.serializer,      () -> ResponseVerbHandler.instance                             ),
 
     // dummy verbs
     _TRACE                 (30,  P1, rpcTimeout,      TRACING,           () -> NoPayload.serializer,                 () -> null                                                     ),
-    _SAMPLE                (42,  P1, rpcTimeout,      INTERNAL_RESPONSE, () -> NoPayload.serializer,                 () -> null                                                     ),
+    _SAMPLE                (49,  P1, rpcTimeout,      INTERNAL_RESPONSE, () -> NoPayload.serializer,                 () -> null                                                     ),
     _TEST_1                (10,  P0, writeTimeout,    IMMEDIATE,         () -> NoPayload.serializer,                 () -> null                                                     ),
     _TEST_2                (11,  P1, rpcTimeout,      IMMEDIATE,         () -> NoPayload.serializer,                 () -> null                                                     ),
 
-    @Deprecated
+    /** @deprecated See CASSANDRA-15066 */
+    @Deprecated(since = "4.0")
     REQUEST_RSP            (4,   P1, rpcTimeout,      REQUEST_RESPONSE,  () -> null,                                 () -> ResponseVerbHandler.instance                             ),
-    @Deprecated
+    /** @deprecated See CASSANDRA-15066 */
+    @Deprecated(since = "4.0")
     INTERNAL_RSP           (23,  P1, rpcTimeout,      INTERNAL_RESPONSE, () -> null,                                 () -> ResponseVerbHandler.instance                             ),
 
     // largest used ID: 116
@@ -188,7 +266,6 @@ public enum Verb
     // CUSTOM VERBS
     UNUSED_CUSTOM_VERB     (CUSTOM,
                             0,   P1, rpcTimeout,      INTERNAL_RESPONSE, () -> null,                                 () -> null                                                     ),
-
     ;
 
     public static final List<Verb> VERBS = ImmutableList.copyOf(Verb.values());
@@ -227,7 +304,7 @@ public enum Verb
     private final Supplier<? extends IVersionedAsymmetricSerializer<?, ?>> serializer;
     private final Supplier<? extends IVerbHandler<?>> handler;
 
-    final Verb responseVerb;
+    public final Verb responseVerb;
 
     private final ToLongFunction<TimeUnit> expiration;
 
@@ -304,22 +381,13 @@ public enum Verb
         return handler.get() == ResponseVerbHandler.instance;
     }
 
-    Verb toPre40Verb()
-    {
-        if (!isResponse())
-            return this;
-        if (priority == P0)
-            return INTERNAL_RSP;
-        return REQUEST_RSP;
-    }
-
     @VisibleForTesting
     Supplier<? extends IVerbHandler<?>> unsafeSetHandler(Supplier<? extends IVerbHandler<?>> handler) throws NoSuchFieldException, IllegalAccessException
     {
         Supplier<? extends IVerbHandler<?>> original = this.handler;
         Field field = Verb.class.getDeclaredField("handler");
         field.setAccessible(true);
-        Field modifiers = Field.class.getDeclaredField("modifiers");
+        Field modifiers = ReflectionUtils.getModifiersField();
         modifiers.setAccessible(true);
         modifiers.setInt(field, field.getModifiers() & ~Modifier.FINAL);
         field.set(this, handler);
@@ -332,7 +400,7 @@ public enum Verb
         Supplier<? extends IVersionedAsymmetricSerializer<?, ?>> original = this.serializer;
         Field field = Verb.class.getDeclaredField("serializer");
         field.setAccessible(true);
-        Field modifiers = Field.class.getDeclaredField("modifiers");
+        Field modifiers = ReflectionUtils.getModifiersField();
         modifiers.setAccessible(true);
         modifiers.setInt(field, field.getModifiers() & ~Modifier.FINAL);
         field.set(this, serializer);
@@ -345,7 +413,7 @@ public enum Verb
         ToLongFunction<TimeUnit> original = this.expiration;
         Field field = Verb.class.getDeclaredField("expiration");
         field.setAccessible(true);
-        Field modifiers = Field.class.getDeclaredField("modifiers");
+        Field modifiers = ReflectionUtils.getModifiersField();
         modifiers.setAccessible(true);
         modifiers.setInt(field, field.getModifiers() & ~Modifier.FINAL);
         field.set(this, expiration);
@@ -447,7 +515,20 @@ class VerbTimeouts
     static final ToLongFunction<TimeUnit> rangeTimeout    = DatabaseDescriptor::getRangeRpcTimeout;
     static final ToLongFunction<TimeUnit> counterTimeout  = DatabaseDescriptor::getCounterWriteRpcTimeout;
     static final ToLongFunction<TimeUnit> truncateTimeout = DatabaseDescriptor::getTruncateRpcTimeout;
+    static final ToLongFunction<TimeUnit> repairTimeout   = DatabaseDescriptor::getRepairRpcTimeout;
     static final ToLongFunction<TimeUnit> pingTimeout     = DatabaseDescriptor::getPingTimeout;
     static final ToLongFunction<TimeUnit> longTimeout     = units -> Math.max(DatabaseDescriptor.getRpcTimeout(units), units.convert(5L, TimeUnit.MINUTES));
-    static final ToLongFunction<TimeUnit> noTimeout       = units -> { throw new IllegalStateException(); };
+    static final ToLongFunction<TimeUnit> noTimeout       = units -> {  throw new IllegalStateException(); };
+
+    // repair verbs need to have different timeouts based off if retries are enabled or not
+    static final ToLongFunction<TimeUnit> repairWithBackoffTimeout      = units -> {
+        if (!DatabaseDescriptor.getRepairRetrySpec().isEnabled())
+            return repairTimeout.applyAsLong(units);
+        return rpcTimeout.applyAsLong(units);
+    };
+    static final ToLongFunction<TimeUnit> repairValidationRspTimeout    = units -> {
+        if (!DatabaseDescriptor.getRepairRetrySpec().isMerkleTreeRetriesEnabled())
+            return longTimeout.applyAsLong(units);
+        return rpcTimeout.applyAsLong(units);
+    };
 }

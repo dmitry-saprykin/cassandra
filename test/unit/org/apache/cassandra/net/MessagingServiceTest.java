@@ -20,8 +20,12 @@
  */
 package org.apache.cassandra.net;
 
+import java.io.IOException;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
+import java.nio.channels.AsynchronousSocketChannel;
+import java.security.cert.Certificate;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
@@ -29,39 +33,70 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.regex.*;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import com.google.common.net.InetAddresses;
-
-import com.codahale.metrics.Timer;
-
-import org.apache.cassandra.auth.IInternodeAuthenticator;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.config.EncryptionOptions.ServerEncryptionOptions;
-import org.apache.cassandra.db.commitlog.CommitLog;
-import org.apache.cassandra.metrics.MessagingMetrics;
-import org.apache.cassandra.exceptions.ConfigurationException;
-import org.apache.cassandra.locator.InetAddressAndPort;
-import org.apache.cassandra.utils.FBUtilities;
-import org.caffinitas.ohc.histo.EstimatedHistogram;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import com.codahale.metrics.Timer;
+import org.apache.cassandra.auth.IInternodeAuthenticator;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.EncryptionOptions.ServerEncryptionOptions;
+import org.apache.cassandra.db.commitlog.CommitLog;
+import org.apache.cassandra.distributed.test.log.ClusterMetadataTestHelper;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.metrics.MessagingMetrics;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
+import org.awaitility.Awaitility;
+import org.caffinitas.ohc.histo.EstimatedHistogram;
+
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
-import static org.junit.Assert.*;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
 
 public class MessagingServiceTest
 {
     private final static long[] bucketOffsets = new EstimatedHistogram(160).getBucketOffsets();
+    public static AtomicInteger rejectedConnections = new AtomicInteger();
     public static final IInternodeAuthenticator ALLOW_NOTHING_AUTHENTICATOR = new IInternodeAuthenticator()
     {
-        public boolean authenticate(InetAddress remoteAddress, int remotePort)
+        public boolean authenticate(InetAddress remoteAddress, int remotePort,
+                                    Certificate[] certificates, InternodeConnectionDirection connectionType)
         {
+            rejectedConnections.incrementAndGet();
             return false;
+        }
+
+        public void validateConfiguration() throws ConfigurationException
+        {
+
+        }
+    };
+
+    public static final IInternodeAuthenticator REJECT_OUTBOUND_AUTHENTICATOR = new IInternodeAuthenticator()
+    {
+        public boolean authenticate(InetAddress remoteAddress, int remotePort,
+                                    Certificate[] certificates, InternodeConnectionDirection connectionType)
+        {
+            if (connectionType == InternodeConnectionDirection.OUTBOUND)
+            {
+                rejectedConnections.incrementAndGet();
+                return false;
+            }
+            return true;
         }
 
         public void validateConfiguration() throws ConfigurationException
@@ -79,6 +114,7 @@ public class MessagingServiceTest
     public static void beforeClass() throws UnknownHostException
     {
         DatabaseDescriptor.daemonInitialization();
+        ClusterMetadataTestHelper.setInstanceForTest();
         CommitLog.instance.start();
         DatabaseDescriptor.setBroadcastAddress(InetAddress.getByName("127.0.0.1"));
         originalAuthenticator = DatabaseDescriptor.getInternodeAuthenticator();
@@ -92,6 +128,7 @@ public class MessagingServiceTest
         messagingService.metrics.resetDroppedMessages();
         messagingService.closeOutbound(InetAddressAndPort.getByName("127.0.0.2"));
         messagingService.closeOutbound(InetAddressAndPort.getByName("127.0.0.3"));
+        DatabaseDescriptor.setInternodeAuthenticator(originalAuthenticator);
     }
 
     @After
@@ -100,7 +137,7 @@ public class MessagingServiceTest
         DatabaseDescriptor.setInternodeAuthenticator(originalAuthenticator);
         DatabaseDescriptor.setInternodeMessagingEncyptionOptions(originalServerEncryptionOptions);
         DatabaseDescriptor.setShouldListenOnBroadcastAddress(false);
-        DatabaseDescriptor.setListenAddress(originalListenAddress.address);
+        DatabaseDescriptor.setListenAddress(originalListenAddress.getAddress());
         FBUtilities.reset();
     }
 
@@ -216,19 +253,75 @@ public class MessagingServiceTest
      * @throws Exception
      */
     @Test
-    public void testFailedInternodeAuth() throws Exception
+    public void testFailedOutboundInternodeAuth() throws Exception
     {
-        MessagingService ms = MessagingService.instance();
+        // Listen on serverside for connections
+        ServerEncryptionOptions serverEncryptionOptions = new ServerEncryptionOptions()
+        .withInternodeEncryption(ServerEncryptionOptions.InternodeEncryption.none);
+
+        DatabaseDescriptor.setInternodeAuthenticator(REJECT_OUTBOUND_AUTHENTICATOR);
+        InetAddress listenAddress = FBUtilities.getJustLocalAddress();
+
+        InboundConnectionSettings settings = new InboundConnectionSettings().withEncryption(serverEncryptionOptions);
+        InboundSockets connections = new InboundSockets(settings);
+
+        try
+        {
+            connections.open().await();
+            Assert.assertTrue(connections.isListening());
+
+            MessagingService ms = MessagingService.instance();
+            //Should return null
+            int rejectedBefore = rejectedConnections.get();
+            Message<?> messageOut = Message.out(Verb.ECHO_REQ, NoPayload.noPayload);
+            InetAddressAndPort address = InetAddressAndPort.getByAddress(listenAddress);
+            ms.send(messageOut, address);
+            Awaitility.await().atMost(10, TimeUnit.SECONDS).until(() -> rejectedConnections.get() > rejectedBefore);
+
+            //Should tolerate null
+            ms.closeOutbound(address);
+            ms.send(messageOut, address);
+        }
+        finally
+        {
+            connections.close().await();
+            Assert.assertFalse(connections.isListening());
+        }
+    }
+
+    @Test
+    public void testFailedInboundInternodeAuth() throws IOException, InterruptedException
+    {
+        ServerEncryptionOptions serverEncryptionOptions = new ServerEncryptionOptions()
+            .withInternodeEncryption(ServerEncryptionOptions.InternodeEncryption.none);
+
         DatabaseDescriptor.setInternodeAuthenticator(ALLOW_NOTHING_AUTHENTICATOR);
-        InetAddressAndPort address = InetAddressAndPort.getByName("127.0.0.250");
+        InetAddress listenAddress = FBUtilities.getJustLocalAddress();
 
-        //Should return null
-        Message messageOut = Message.out(Verb.ECHO_REQ, NoPayload.noPayload);
-        assertFalse(ms.isConnected(address, messageOut));
+        InboundConnectionSettings settings = new InboundConnectionSettings().withEncryption(serverEncryptionOptions);
+        InboundSockets connections = new InboundSockets(settings);
 
-        //Should tolerate null
-        ms.closeOutbound(address);
-        ms.send(messageOut, address);
+        try (AsynchronousSocketChannel testChannel = AsynchronousSocketChannel.open())
+        {
+            connections.open().await();
+            Assert.assertTrue(connections.isListening());
+
+            int rejectedBefore = rejectedConnections.get();
+            Future<Void> connectFuture = testChannel.connect(new InetSocketAddress(listenAddress, DatabaseDescriptor.getStoragePort()));
+            Awaitility.await().atMost(10, TimeUnit.SECONDS).until(connectFuture::isDone);
+
+            // Since authentication doesn't happen during connect, try writing a dummy string which triggers
+            // authentication handler.
+            testChannel.write(ByteBufferUtil.bytes("dummy string"));
+            Awaitility.await().atMost(10, TimeUnit.SECONDS).until(() -> rejectedConnections.get() > rejectedBefore);
+
+            connectFuture.cancel(true);
+        }
+        finally
+        {
+            connections.close().await();
+            Assert.assertFalse(connections.isListening());
+        }
     }
 
 //    @Test
@@ -310,9 +403,12 @@ public class MessagingServiceTest
     @Test
     public void listenOptionalSecureConnection() throws InterruptedException
     {
-        ServerEncryptionOptions serverEncryptionOptions = new ServerEncryptionOptions()
-                                                          .withOptional(true);
-        listen(serverEncryptionOptions, false);
+        for (int i = 0; i < 500; i++) // test used to be flaky, so run in a loop to make sure stable (see CASSANDRA-17033)
+        {
+            ServerEncryptionOptions serverEncryptionOptions = new ServerEncryptionOptions()
+                                                              .withOptional(true);
+            listen(serverEncryptionOptions, false);
+        }
     }
 
     @Test
@@ -329,7 +425,7 @@ public class MessagingServiceTest
         if (listenOnBroadcastAddr)
         {
             DatabaseDescriptor.setShouldListenOnBroadcastAddress(true);
-            listenAddress = InetAddresses.increment(FBUtilities.getBroadcastAddressAndPort().address);
+            listenAddress = InetAddresses.increment(FBUtilities.getBroadcastAddressAndPort().getAddress());
             DatabaseDescriptor.setListenAddress(listenAddress);
             FBUtilities.reset();
         }
@@ -339,18 +435,18 @@ public class MessagingServiceTest
         InboundSockets connections = new InboundSockets(settings);
         try
         {
-            connections.open().await();
-            Assert.assertTrue(connections.isListening());
+            connections.open().sync();
+            Assert.assertTrue("connections is not listening", connections.isListening());
 
             Set<InetAddressAndPort> expect = new HashSet<>();
             expect.add(InetAddressAndPort.getByAddressOverrideDefaults(listenAddress, DatabaseDescriptor.getStoragePort()));
-            if (settings.encryption.enable_legacy_ssl_storage_port)
+            if (settings.encryption.legacy_ssl_storage_port_enabled)
                 expect.add(InetAddressAndPort.getByAddressOverrideDefaults(listenAddress, DatabaseDescriptor.getSSLStoragePort()));
             if (listenOnBroadcastAddr)
             {
-                expect.add(InetAddressAndPort.getByAddressOverrideDefaults(FBUtilities.getBroadcastAddressAndPort().address, DatabaseDescriptor.getStoragePort()));
-                if (settings.encryption.enable_legacy_ssl_storage_port)
-                    expect.add(InetAddressAndPort.getByAddressOverrideDefaults(FBUtilities.getBroadcastAddressAndPort().address, DatabaseDescriptor.getSSLStoragePort()));
+                expect.add(InetAddressAndPort.getByAddressOverrideDefaults(FBUtilities.getBroadcastAddressAndPort().getAddress(), DatabaseDescriptor.getStoragePort()));
+                if (settings.encryption.legacy_ssl_storage_port_enabled)
+                    expect.add(InetAddressAndPort.getByAddressOverrideDefaults(FBUtilities.getBroadcastAddressAndPort().getAddress(), DatabaseDescriptor.getSSLStoragePort()));
             }
 
             Assert.assertEquals(expect.size(), connections.sockets().size());
@@ -358,12 +454,12 @@ public class MessagingServiceTest
             final int legacySslPort = DatabaseDescriptor.getSSLStoragePort();
             for (InboundSockets.InboundSocket socket : connections.sockets())
             {
-                Assert.assertEquals(serverEncryptionOptions.isEnabled(), socket.settings.encryption.isEnabled());
-                Assert.assertEquals(serverEncryptionOptions.isOptional(), socket.settings.encryption.isOptional());
-                if (!serverEncryptionOptions.isEnabled())
-                    assertNotEquals(legacySslPort, socket.settings.bindAddress.port);
-                if (legacySslPort == socket.settings.bindAddress.port)
-                    Assert.assertFalse(socket.settings.encryption.isOptional());
+                Assert.assertEquals(serverEncryptionOptions.getEnabled(), socket.settings.encryption.getEnabled());
+                Assert.assertEquals(serverEncryptionOptions.getOptional(), socket.settings.encryption.getOptional());
+                if (!serverEncryptionOptions.getEnabled())
+                    assertNotEquals(legacySslPort, socket.settings.bindAddress.getPort());
+                if (legacySslPort == socket.settings.bindAddress.getPort())
+                    Assert.assertFalse(socket.settings.encryption.getOptional());
                 Assert.assertTrue(socket.settings.bindAddress.toString(), expect.remove(socket.settings.bindAddress));
             }
         }

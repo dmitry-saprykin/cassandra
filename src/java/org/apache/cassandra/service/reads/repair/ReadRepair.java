@@ -19,7 +19,6 @@ package org.apache.cassandra.service.reads.repair;
 
 import java.util.Map;
 import java.util.function.Consumer;
-import java.util.function.Supplier;
 
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.locator.Endpoints;
@@ -32,19 +31,20 @@ import org.apache.cassandra.exceptions.ReadTimeoutException;
 import org.apache.cassandra.locator.Replica;
 import org.apache.cassandra.locator.ReplicaPlan;
 import org.apache.cassandra.service.reads.DigestResolver;
+import org.apache.cassandra.transport.Dispatcher;
 
-public interface ReadRepair<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<E>>
+public interface ReadRepair<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<E, P>>
 {
     public interface Factory
     {
-        <E extends Endpoints<E>, P extends ReplicaPlan.ForRead<E>>
-        ReadRepair<E, P> create(ReadCommand command, ReplicaPlan.Shared<E, P> replicaPlan, long queryStartNanoTime);
+        <E extends Endpoints<E>, P extends ReplicaPlan.ForRead<E, P>>
+        ReadRepair<E, P> create(ReadCommand command, ReplicaPlan.Shared<E, P> replicaPlan, Dispatcher.RequestTime requestTime);
     }
 
-    static <E extends Endpoints<E>, P extends ReplicaPlan.ForRead<E>>
-    ReadRepair<E, P> create(ReadCommand command, ReplicaPlan.Shared<E, P> replicaPlan, long queryStartNanoTime)
+    static <E extends Endpoints<E>, P extends ReplicaPlan.ForRead<E, P>>
+    ReadRepair<E, P> create(ReadCommand command, ReplicaPlan.Shared<E, P> replicaPlan, Dispatcher.RequestTime requestTime)
     {
-        return command.metadata().params.readRepair.create(command, replicaPlan, queryStartNanoTime);
+        return command.metadata().params.readRepair.create(command, replicaPlan, requestTime);
     }
 
     /**
@@ -93,5 +93,5 @@ public interface ReadRepair<E extends Endpoints<E>, P extends ReplicaPlan.ForRea
      * Repairs a partition _after_ receiving data responses. This method receives replica list, since
      * we will block repair only on the replicas that have responded.
      */
-    void repairPartition(DecoratedKey partitionKey, Map<Replica, Mutation> mutations, ReplicaPlan.ForTokenWrite writePlan);
+    void repairPartition(DecoratedKey partitionKey, Map<Replica, Mutation> mutations, ReplicaPlan.ForWrite writePlan);
 }

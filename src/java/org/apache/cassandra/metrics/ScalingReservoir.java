@@ -17,18 +17,17 @@
  */
 package org.apache.cassandra.metrics;
 
-import com.codahale.metrics.Reservoir;
 import com.codahale.metrics.Snapshot;
 
 /**
  * A reservoir that scales the values before updating.
  */
-public class ScalingReservoir implements Reservoir
+public class ScalingReservoir implements SnapshottingReservoir
 {
-    private final Reservoir delegate;
+    private final SnapshottingReservoir delegate;
     private final ScaleFunction scaleFunc;
 
-    public ScalingReservoir(Reservoir reservoir, ScaleFunction scaleFunc)
+    public ScalingReservoir(SnapshottingReservoir reservoir, ScaleFunction scaleFunc)
     {
         this.delegate = reservoir;
         this.scaleFunc = scaleFunc;
@@ -52,10 +51,16 @@ public class ScalingReservoir implements Reservoir
         return delegate.getSnapshot();
     }
 
+    @Override
+    public Snapshot getPercentileSnapshot()
+    {
+        return delegate.getPercentileSnapshot();
+    }
+
     /**
      * Scale the input value.
      *
-     * Not using {@linkplain java.util.function.Function<Long, Long>} to avoid auto-boxing.
+     * Not using {@code java.util.function.Function<Long, Long>} to avoid auto-boxing.
      */
     @FunctionalInterface
     public static interface ScaleFunction

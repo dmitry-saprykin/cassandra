@@ -17,7 +17,6 @@
  */
 package org.apache.cassandra.io.util;
 
-import java.io.File;
 import java.io.IOException;
 import java.nio.ByteOrder;
 
@@ -38,14 +37,14 @@ public class RandomAccessReader extends RebufferingInputStream implements FileDa
     private long markedPointer;
 
     final Rebufferer rebufferer;
-    private BufferHolder bufferHolder = Rebufferer.EMPTY;
+    protected BufferHolder bufferHolder = Rebufferer.EMPTY;
 
     /**
      * Only created through Builder
      *
      * @param rebufferer Rebufferer to use
      */
-    RandomAccessReader(Rebufferer rebufferer)
+    protected RandomAccessReader(Rebufferer rebufferer)
     {
         super(Rebufferer.EMPTY.buffer());
         this.rebufferer = rebufferer;
@@ -326,7 +325,7 @@ public class RandomAccessReader extends RebufferingInputStream implements FileDa
      * @param file File to open for reading
      * @return new RandomAccessReader that owns the channel opened in this method.
      */
-    @SuppressWarnings("resource")
+    @SuppressWarnings({ "resource", "RedundantSuppression" }) // reader is closed along with the returned RandomAccessReader instance
     public static RandomAccessReader open(File file)
     {
         ChannelProxy channel = new ChannelProxy(file);

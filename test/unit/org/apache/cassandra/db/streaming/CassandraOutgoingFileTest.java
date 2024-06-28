@@ -18,6 +18,7 @@
 
 package org.apache.cassandra.db.streaming;
 
+import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
 
@@ -25,6 +26,7 @@ import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.SchemaLoader;
+import org.apache.cassandra.Util;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.Keyspace;
@@ -78,7 +80,7 @@ public class CassandraOutgoingFileTest
             .build()
             .applyUnsafe();
         }
-        store.forceBlockingFlush();
+        Util.flush(store);
         CompactionManager.instance.performMaximal(store, false);
 
         sstable = store.getLiveSSTables().iterator().next();
@@ -87,7 +89,7 @@ public class CassandraOutgoingFileTest
     @Test
     public void validateFullyContainedIn_SingleContiguousRange_Succeeds()
     {
-        List<Range<Token>> requestedRanges = Arrays.asList(new Range<>(store.getPartitioner().getMinimumToken(), sstable.last.getToken()));
+        List<Range<Token>> requestedRanges = Arrays.asList(new Range<>(store.getPartitioner().getMinimumToken(), sstable.getLast().getToken()));
 
         List<SSTableReader.PartitionPositionBounds> sections = sstable.getPositionsForRanges(requestedRanges);
         CassandraOutgoingFile cof = new CassandraOutgoingFile(StreamOperation.BOOTSTRAP, sstable.ref(),
@@ -115,7 +117,7 @@ public class CassandraOutgoingFileTest
     {
         List<Range<Token>> requestedRanges = Arrays.asList(new Range<>(store.getPartitioner().getMinimumToken(), getTokenAtIndex(4)),
                                                          new Range<>(getTokenAtIndex(2), getTokenAtIndex(6)),
-                                                         new Range<>(getTokenAtIndex(5), sstable.last.getToken()));
+                                                         new Range<>(getTokenAtIndex(5), sstable.getLast().getToken()));
         requestedRanges = Range.normalize(requestedRanges);
 
         List<SSTableReader.PartitionPositionBounds> sections = sstable.getPositionsForRanges(requestedRanges);
@@ -131,13 +133,17 @@ public class CassandraOutgoingFileTest
         int count = 0;
         DecoratedKey key;
 
-        try (KeyIterator iter = new KeyIterator(sstable.descriptor, sstable.metadata()))
+        try (KeyIterator iter = sstable.keyIterator())
         {
             do
             {
                 key = iter.next();
                 count++;
             } while (iter.hasNext() && count < i);
+        }
+        catch (IOException e)
+        {
+            throw new RuntimeException(e);
         }
         return key;
     }

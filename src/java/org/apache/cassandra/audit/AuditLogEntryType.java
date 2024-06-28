@@ -58,6 +58,8 @@ public enum AuditLogEntryType
     LIST_PERMISSIONS(AuditLogEntryCategory.DCL),
     ALTER_TYPE(AuditLogEntryCategory.DDL),
     CREATE_ROLE(AuditLogEntryCategory.DCL),
+    CREATE_IDENTITY(AuditLogEntryCategory.DCL),
+    DROP_IDENTITY(AuditLogEntryCategory.DCL),
     USE_KEYSPACE(AuditLogEntryCategory.OTHER),
     DESCRIBE(AuditLogEntryCategory.OTHER),
 
@@ -68,7 +70,8 @@ public enum AuditLogEntryType
     REQUEST_FAILURE(AuditLogEntryCategory.ERROR),
     LOGIN_ERROR(AuditLogEntryCategory.AUTH),
     UNAUTHORIZED_ATTEMPT(AuditLogEntryCategory.AUTH),
-    LOGIN_SUCCESS(AuditLogEntryCategory.AUTH);
+    LOGIN_SUCCESS(AuditLogEntryCategory.AUTH),
+    LIST_SUPERUSERS(AuditLogEntryCategory.DCL);
 
     private final AuditLogEntryCategory category;
 

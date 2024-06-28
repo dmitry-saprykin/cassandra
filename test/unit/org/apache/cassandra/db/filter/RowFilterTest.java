@@ -58,12 +58,13 @@ public class RowFilterTest
                                               .addPartitionKeyColumn("pk", Int32Type.instance)
                                               .addStaticColumn("s", Int32Type.instance)
                                               .addRegularColumn("r", Int32Type.instance)
+                                              .offline()
                                               .build();
         ColumnMetadata s = metadata.getColumn(new ColumnIdentifier("s", true));
         ColumnMetadata r = metadata.getColumn(new ColumnIdentifier("r", true));
 
         ByteBuffer one = Int32Type.instance.decompose(1);
-        RowFilter filter = RowFilter.NONE.withNewExpressions(new ArrayList<>());
+        RowFilter filter = RowFilter.none().withNewExpressions(new ArrayList<>());
         filter.add(s, Operator.NEQ, one);
         AtomicBoolean closed = new AtomicBoolean();
         UnfilteredPartitionIterator iter = filter.filter(new SingletonUnfilteredPartitionIterator(new UnfilteredRowIterator()
@@ -91,7 +92,7 @@ public class RowFilterTest
         Assert.assertFalse(iter.hasNext());
         Assert.assertTrue(closed.get());
 
-        filter = RowFilter.NONE.withNewExpressions(new ArrayList<>());
+        filter = RowFilter.none().withNewExpressions(new ArrayList<>());
         filter.add(r, Operator.NEQ, one);
         closed.set(false);
         iter = filter.filter(new SingletonUnfilteredPartitionIterator(new UnfilteredRowIterator()

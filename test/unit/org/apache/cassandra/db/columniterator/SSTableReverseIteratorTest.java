@@ -28,14 +28,16 @@ import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.SchemaLoader;
+import org.apache.cassandra.Util;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.Keyspace;
-import org.apache.cassandra.db.RowIndexEntry;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.format.big.BigTableReader;
+import org.apache.cassandra.io.sstable.format.big.RowIndexEntry;
 import org.apache.cassandra.schema.KeyspaceParams;
 
 public class SSTableReverseIteratorTest
@@ -81,12 +83,15 @@ public class SSTableReverseIteratorTest
         QueryProcessor.executeInternal(String.format("UPDATE %s.%s SET v1=? WHERE k=? AND c=?", KEYSPACE, table), bytes(0x20000), key, 2);
         QueryProcessor.executeInternal(String.format("UPDATE %s.%s SET v1=? WHERE k=? AND c=?", KEYSPACE, table), bytes(0x20000), key, 3);
 
-        tbl.forceBlockingFlush();
+        Util.flush(tbl);
         SSTableReader sstable = Iterables.getOnlyElement(tbl.getLiveSSTables());
         DecoratedKey dk = tbl.getPartitioner().decorateKey(Int32Type.instance.decompose(key));
-        RowIndexEntry indexEntry = sstable.getPosition(dk, SSTableReader.Operator.EQ);
-        Assert.assertTrue(indexEntry.isIndexed());
-        Assert.assertTrue(indexEntry.columnsIndexCount() > 2);
+        if (sstable instanceof BigTableReader)
+        {
+            RowIndexEntry indexEntry = ((BigTableReader) sstable).getRowIndexEntry(dk, SSTableReader.Operator.EQ);
+            Assert.assertTrue(indexEntry.isIndexed());
+            Assert.assertTrue(indexEntry.blockCount() > 2);
+        }
 
         // drop v1 so the first 2 index blocks only contain empty unfiltereds
         QueryProcessor.executeInternal(String.format("ALTER TABLE %s.%s DROP v1", KEYSPACE, table));

@@ -18,13 +18,25 @@
 package org.apache.cassandra.service;
 
 import java.io.BufferedReader;
-import java.io.File;
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
 import java.lang.management.RuntimeMXBean;
-import java.nio.file.*;
+import java.nio.file.FileStore;
+import java.nio.file.FileVisitResult;
+import java.nio.file.FileVisitor;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -32,34 +44,42 @@ import com.google.common.base.Joiner;
 import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
+import com.google.common.collect.Range;
+import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.vdurmont.semver4j.Semver;
 import net.jpountz.lz4.LZ4Factory;
-import org.apache.cassandra.cql3.QueryProcessor;
-import org.apache.cassandra.cql3.UntypedResultSet;
-import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.schema.Schema;
-import org.apache.cassandra.schema.SchemaConstants;
+import org.apache.cassandra.config.StartupChecksOptions;
+import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.StartupException;
 import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.UUIDBasedSSTableId;
+import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.FileUtils;
-import org.apache.cassandra.utils.NativeLibrary;
+import org.apache.cassandra.io.util.PathUtils;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.SchemaConstants;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.JavaUtils;
-import org.apache.cassandra.utils.NoSpamLogger;
-import org.apache.cassandra.utils.SigarLibrary;
+import org.apache.cassandra.utils.NativeLibrary;
 
-import static java.lang.String.format;
+import static org.apache.cassandra.config.CassandraRelevantProperties.CASSANDRA_JMX_LOCAL_PORT;
 import static org.apache.cassandra.config.CassandraRelevantProperties.COM_SUN_MANAGEMENT_JMXREMOTE_PORT;
+import static org.apache.cassandra.config.CassandraRelevantProperties.IGNORE_KERNEL_BUG_1057843_CHECK;
 import static org.apache.cassandra.config.CassandraRelevantProperties.JAVA_VERSION;
 import static org.apache.cassandra.config.CassandraRelevantProperties.JAVA_VM_NAME;
+import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
 
 /**
  * Verifies that the system and environment is in a fit state to be started.
@@ -68,7 +88,7 @@ import static org.apache.cassandra.config.CassandraRelevantProperties.JAVA_VM_NA
  * Each individual test is modelled as an implementation of StartupCheck, these are run
  * at the start of CassandraDaemon#setup() before any local state is mutated. The default
  * checks are a mix of informational tests (inspectJvmOptions), initialization
- * (initSigarLibrary, checkCacheServiceInitialization) and invariant checking
+ * (checkProcessEnvironment, checkCacheServiceInitialization) and invariant checking
  * (checkValidLaunchDate, checkSystemKeyspaceState, checkSSTablesFormat).
  *
  * In addition, if checkSystemKeyspaceState determines that the release version has
@@ -82,6 +102,26 @@ import static org.apache.cassandra.config.CassandraRelevantProperties.JAVA_VM_NA
  */
 public class StartupChecks
 {
+    public enum StartupCheckType
+    {
+        // non-configurable check is always enabled for execution
+        non_configurable_check,
+        check_filesystem_ownership(true),
+        check_data_resurrection(true);
+
+        public final boolean disabledByDefault;
+
+        StartupCheckType()
+        {
+            this(false);
+        }
+
+        StartupCheckType(boolean disabledByDefault)
+        {
+            this.disabledByDefault = disabledByDefault;
+        }
+    }
+
     private static final Logger logger = LoggerFactory.getLogger(StartupChecks.class);
     // List of checks to run before starting up. If any test reports failure, startup will be halted.
     private final List<StartupCheck> preFlightChecks = new ArrayList<>();
@@ -89,21 +129,24 @@ public class StartupChecks
     // The default set of pre-flight checks to run. Order is somewhat significant in that we probably
     // always want the system keyspace check run last, as this actually loads the schema for that
     // keyspace. All other checks should not require any schema initialization.
-    private final List<StartupCheck> DEFAULT_TESTS = ImmutableList.of(checkJemalloc,
+    private final List<StartupCheck> DEFAULT_TESTS = ImmutableList.of(checkKernelBug1057843,
+                                                                      checkJemalloc,
                                                                       checkLz4Native,
                                                                       checkValidLaunchDate,
                                                                       checkJMXPorts,
                                                                       checkJMXProperties,
                                                                       inspectJvmOptions,
                                                                       checkNativeLibraryInitialization,
-                                                                      initSigarLibrary,
+                                                                      checkProcessEnvironment,
                                                                       checkMaxMapCount,
+                                                                      checkReadAheadKbSetting,
                                                                       checkDataDirs,
                                                                       checkSSTablesFormat,
                                                                       checkSystemKeyspaceState,
                                                                       checkDatacenter,
                                                                       checkRack,
-                                                                      checkLegacyAuthTables);
+                                                                      checkLegacyAuthTables,
+                                                                      new DataResurrectionCheck());
 
     public StartupChecks withDefaultTests()
     {
@@ -123,22 +166,95 @@ public class StartupChecks
 
     /**
      * Run the configured tests and return a report detailing the results.
-     * @throws org.apache.cassandra.exceptions.StartupException if any test determines that the
+     * @throws StartupException if any test determines that the
      * system is not in an valid state to startup
+     * @param options options to pass to respective checks for their configration
      */
-    public void verify() throws StartupException
+    public void verify(StartupChecksOptions options) throws StartupException
     {
         for (StartupCheck test : preFlightChecks)
-            test.execute();
+            test.execute(options);
+
+        for (StartupCheck test : preFlightChecks)
+        {
+            try
+            {
+                test.postAction(options);
+            }
+            catch (Throwable t)
+            {
+                logger.warn("Failed to run startup check post-action on " + test.getStartupCheckType());
+            }
+        }
     }
+
+    // https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1057843
+    public static final StartupCheck checkKernelBug1057843 = new StartupCheck()
+    {
+        @Override
+        public void execute(StartupChecksOptions startupChecksOptions) throws StartupException
+        {
+            if (startupChecksOptions.isDisabled(getStartupCheckType()))
+                return;
+
+            if (!FBUtilities.isLinux)
+                return;
+
+            Set<Path> directIOWritePaths = new HashSet<>();
+            if (DatabaseDescriptor.getCommitLogWriteDiskAccessMode() == Config.DiskAccessMode.direct)
+                directIOWritePaths.add(new File(DatabaseDescriptor.getCommitLogLocation()).toPath());
+            // TODO: add data directories when direct IO is supported for flushing and compaction
+
+            if (!directIOWritePaths.isEmpty() && IGNORE_KERNEL_BUG_1057843_CHECK.getBoolean())
+            {
+                logger.info("Ignoring check for the kernel bug 1057843 against the following paths configured to be accessed with Direct IO: {}", directIOWritePaths);
+                return;
+            }
+
+            Set<String> affectedFileSystemTypes = Set.of("ext4");
+            Set<Path> affectedPaths = new HashSet<>();
+            for (Path path : directIOWritePaths)
+            {
+                try
+                {
+                    if (affectedFileSystemTypes.contains(Files.getFileStore(path).type().toLowerCase()))
+                        affectedPaths.add(path);
+                }
+                catch (IOException e)
+                {
+                    throw new StartupException(StartupException.ERR_WRONG_MACHINE_STATE, "Failed to determine file system type for path " + path, e);
+                }
+            }
+
+            if (affectedPaths.isEmpty())
+                return;
+
+            Range<Semver> affectedKernels = Range.closedOpen(new Semver("6.1.64", Semver.SemverType.LOOSE),
+                                                             new Semver("6.1.66", Semver.SemverType.LOOSE));
+
+            Semver kernelVersion = FBUtilities.getKernelVersion();
+            if (!affectedKernels.contains(kernelVersion.withClearedSuffixAndBuild()))
+                return;
+
+            throw new StartupException(StartupException.ERR_WRONG_MACHINE_STATE,
+                                       String.format("Detected kernel version %s with affected file system types %s and direct IO enabled for paths %s. " +
+                                                     "This combination is known to cause data corruption. To start Cassandra in this environment, " +
+                                                     "you have to disable direct IO for the affected paths. If you are sure the verification provided " +
+                                                     "a false positive result, you can suppress it by setting '" + IGNORE_KERNEL_BUG_1057843_CHECK.getKey() + "' system property to 'true'. " +
+                                                     "Please see https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1057843 for more information.",
+                                                     kernelVersion, affectedFileSystemTypes, affectedPaths));
+        }
+    };
 
     public static final StartupCheck checkJemalloc = new StartupCheck()
     {
-        public void execute()
+        @Override
+        public void execute(StartupChecksOptions options)
         {
-            if (FBUtilities.isWindows)
+            if (options.isDisabled(getStartupCheckType()))
                 return;
-            String jemalloc = System.getProperty("cassandra.libjemalloc");
+
+            String jemalloc = CassandraRelevantProperties.LIBJEMALLOC.getString();
             if (jemalloc == null)
                 logger.warn("jemalloc shared library could not be preloaded to speed up memory allocations");
             else if ("-".equals(jemalloc))
@@ -148,14 +264,21 @@ public class StartupChecks
         }
     };
 
-    public static final StartupCheck checkLz4Native = () -> {
-        try
+    public static final StartupCheck checkLz4Native = new StartupCheck()
+    {
+        @Override
+        public void execute(StartupChecksOptions options)
         {
-            LZ4Factory.nativeInstance(); // make sure native loads
-        }
-        catch (AssertionError | LinkageError e)
-        {
-            logger.warn("lz4-java was unable to load native libraries; this will lower the performance of lz4 (network/sstables/etc.): {}", Throwables.getRootCause(e).getMessage());
+            if (options.isDisabled(getStartupCheckType()))
+                return;
+            try
+            {
+                LZ4Factory.nativeInstance(); // make sure native loads
+            }
+            catch (AssertionError | LinkageError e)
+            {
+                logger.warn("lz4-java was unable to load native libraries; this will lower the performance of lz4 (network/sstables/etc.): {}", Throwables.getRootCause(e).getMessage());
+            }
         }
     };
 
@@ -167,9 +290,13 @@ public class StartupChecks
          * We use this to ensure the system clock is at least somewhat correct at startup.
          */
         private static final long EARLIEST_LAUNCH_DATE = 1215820800000L;
-        public void execute() throws StartupException
+
+        @Override
+        public void execute(StartupChecksOptions options) throws StartupException
         {
-            long now = System.currentTimeMillis();
+            if (options.isDisabled(getStartupCheckType()))
+                return;
+            long now = currentTimeMillis();
             if (now < EARLIEST_LAUNCH_DATE)
                 throw new StartupException(StartupException.ERR_WRONG_MACHINE_STATE,
                                            String.format("current machine time is %s, but that is seemingly incorrect. exiting now.",
@@ -179,15 +306,18 @@ public class StartupChecks
 
     public static final StartupCheck checkJMXPorts = new StartupCheck()
     {
-        public void execute()
+        @Override
+        public void execute(StartupChecksOptions options)
         {
-            String jmxPort = System.getProperty("cassandra.jmx.remote.port");
+            if (options.isDisabled(getStartupCheckType()))
+                return;
+            String jmxPort = CassandraRelevantProperties.CASSANDRA_JMX_REMOTE_PORT.getString();
             if (jmxPort == null)
             {
                 logger.warn("JMX is not enabled to receive remote connections. Please see cassandra-env.sh for more info.");
-                jmxPort = System.getProperty("cassandra.jmx.local.port");
+                jmxPort = CassandraRelevantProperties.CASSANDRA_JMX_LOCAL_PORT.toString();
                 if (jmxPort == null)
-                    logger.error("cassandra.jmx.local.port missing from cassandra-env.sh, unable to start local JMX service.");
+                    logger.error(CASSANDRA_JMX_LOCAL_PORT.getKey() + " missing from cassandra-env.sh, unable to start local JMX service.");
             }
             else
             {
@@ -198,8 +328,11 @@ public class StartupChecks
 
     public static final StartupCheck checkJMXProperties = new StartupCheck()
     {
-        public void execute()
+        @Override
+        public void execute(StartupChecksOptions options)
         {
+            if (options.isDisabled(getStartupCheckType()))
+                return;
             if (COM_SUN_MANAGEMENT_JMXREMOTE_PORT.isPresent())
             {
                 logger.warn("Use of com.sun.management.jmxremote.port at startup is deprecated. " +
@@ -210,8 +343,11 @@ public class StartupChecks
 
     public static final StartupCheck inspectJvmOptions = new StartupCheck()
     {
-        public void execute()
+        @Override
+        public void execute(StartupChecksOptions options)
         {
+            if (options.isDisabled(getStartupCheckType()))
+                return;
             // log warnings for different kinds of sub-optimal JVMs.  tldr use 64-bit Oracle >= 1.6u32
             if (!DatabaseDescriptor.hasLargeAddressSpace())
                 logger.warn("32bit JVM detected.  It is recommended to run Cassandra on a 64bit JVM for better performance.");
@@ -269,19 +405,108 @@ public class StartupChecks
 
     public static final StartupCheck checkNativeLibraryInitialization = new StartupCheck()
     {
-        public void execute() throws StartupException
+        @Override
+        public void execute(StartupChecksOptions options) throws StartupException
         {
+            if (options.isDisabled(getStartupCheckType()))
+                return;
             // Fail-fast if the native library could not be linked.
             if (!NativeLibrary.isAvailable())
                 throw new StartupException(StartupException.ERR_WRONG_MACHINE_STATE, "The native library could not be initialized properly. ");
         }
     };
 
-    public static final StartupCheck initSigarLibrary = new StartupCheck()
+    public static final StartupCheck checkProcessEnvironment = new StartupCheck()
     {
-        public void execute()
+        @Override
+        public void execute(StartupChecksOptions options)
         {
-            SigarLibrary.instance.warnIfRunningInDegradedMode();
+            Optional<String> degradations = FBUtilities.getSystemInfo().isDegraded();
+
+            if (degradations.isPresent())
+                logger.warn("Cassandra server running in degraded mode. " + degradations.get());
+            else
+                logger.info("Checked OS settings and found them configured for optimal performance.");
+        }
+    };
+
+    public static final StartupCheck checkReadAheadKbSetting = new StartupCheck()
+    {
+        // This value is in KB.
+        private static final long MAX_RECOMMENDED_READ_AHEAD_KB_SETTING = 128;
+
+        /**
+         * Function to get the block device system path(Example: /dev/sda) from the
+         * data directories defined in cassandra config.(cassandra.yaml)
+         * @param dataDirectories list of data directories from cassandra.yaml
+         * @return Map of block device path and data directory
+         */
+        private Map<String, String> getBlockDevices(String[] dataDirectories) {
+            Map<String, String> blockDevices = new HashMap<String, String>();
+
+            for (String dataDirectory : dataDirectories)
+            {
+                try
+                {
+                    Path p = File.getPath(dataDirectory);
+                    FileStore fs = Files.getFileStore(p);
+
+                    String blockDirectory = fs.name();
+                    if(StringUtils.isNotEmpty(blockDirectory))
+                    {
+                        blockDevices.put(blockDirectory, dataDirectory);
+                    }
+                }
+                catch (IOException e)
+                {
+                    logger.warn("IO exception while reading file {}.", dataDirectory, e);
+                }
+            }
+            return blockDevices;
+        }
+
+        @Override
+        public void execute(StartupChecksOptions options)
+        {
+            if (options.isDisabled(getStartupCheckType()) || !FBUtilities.isLinux)
+                return;
+
+            String[] dataDirectories = DatabaseDescriptor.getRawConfig().data_file_directories;
+            Map<String, String> blockDevices = getBlockDevices(dataDirectories);
+
+            for (Map.Entry<String, String> entry: blockDevices.entrySet())
+            {
+                String blockDeviceDirectory = entry.getKey();
+                String dataDirectory = entry.getValue();
+                try
+                {
+                    Path readAheadKBPath = StartupChecks.getReadAheadKBPath(blockDeviceDirectory);
+
+                    if (readAheadKBPath == null || Files.notExists(readAheadKBPath))
+                    {
+                        logger.debug("No 'read_ahead_kb' setting found for device {} of data directory {}.", blockDeviceDirectory, dataDirectory);
+                        continue;
+                    }
+
+                    final List<String> data = Files.readAllLines(readAheadKBPath);
+                    if (data.isEmpty())
+                        continue;
+
+                    int readAheadKbSetting = Integer.parseInt(data.get(0));
+
+                    if (readAheadKbSetting > MAX_RECOMMENDED_READ_AHEAD_KB_SETTING)
+                    {
+                        logger.warn("Detected high '{}' setting of {} for device '{}' of data directory '{}'. It is " +
+                                    "recommended to set this value to 8KB (or lower) on SSDs or 64KB (or lower) on HDDs " +
+                                    "to prevent excessive IO usage and page cache churn on read-intensive workloads.",
+                                    readAheadKBPath, readAheadKbSetting, blockDeviceDirectory, dataDirectory);
+                    }
+                }
+                catch (final IOException e)
+                {
+                    logger.warn("IO exception while reading file {}.", blockDeviceDirectory, e);
+                }
+            }
         }
     };
 
@@ -292,7 +517,7 @@ public class StartupChecks
 
         private long getMaxMapCount()
         {
-            final Path path = Paths.get(MAX_MAP_COUNT_PATH);
+            final Path path = File.getPath(MAX_MAP_COUNT_PATH);
             try (final BufferedReader bufferedReader = Files.newBufferedReader(path))
             {
                 final String data = bufferedReader.readLine();
@@ -315,9 +540,10 @@ public class StartupChecks
             return -1;
         }
 
-        public void execute()
+        @Override
+        public void execute(StartupChecksOptions options)
         {
-            if (!FBUtilities.isLinux)
+            if (options.isDisabled(getStartupCheckType()) || !FBUtilities.isLinux)
                 return;
 
             if (DatabaseDescriptor.getDiskAccessMode() == Config.DiskAccessMode.standard &&
@@ -332,42 +558,51 @@ public class StartupChecks
         }
     };
 
-    public static final StartupCheck checkDataDirs = () ->
+    public static final StartupCheck checkDataDirs = new StartupCheck()
     {
-        // check all directories(data, commitlog, saved cache) for existence and permission
-        Iterable<String> dirs = Iterables.concat(Arrays.asList(DatabaseDescriptor.getAllDataFileLocations()),
-                                                 Arrays.asList(DatabaseDescriptor.getCommitLogLocation(),
-                                                               DatabaseDescriptor.getSavedCachesLocation(),
-                                                               DatabaseDescriptor.getHintsDirectory().getAbsolutePath()));
-
-        for (String dataDir : dirs)
+        @Override
+        public void execute(StartupChecksOptions options) throws StartupException
         {
-            logger.debug("Checking directory {}", dataDir);
-            File dir = new File(dataDir);
-
-            // check that directories exist.
-            if (!dir.exists())
+            if (options.isDisabled(getStartupCheckType()))
+                return;
+            // check all directories(data, commitlog, saved cache) for existence and permission
+            Iterable<String> dirs = Iterables.concat(Arrays.asList(DatabaseDescriptor.getAllDataFileLocations()),
+                                                     Arrays.asList(DatabaseDescriptor.getCommitLogLocation(),
+                                                                   DatabaseDescriptor.getSavedCachesLocation(),
+                                                                   DatabaseDescriptor.getHintsDirectory().absolutePath()));
+            for (String dataDir : dirs)
             {
-                logger.warn("Directory {} doesn't exist", dataDir);
-                // if they don't, failing their creation, stop cassandra.
-                if (!dir.mkdirs())
-                    throw new StartupException(StartupException.ERR_WRONG_DISK_STATE,
-                                               "Has no permission to create directory "+ dataDir);
-            }
+                logger.debug("Checking directory {}", dataDir);
+                File dir = new File(dataDir);
 
-            // if directories exist verify their permissions
-            if (!Directories.verifyFullPermissions(dir, dataDir))
-                throw new StartupException(StartupException.ERR_WRONG_DISK_STATE,
-                                           "Insufficient permissions on directory " + dataDir);
+                // check that directories exist.
+                if (!dir.exists())
+                {
+                    logger.warn("Directory {} doesn't exist", dataDir);
+                    // if they don't, failing their creation, stop cassandra.
+                    if (!dir.tryCreateDirectories())
+                        throw new StartupException(StartupException.ERR_WRONG_DISK_STATE,
+                                                   "Has no permission to create directory "+ dataDir);
+                }
+
+                // if directories exist verify their permissions
+                if (!Directories.verifyFullPermissions(dir, dataDir))
+                    throw new StartupException(StartupException.ERR_WRONG_DISK_STATE,
+                                               "Insufficient permissions on directory " + dataDir);
+            }
         }
     };
 
     public static final StartupCheck checkSSTablesFormat = new StartupCheck()
     {
-        public void execute() throws StartupException
+        @Override
+        public void execute(StartupChecksOptions options) throws StartupException
         {
+            if (options.isDisabled(getStartupCheckType()))
+                return;
             final Set<String> invalid = new HashSet<>();
             final Set<String> nonSSTablePaths = new HashSet<>();
+            final List<String> withIllegalGenId = new ArrayList<>();
             nonSSTablePaths.add(FileUtils.getCanonicalPath(DatabaseDescriptor.getCommitLogLocation()));
             nonSSTablePaths.add(FileUtils.getCanonicalPath(DatabaseDescriptor.getSavedCachesLocation()));
             nonSSTablePaths.add(FileUtils.getCanonicalPath(DatabaseDescriptor.getHintsDirectory()));
@@ -376,14 +611,18 @@ public class StartupChecks
             {
                 public FileVisitResult visitFile(Path path, BasicFileAttributes attrs)
                 {
-                    File file = path.toFile();
+                    File file = new File(path);
                     if (!Descriptor.isValidFile(file))
                         return FileVisitResult.CONTINUE;
 
                     try
                     {
-                        if (!Descriptor.fromFilename(file).isCompatible())
+                        Descriptor desc = Descriptor.fromFileWithComponent(file, false).left;
+                        if (!desc.isCompatible())
                             invalid.add(file.toString());
+
+                        if (!DatabaseDescriptor.isUUIDSSTableIdentifiersEnabled() && desc.id instanceof UUIDBasedSSTableId)
+                            withIllegalGenId.add(file.toString());
                     }
                     catch (Exception e)
                     {
@@ -394,10 +633,44 @@ public class StartupChecks
 
                 public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) throws IOException
                 {
+                    String[] nameParts = FileUtils.getCanonicalPath(new File(dir)).split(java.io.File.separator);
+                    if (nameParts.length >= 2)
+                    {
+                        String tablePart = nameParts[nameParts.length - 1];
+                        String ksPart = nameParts[nameParts.length - 2];
+
+                        if (tablePart.contains("-"))
+                            tablePart = tablePart.split("-")[0];
+
+                        // In very old versions of Cassandra, we wouldn't necessarily delete sstables from dropped system tables
+                        // which were removed in various major version upgrades (e.g system.Versions in 1.2)
+                        if (ksPart.equals(SchemaConstants.SYSTEM_KEYSPACE_NAME) && !SystemKeyspace.ALL_TABLE_NAMES.contains(tablePart))
+                        {
+                            String canonicalPath = FileUtils.getCanonicalPath(new File(dir));
+
+                            // We can have snapshots of our system tables or snapshots created with a -t tag of "system" that would trigger
+                            // this potential warning, so we warn more softly in the case that it's probably a snapshot.
+                            if (canonicalPath.contains("snapshot"))
+                            {
+                                logger.info("Found unknown system directory {}.{} at {} that contains the word snapshot. " +
+                                            "This may be left over from a previous version of Cassandra or may be normal. " +
+                                            " Consider removing after inspection if determined to be unnecessary.",
+                                            ksPart, tablePart, canonicalPath);
+                            }
+                            else
+                            {
+                                logger.warn("Found unknown system directory {}.{} at {} - this is likely left over from a previous " +
+                                            "version of Cassandra and should be removed after inspection.",
+                                            ksPart, tablePart, canonicalPath);
+                            }
+                            return FileVisitResult.SKIP_SUBTREE;
+                        }
+                    }
+
                     String name = dir.getFileName().toString();
                     return (name.equals(Directories.SNAPSHOT_SUBDIR)
                             || name.equals(Directories.BACKUPS_SUBDIR)
-                            || nonSSTablePaths.contains(dir.toFile().getCanonicalPath()))
+                            || nonSSTablePaths.contains(PathUtils.toCanonicalPath(dir).toString()))
                            ? FileVisitResult.SKIP_SUBTREE
                            : FileVisitResult.CONTINUE;
                 }
@@ -407,7 +680,7 @@ public class StartupChecks
             {
                 try
                 {
-                    Files.walkFileTree(Paths.get(dataDir), sstableVisitor);
+                    Files.walkFileTree(new File(dataDir).toPath(), sstableVisitor);
                 }
                 catch (IOException e)
                 {
@@ -423,13 +696,25 @@ public class StartupChecks
                                                          "upgradesstables",
                                                          Joiner.on(",").join(invalid)));
 
+            if (!withIllegalGenId.isEmpty())
+                throw new StartupException(StartupException.ERR_WRONG_CONFIG,
+                                           "UUID sstable identifiers are disabled but some sstables have been " +
+                                           "created with UUID identifiers. You have to either delete those " +
+                                           "sstables or enable UUID based sstable identifers in cassandra.yaml " +
+                                           "(uuid_sstable_identifiers_enabled). The list of affected sstables is: " +
+                                           Joiner.on(", ").join(withIllegalGenId) + ". If you decide to delete sstables, " +
+                                           "and have that data replicated over other healthy nodes, those will be brought" +
+                                           "back during repair");
         }
     };
 
     public static final StartupCheck checkSystemKeyspaceState = new StartupCheck()
     {
-        public void execute() throws StartupException
+        @Override
+        public void execute(StartupChecksOptions options) throws StartupException
         {
+            if (options.isDisabled(getStartupCheckType()))
+                return;
             // check the system keyspace to keep user from shooting self in foot by changing partitioner, cluster name, etc.
             // we do a one-off scrub of the system keyspace first; we can't load the list of the rest of the keyspaces,
             // until system keyspace is opened.
@@ -450,21 +735,19 @@ public class StartupChecks
 
     public static final StartupCheck checkDatacenter = new StartupCheck()
     {
-        public void execute() throws StartupException
+        @Override
+        public void execute(StartupChecksOptions options) throws StartupException
         {
-            if (!Boolean.getBoolean("cassandra.ignore_dc"))
+            String storedDc = SystemKeyspace.getDatacenter();
+            if (storedDc != null)
             {
-                String storedDc = SystemKeyspace.getDatacenter();
-                if (storedDc != null)
+                String currentDc = DatabaseDescriptor.getEndpointSnitch().getLocalDatacenter();
+                if (!storedDc.equals(currentDc))
                 {
-                    String currentDc = DatabaseDescriptor.getEndpointSnitch().getLocalDatacenter();
-                    if (!storedDc.equals(currentDc))
-                    {
-                        String formatMessage = "Cannot start node if snitch's data center (%s) differs from previous data center (%s). " +
-                                               "Please fix the snitch configuration, decommission and rebootstrap this node or use the flag -Dcassandra.ignore_dc=true.";
+                    String formatMessage = "Cannot start node if snitch's data center (%s) differs from previous data center (%s). " +
+                                           "Please fix the snitch configuration, decommission and rebootstrap this node";
 
-                        throw new StartupException(StartupException.ERR_WRONG_CONFIG, String.format(formatMessage, currentDc, storedDc));
-                    }
+                    throw new StartupException(StartupException.ERR_WRONG_CONFIG, String.format(formatMessage, currentDc, storedDc));
                 }
             }
         }
@@ -472,32 +755,62 @@ public class StartupChecks
 
     public static final StartupCheck checkRack = new StartupCheck()
     {
-        public void execute() throws StartupException
+        @Override
+        public void execute(StartupChecksOptions options) throws StartupException
         {
-            if (!Boolean.getBoolean("cassandra.ignore_rack"))
+            String storedRack = SystemKeyspace.getRack();
+            if (storedRack != null)
             {
-                String storedRack = SystemKeyspace.getRack();
-                if (storedRack != null)
+                String currentRack = DatabaseDescriptor.getEndpointSnitch().getLocalRack();
+                if (!storedRack.equals(currentRack))
                 {
-                    String currentRack = DatabaseDescriptor.getEndpointSnitch().getLocalRack();
-                    if (!storedRack.equals(currentRack))
-                    {
-                        String formatMessage = "Cannot start node if snitch's rack (%s) differs from previous rack (%s). " +
-                                               "Please fix the snitch configuration, decommission and rebootstrap this node or use the flag -Dcassandra.ignore_rack=true.";
+                    String formatMessage = "Cannot start node if snitch's rack (%s) differs from previous rack (%s). " +
+                                           "Please fix the snitch configuration, decommission and rebootstrap this node";
 
-                        throw new StartupException(StartupException.ERR_WRONG_CONFIG, String.format(formatMessage, currentRack, storedRack));
-                    }
+                    throw new StartupException(StartupException.ERR_WRONG_CONFIG, String.format(formatMessage, currentRack, storedRack));
                 }
             }
         }
     };
 
-    public static final StartupCheck checkLegacyAuthTables = () ->
+    public static final StartupCheck checkLegacyAuthTables = new StartupCheck()
     {
-        Optional<String> errMsg = checkLegacyAuthTablesMessage();
-        if (errMsg.isPresent())
-            throw new StartupException(StartupException.ERR_WRONG_CONFIG, errMsg.get());
+        @Override
+        public void execute(StartupChecksOptions options) throws StartupException
+        {
+            if (options.isDisabled(getStartupCheckType()))
+                return;
+            Optional<String> errMsg = checkLegacyAuthTablesMessage();
+            if (errMsg.isPresent())
+                throw new StartupException(StartupException.ERR_WRONG_CONFIG, errMsg.get());
+        }
     };
+
+    @VisibleForTesting
+    public static Path getReadAheadKBPath(String blockDirectoryPath)
+    {
+        Path readAheadKBPath = null;
+
+        final String READ_AHEAD_KB_SETTING_PATH = "/sys/block/%s/queue/read_ahead_kb";
+        try
+        {
+            String[] blockDirComponents = blockDirectoryPath.split("/");
+            if (blockDirComponents.length >= 2 && blockDirComponents[1].equals("dev"))
+            {
+                String deviceName = blockDirComponents[2].replaceAll("[0-9]*$", "");
+                if (StringUtils.isNotEmpty(deviceName))
+                {
+                    readAheadKBPath = File.getPath(String.format(READ_AHEAD_KB_SETTING_PATH, deviceName));
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            logger.error("Error retrieving device path for {}.", blockDirectoryPath);
+        }
+
+        return readAheadKBPath;
+    }
 
     @VisibleForTesting
     static Optional<String> checkLegacyAuthTablesMessage()

@@ -27,11 +27,14 @@ import org.apache.cassandra.cql3.*;
 import org.apache.cassandra.cql3.conditions.ColumnCondition;
 import org.apache.cassandra.cql3.conditions.Conditions;
 import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
+import org.apache.cassandra.cql3.terms.Constants;
+import org.apache.cassandra.cql3.terms.Term;
 import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.Slice;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.Pair;
 import org.apache.commons.lang3.builder.ToStringBuilder;
@@ -135,7 +138,8 @@ public class UpdateStatement extends ModificationStatement
         }
 
         @Override
-        protected ModificationStatement prepareInternal(TableMetadata metadata,
+        protected ModificationStatement prepareInternal(ClientState state,
+                                                        TableMetadata metadata,
                                                         VariableSpecifications bindVariables,
                                                         Conditions conditions,
                                                         Attributes attrs)
@@ -164,11 +168,11 @@ public class UpdateStatement extends ModificationStatement
 
                 if (def.isPrimaryKeyColumn())
                 {
-                    whereClause.add(new SingleColumnRelation(columnNames.get(i), Operator.EQ, value));
+                    whereClause.add(Relation.singleColumn(columnNames.get(i), Operator.EQ, value));
                 }
                 else
                 {
-                    Operation operation = new Operation.SetValue(value).prepare(metadata, def);
+                    Operation operation = new Operation.SetValue(value).prepare(metadata, def, !conditions.isEmpty());
                     operation.collectMarkerSpecification(bindVariables);
                     operations.add(operation);
                 }
@@ -176,10 +180,12 @@ public class UpdateStatement extends ModificationStatement
 
             boolean applyOnlyToStaticColumns = !hasClusteringColumnsSet && appliesOnlyToStaticColumns(operations, conditions);
 
-            StatementRestrictions restrictions = new StatementRestrictions(type,
+            StatementRestrictions restrictions = new StatementRestrictions(state,
+                                                                           type,
                                                                            metadata,
                                                                            whereClause.build(),
                                                                            bindVariables,
+                                                                           Collections.emptyList(),
                                                                            applyOnlyToStaticColumns,
                                                                            false,
                                                                            false);
@@ -210,7 +216,8 @@ public class UpdateStatement extends ModificationStatement
         }
 
         @Override
-        protected ModificationStatement prepareInternal(TableMetadata metadata,
+        protected ModificationStatement prepareInternal(ClientState state,
+                                                        TableMetadata metadata,
                                                         VariableSpecifications bindVariables,
                                                         Conditions conditions,
                                                         Attributes attrs)
@@ -232,11 +239,11 @@ public class UpdateStatement extends ModificationStatement
                 Term.Raw raw = prepared.getRawTermForColumn(def, defaultUnset);
                 if (def.isPrimaryKeyColumn())
                 {
-                    whereClause.add(new SingleColumnRelation(def.name, Operator.EQ, raw));
+                    whereClause.add(Relation.singleColumn(def.name, Operator.EQ, raw));
                 }
                 else
                 {
-                    Operation operation = new Operation.SetValue(raw).prepare(metadata, def);
+                    Operation operation = new Operation.SetValue(raw).prepare(metadata, def, !conditions.isEmpty());
                     operation.collectMarkerSpecification(bindVariables);
                     operations.add(operation);
                 }
@@ -244,10 +251,12 @@ public class UpdateStatement extends ModificationStatement
 
             boolean applyOnlyToStaticColumns = !hasClusteringColumnsSet && appliesOnlyToStaticColumns(operations, conditions);
 
-            StatementRestrictions restrictions = new StatementRestrictions(type,
+            StatementRestrictions restrictions = new StatementRestrictions(state,
+                                                                           type,
                                                                            metadata,
                                                                            whereClause.build(),
                                                                            bindVariables,
+                                                                           Collections.emptyList(),
                                                                            applyOnlyToStaticColumns,
                                                                            false,
                                                                            false);
@@ -291,7 +300,8 @@ public class UpdateStatement extends ModificationStatement
         }
 
         @Override
-        protected ModificationStatement prepareInternal(TableMetadata metadata,
+        protected ModificationStatement prepareInternal(ClientState state,
+                                                        TableMetadata metadata,
                                                         VariableSpecifications bindVariables,
                                                         Conditions conditions,
                                                         Attributes attrs)
@@ -304,16 +314,18 @@ public class UpdateStatement extends ModificationStatement
 
                 checkFalse(def.isPrimaryKeyColumn(), "PRIMARY KEY part %s found in SET part", def.name);
 
-                Operation operation = entry.right.prepare(metadata, def);
+                Operation operation = entry.right.prepare(metadata, def, !conditions.isEmpty());
                 operation.collectMarkerSpecification(bindVariables);
                 operations.add(operation);
             }
 
-            StatementRestrictions restrictions = newRestrictions(metadata,
+            StatementRestrictions restrictions = newRestrictions(state,
+                                                                 metadata,
                                                                  bindVariables,
                                                                  operations,
                                                                  whereClause,
-                                                                 conditions);
+                                                                 conditions,
+                                                                 Collections.emptyList());
 
             return new UpdateStatement(type,
                                        bindVariables,
@@ -334,6 +346,6 @@ public class UpdateStatement extends ModificationStatement
     @Override
     public AuditLogContext getAuditLogContext()
     {
-        return new AuditLogContext(AuditLogEntryType.UPDATE, keyspace(), columnFamily());
+        return new AuditLogContext(AuditLogEntryType.UPDATE, keyspace(), table());
     }
 }

@@ -17,7 +17,6 @@
  */
 package org.apache.cassandra.index.sasi.conf;
 
-import java.io.File;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
@@ -25,14 +24,15 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.index.sasi.SSTableIndex;
 import org.apache.cassandra.index.sasi.conf.view.View;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.utils.Pair;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /** a pared-down version of DataTracker and DT.View. need one for each index of each column family */
 public class DataTracker
@@ -76,6 +76,11 @@ public class DataTracker
             newView = new View(columnIndex, currentView.getIndexes(), oldSSTables, newIndexes);
         }
         while (!view.compareAndSet(currentView, newView));
+
+        for (SSTableReader sstable : indexedSSTables)
+        {
+                sstable.addComponents(Collections.singleton(columnIndex.getComponent()));
+        }
 
         return newSSTables.stream().filter(sstable -> !indexedSSTables.contains(sstable)).collect(Collectors.toList());
     }
@@ -140,7 +145,7 @@ public class DataTracker
             if (sstable.isMarkedCompacted())
                 continue;
 
-            File indexFile = new File(sstable.descriptor.filenameFor(columnIndex.getComponent()));
+            File indexFile = sstable.descriptor.fileFor(columnIndex.getComponent());
             if (!indexFile.exists())
                 continue;
 
@@ -176,7 +181,7 @@ public class DataTracker
             }
             catch (Throwable t)
             {
-                logger.error("Can't open index file at " + indexFile.getAbsolutePath() + ", skipping.", t);
+                logger.error("Can't open index file at " + indexFile.absolutePath() + ", skipping.", t);
                 if (index != null)
                     index.release();
             }

@@ -21,13 +21,9 @@ package org.apache.cassandra.service;
 
 import java.net.InetAddress;
 import java.net.UnknownHostException;
-import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 import com.google.common.base.Predicates;
-import org.apache.cassandra.dht.Murmur3Partitioner;
-import org.apache.cassandra.locator.EndpointsForToken;
-import org.apache.cassandra.locator.ReplicaPlans;
 import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -38,18 +34,24 @@ import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.WriteType;
+import org.apache.cassandra.dht.Murmur3Partitioner;
+import org.apache.cassandra.locator.EndpointsForToken;
 import org.apache.cassandra.locator.IEndpointSnitch;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.Replica;
 import org.apache.cassandra.locator.ReplicaCollection;
+import org.apache.cassandra.locator.ReplicaPlans;
 import org.apache.cassandra.locator.ReplicaUtils;
-import org.apache.cassandra.locator.TokenMetadata;
 import org.apache.cassandra.net.Message;
 import org.apache.cassandra.net.Verb;
 import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.tcm.Epoch;
+import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
+import static java.util.concurrent.TimeUnit.DAYS;
 import static org.apache.cassandra.net.NoPayload.noPayload;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
@@ -78,10 +80,9 @@ public class WriteResponseHandlerTest
         SchemaLoader.loadSchema();
         DatabaseDescriptor.setPartitionerUnsafe(Murmur3Partitioner.instance);
         // Register peers with expected DC for NetworkTopologyStrategy.
-        TokenMetadata metadata = StorageService.instance.getTokenMetadata();
-        metadata.clearUnsafe();
-        metadata.updateHostId(UUID.randomUUID(), InetAddressAndPort.getByName("127.1.0.255"));
-        metadata.updateHostId(UUID.randomUUID(), InetAddressAndPort.getByName("127.2.0.255"));
+//        metadata.clearUnsafe();
+//        metadata.updateHostId(UUID.randomUUID(), InetAddressAndPort.getByName("127.1.0.255"));
+//        metadata.updateHostId(UUID.randomUUID(), InetAddressAndPort.getByName("127.2.0.255"));
 
         DatabaseDescriptor.setEndpointSnitch(new IEndpointSnitch()
         {
@@ -92,7 +93,7 @@ public class WriteResponseHandlerTest
 
             public String getDatacenter(InetAddressAndPort endpoint)
             {
-                byte[] address = endpoint.address.getAddress();
+                byte[] address = endpoint.getAddress().getAddress();
                 if (address[1] == 1)
                     return "datacenter1";
                 else
@@ -145,7 +146,7 @@ public class WriteResponseHandlerTest
     {
         long startingCount = ks.metric.idealCLWriteLatency.latency.getCount();
         //Specify query start time in past to ensure minimum latency measurement
-        AbstractWriteResponseHandler awr = createWriteResponseHandler(ConsistencyLevel.LOCAL_QUORUM, ConsistencyLevel.EACH_QUORUM, System.nanoTime() - TimeUnit.DAYS.toNanos(1));
+        AbstractWriteResponseHandler awr = createWriteResponseHandler(ConsistencyLevel.LOCAL_QUORUM, ConsistencyLevel.EACH_QUORUM, new Dispatcher.RequestTime(nanoTime() - DAYS.toNanos(1)));
 
         //dc1
         awr.onResponse(createDummyMessage(0));
@@ -260,13 +261,13 @@ public class WriteResponseHandlerTest
 
     private static AbstractWriteResponseHandler createWriteResponseHandler(ConsistencyLevel cl, ConsistencyLevel ideal)
     {
-        return createWriteResponseHandler(cl, ideal, System.nanoTime());
+        return createWriteResponseHandler(cl, ideal, Dispatcher.RequestTime.forImmediateExecution());
     }
 
-    private static AbstractWriteResponseHandler createWriteResponseHandler(ConsistencyLevel cl, ConsistencyLevel ideal, long queryStartTime)
+    private static AbstractWriteResponseHandler createWriteResponseHandler(ConsistencyLevel cl, ConsistencyLevel ideal, Dispatcher.RequestTime requestTime)
     {
-        return ks.getReplicationStrategy().getWriteResponseHandler(ReplicaPlans.forWrite(ks, cl, targets, pending, Predicates.alwaysTrue(), ReplicaPlans.writeAll),
-                                                                   null, WriteType.SIMPLE, queryStartTime, ideal);
+        return ks.getReplicationStrategy().getWriteResponseHandler(ReplicaPlans.forWrite(ks, cl, (cm) -> targets, (cm) -> pending, Epoch.FIRST, Predicates.alwaysTrue(), ReplicaPlans.writeAll),
+                                                                   null, WriteType.SIMPLE, null, requestTime, ideal);
     }
 
     private static Message createDummyMessage(int target)

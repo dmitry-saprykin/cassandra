@@ -18,19 +18,26 @@
 */
 package org.apache.cassandra.utils;
 
-import java.io.File;
 import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
 import java.util.Arrays;
 import java.util.Iterator;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.function.Predicate;
 import java.util.stream.Stream;
+import javax.annotation.Nonnull;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.Iterables;
 
 import org.apache.cassandra.io.FSReadError;
 import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.utils.concurrent.UncheckedInterruptedException;
 
 public final class Throwables
 {
@@ -60,6 +67,8 @@ public final class Throwables
     {
         if (existingFail == null)
             return newFail;
+        if (newFail == null)
+            return existingFail;
         existingFail.addSuppressed(newFail);
         return existingFail;
     }
@@ -86,6 +95,9 @@ public final class Throwables
 
         if (fail instanceof RuntimeException)
             throw (RuntimeException) fail;
+
+        if (fail instanceof InterruptedException)
+            throw new UncheckedInterruptedException((InterruptedException) fail);
 
         if (checked != null && checked.isInstance(fail))
             throw checked.cast(fail);
@@ -148,7 +160,7 @@ public final class Throwables
     @SafeVarargs
     public static void perform(File against, FileOpType opType, DiscreteAction<? extends IOException> ... actions)
     {
-        perform(against.getPath(), opType, actions);
+        perform(against.path(), opType, actions);
     }
 
     @SafeVarargs
@@ -178,6 +190,59 @@ public final class Throwables
         }));
     }
 
+    /**
+     * See {@link #closeAndAddSuppressed(Throwable, Iterable)}
+     */
+    public static void closeAndAddSuppressed(@Nonnull Throwable t, AutoCloseable... closeables)
+    {
+        closeAndAddSuppressed(t, Arrays.asList(closeables));
+    }
+
+    /**
+     * Do what {@link #closeAndAddSuppressed(Throwable, Iterable)} does, additionally filtering out all null closables.
+     */
+    public static void closeNonNullAndAddSuppressed(@Nonnull Throwable t, AutoCloseable... closeables)
+    {
+        closeAndAddSuppressed(t, Iterables.filter(Arrays.asList(closeables), Objects::nonNull));
+    }
+
+    /**
+     * Closes all closables in the provided collections and accumulates the possible exceptions thrown when closing.
+     *
+     * @param accumulate non-null exception to accumulate errors thrown when closing the provided resources
+     * @param closeables closeables to be closed
+     */
+    public static void closeAndAddSuppressed(@Nonnull Throwable accumulate, Iterable<AutoCloseable> closeables)
+    {
+        Preconditions.checkNotNull(accumulate);
+        for (AutoCloseable closeable : closeables)
+        {
+            try
+            {
+                closeable.close();
+            }
+            catch (Throwable ex)
+            {
+                accumulate.addSuppressed(ex);
+            }
+        }
+    }
+
+    /**
+     * See {@link #close(Throwable, Iterable)}
+     */
+    public static Throwable close(Throwable accumulate, AutoCloseable ... closeables)
+    {
+        return close(accumulate, Arrays.asList(closeables));
+    }
+
+    /**
+     * Closes all the resources in the provided collections and accumulates the possible exceptions thrown when closing.
+     *
+     * @param accumulate the initial value for the exception accumulator, can be {@code null}
+     * @param closeables closeables to be closed
+     * @return {@code null}, {@param accumulate} or the first exception thrown when closing the provided resources
+     */
     public static Throwable close(Throwable accumulate, Iterable<? extends AutoCloseable> closeables)
     {
         for (AutoCloseable closeable : closeables)
@@ -237,7 +302,10 @@ public final class Throwables
      */
     public static RuntimeException unchecked(Throwable t)
     {
-        return t instanceof RuntimeException ? (RuntimeException)t : new RuntimeException(t);
+        return t instanceof RuntimeException ? (RuntimeException)t :
+               t instanceof InterruptedException
+               ? new UncheckedInterruptedException((InterruptedException) t)
+               : new RuntimeException(t);
     }
 
     /**
@@ -257,5 +325,12 @@ public final class Throwables
     public static RuntimeException cleaned(Throwable t)
     {
         return unchecked(unwrapped(t));
+    }
+
+    @VisibleForTesting
+    public static void assertAnyCause(Throwable err, Class<? extends Throwable> cause)
+    {
+        if (!anyCauseMatches(err, cause::isInstance))
+            throw new AssertionError("The exception is not caused by " + cause.getName(), err);
     }
 }

@@ -18,25 +18,26 @@
 
 package org.apache.cassandra.db.virtual;
 
-import java.lang.reflect.Field;
-import java.lang.reflect.Modifier;
-import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 import com.google.common.collect.ImmutableList;
 import org.junit.Assert;
 import org.junit.Before;
-import org.junit.BeforeClass;
 import org.junit.Test;
 
 import com.datastax.driver.core.ResultSet;
 import com.datastax.driver.core.Row;
 import org.apache.cassandra.config.Config;
+import org.apache.cassandra.config.DurationSpec;
 import org.apache.cassandra.config.EncryptionOptions.ServerEncryptionOptions.InternodeEncryption;
 import org.apache.cassandra.config.ParameterizedClass;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.security.SSLFactory;
+import org.yaml.snakeyaml.introspector.Property;
+
+import static org.apache.cassandra.config.EncryptionOptions.ClientAuth.REQUIRED;
 
 public class SettingsTableTest extends CQLTester
 {
@@ -45,36 +46,28 @@ public class SettingsTableTest extends CQLTester
     private Config config;
     private SettingsTable table;
 
-    @BeforeClass
-    public static void setUpClass()
-    {
-        CQLTester.setUpClass();
-    }
-
     @Before
     public void config()
     {
         config = new Config();
         config.client_encryption_options.applyConfig();
         config.server_encryption_options.applyConfig();
+        config.sstable_preemptive_open_interval = null;
+        config.index_summary_resize_interval = null;
+        config.cache_load_timeout = new DurationSpec.IntSecondsBound(0);
+        config.commitlog_sync_group_window = new DurationSpec.IntMillisecondsBound(0);
+        config.credentials_update_interval = null;
+        config.data_file_directories = new String[] {"/my/data/directory", "/another/data/directory"};
         table = new SettingsTable(KS_NAME, config);
         VirtualKeyspaceRegistry.instance.register(new VirtualKeyspace(KS_NAME, ImmutableList.of(table)));
+        disablePreparedReuseForTest();
     }
 
-    private String getValue(Field f)
+    @Test
+    public void testArray() throws Throwable
     {
-        Object untypedValue = table.getValue(f);
-        String value = null;
-        if (untypedValue != null)
-        {
-            if (untypedValue.getClass().isArray())
-            {
-                value = Arrays.toString((Object[]) untypedValue);
-            }
-            else
-                value = untypedValue.toString();
-        }
-        return value;
+        Row one = executeNet("SELECT value FROM vts.settings WHERE name = 'data_file_directories'").one();
+        Assert.assertEquals("[/my/data/directory, /another/data/directory]", one.getString("value"));
     }
 
     @Test
@@ -87,26 +80,22 @@ public class SettingsTableTest extends CQLTester
         {
             i++;
             String name = r.getString("name");
-            Field f = SettingsTable.FIELDS.get(name);
-            if (f != null) // skip overrides
-                Assert.assertEquals(getValue(f), r.getString("value"));
+            Property prop = SettingsTable.PROPERTIES.get(name);
+            if (prop != null) // skip overrides
+                Assert.assertEquals(table.getValue(prop), r.getString("value"));
         }
-        Assert.assertTrue(SettingsTable.FIELDS.size() <= i);
+        Assert.assertTrue(SettingsTable.PROPERTIES.size() <= i);
     }
 
     @Test
     public void testSelectPartition() throws Throwable
     {
-        List<Field> fields = Arrays.stream(Config.class.getFields())
-                                   .filter(f -> !Modifier.isStatic(f.getModifiers()))
-                                   .collect(Collectors.toList());
-        for (Field f : fields)
+        for (Map.Entry<String, Property> e : SettingsTable.PROPERTIES.entrySet())
         {
-            if (table.overrides.containsKey(f.getName()))
-                continue;
-
-            String q = "SELECT * FROM vts.settings WHERE name = '"+f.getName()+'\'';
-            assertRowsNet(executeNet(q), new Object[] {f.getName(), getValue(f)});
+            String name = e.getKey();
+            Property prop = e.getValue();
+            String q = "SELECT * FROM vts.settings WHERE name = '"+name+'\'';
+            assertRowsNet(executeNet(q), new Object[] { name, table.getValue(prop) });
         }
     }
 
@@ -126,10 +115,51 @@ public class SettingsTableTest extends CQLTester
         assertRowsNet(executeNet(q));
     }
 
+    @Test
+    public void virtualTableBackwardCompatibility() throws Throwable
+    {
+        // test NEGATIVE_MEBIBYTES_DATA_STORAGE_INT converter
+        String q = "SELECT * FROM vts.settings WHERE name = 'sstable_preemptive_open_interval';";
+        assertRowsNet(executeNet(q), new Object[] {"sstable_preemptive_open_interval", null});
+        q = "SELECT * FROM vts.settings WHERE name = 'sstable_preemptive_open_interval_in_mb';";
+        assertRowsNet(executeNet(q), new Object[] {"sstable_preemptive_open_interval_in_mb", "-1"});
+
+        // test MINUTES_CUSTOM_DURATION converter
+        q = "SELECT * FROM vts.settings WHERE name = 'index_summary_resize_interval';";
+        assertRowsNet(executeNet(q), new Object[] {"index_summary_resize_interval", null});
+        q = "SELECT * FROM vts.settings WHERE name = 'index_summary_resize_interval_in_minutes';";
+        assertRowsNet(executeNet(q), new Object[] {"index_summary_resize_interval_in_minutes", "-1"});
+
+        // test NEGATIVE_SECONDS_DURATION converter
+        q = "SELECT * FROM vts.settings WHERE name = 'cache_load_timeout';";
+        assertRowsNet(executeNet(q), new Object[] {"cache_load_timeout", "0s"});
+        q = "SELECT * FROM vts.settings WHERE name = 'cache_load_timeout_seconds';";
+        assertRowsNet(executeNet(q), new Object[] {"cache_load_timeout_seconds", "0"});
+
+        // test MILLIS_DURATION_DOUBLE converter
+        q = "SELECT * FROM vts.settings WHERE name = 'commitlog_sync_group_window';";
+        assertRowsNet(executeNet(q), new Object[] {"commitlog_sync_group_window", "0ms"});
+        q = "SELECT * FROM vts.settings WHERE name = 'commitlog_sync_group_window_in_ms';";
+        assertRowsNet(executeNet(q), new Object[] {"commitlog_sync_group_window_in_ms", "0.0"});
+
+        //test MILLIS_CUSTOM_DURATION converter
+        q = "SELECT * FROM vts.settings WHERE name = 'credentials_update_interval';";
+        assertRowsNet(executeNet(q), new Object[] {"credentials_update_interval", null});
+        q = "SELECT * FROM vts.settings WHERE name = 'credentials_update_interval_in_ms';";
+        assertRowsNet(executeNet(q), new Object[] {"credentials_update_interval_in_ms", "-1"});
+    }
+
     private void check(String setting, String expected) throws Throwable
     {
         String q = "SELECT * FROM vts.settings WHERE name = '"+setting+'\'';
-        assertRowsNet(executeNet(q), new Object[] {setting, expected});
+        try
+        {
+            assertRowsNet(executeNet(q), new Object[] {setting, expected});
+        }
+        catch (AssertionError e)
+        {
+            throw new AssertionError(e.getMessage() + " for query " + q);
+        }
     }
 
     @Test
@@ -140,7 +170,8 @@ public class SettingsTableTest extends CQLTester
         String all = "SELECT * FROM vts.settings WHERE " +
                      "name > 'server_encryption' AND name < 'server_encryptionz' ALLOW FILTERING";
 
-        Assert.assertEquals(9, executeNet(all).all().size());
+        List<String> expectedNames = SettingsTable.PROPERTIES.keySet().stream().filter(n -> n.startsWith("server_encryption")).collect(Collectors.toList());
+        Assert.assertEquals(expectedNames.size(), executeNet(all).all().size());
 
         check(pre + "algorithm", null);
         config.server_encryption_options = config.server_encryption_options.withAlgorithm("SUPERSSL");
@@ -150,6 +181,7 @@ public class SettingsTableTest extends CQLTester
         config.server_encryption_options = config.server_encryption_options.withCipherSuites("c1", "c2");
         check(pre + "cipher_suites", "[c1, c2]");
 
+        // name doesn't match yaml
         check(pre + "protocol", null);
         config.server_encryption_options = config.server_encryption_options.withProtocol("TLSv5");
         check(pre + "protocol", "[TLSv5]");
@@ -169,10 +201,12 @@ public class SettingsTableTest extends CQLTester
         config.server_encryption_options = config.server_encryption_options.withOptional(true);
         check(pre + "optional", "true");
 
+        // name doesn't match yaml
         check(pre + "client_auth", "false");
-        config.server_encryption_options = config.server_encryption_options.withRequireClientAuth(true);
+        config.server_encryption_options = config.server_encryption_options.withRequireClientAuth(REQUIRED);
         check(pre + "client_auth", "true");
 
+        // name doesn't match yaml
         check(pre + "endpoint_verification", "false");
         config.server_encryption_options = config.server_encryption_options.withRequireEndpointVerification(true);
         check(pre + "endpoint_verification", "true");
@@ -182,6 +216,7 @@ public class SettingsTableTest extends CQLTester
         check(pre + "internode_encryption", "all");
         check(pre + "enabled", "true");
 
+        // name doesn't match yaml
         check(pre + "legacy_ssl_storage_port", "false");
         config.server_encryption_options = config.server_encryption_options.withLegacySslStoragePort(true);
         check(pre + "legacy_ssl_storage_port", "true");
@@ -196,9 +231,11 @@ public class SettingsTableTest extends CQLTester
                      "name > 'audit_logging' AND name < 'audit_loggingz' ALLOW FILTERING";
 
         config.audit_logging_options.enabled = true;
-        Assert.assertEquals(9, executeNet(all).all().size());
+        List<String> expectedNames = SettingsTable.PROPERTIES.keySet().stream().filter(n -> n.startsWith("audit_logging")).collect(Collectors.toList());
+        Assert.assertEquals(expectedNames.size(), executeNet(all).all().size());
         check(pre + "enabled", "true");
 
+        // name doesn't match yaml
         check(pre + "logger", "BinAuditLogger");
         config.audit_logging_options.logger = new ParameterizedClass("logger", null);
         check(pre + "logger", "logger");
@@ -241,7 +278,8 @@ public class SettingsTableTest extends CQLTester
                      "name < 'transparent_data_encryption_optionsz' ALLOW FILTERING";
 
         config.transparent_data_encryption_options.enabled = true;
-        Assert.assertEquals(4, executeNet(all).all().size());
+        List<String> expectedNames = SettingsTable.PROPERTIES.keySet().stream().filter(n -> n.startsWith("transparent_data_encryption_options")).collect(Collectors.toList());
+        Assert.assertEquals(expectedNames.size(), executeNet(all).all().size());
         check(pre + "enabled", "true");
 
         check(pre + "cipher", "AES/CBC/PKCS5Padding");

@@ -41,6 +41,7 @@ import org.apache.cassandra.net.LatencyConsumer;
 import org.apache.cassandra.utils.StatusLogger;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static org.apache.cassandra.metrics.CassandraMetricsRegistry.DEFAULT_TIMER_UNIT;
 import static org.apache.cassandra.metrics.CassandraMetricsRegistry.Metrics;
 
 /**
@@ -48,7 +49,8 @@ import static org.apache.cassandra.metrics.CassandraMetricsRegistry.Metrics;
  */
 public class MessagingMetrics implements InboundMessageHandlers.GlobalMetricCallbacks
 {
-    private static final MetricNameFactory factory = new DefaultNameFactory("Messaging");
+    public static final String TYPE_NAME = "Messaging";
+    private static final MetricNameFactory factory = new DefaultNameFactory(TYPE_NAME);
     private static final Logger logger = LoggerFactory.getLogger(MessagingMetrics.class);
     private static final int LOG_DROPPED_INTERVAL_IN_MS = 5000;
     
@@ -209,8 +211,8 @@ public class MessagingMetrics implements InboundMessageHandlers.GlobalMetricCall
                                       LOG_DROPPED_INTERVAL_IN_MS,
                                       droppedInternal,
                                       droppedCrossNode,
-                                      TimeUnit.NANOSECONDS.toMillis((long) droppedForVerb.metrics.internalDroppedLatency.getSnapshot().getMean()),
-                                      TimeUnit.NANOSECONDS.toMillis((long) droppedForVerb.metrics.crossNodeDroppedLatency.getSnapshot().getMean())));
+                                      DEFAULT_TIMER_UNIT.toMillis((long) droppedForVerb.metrics.internalDroppedLatency.getSnapshot().getMean()),
+                                      DEFAULT_TIMER_UNIT.toMillis((long) droppedForVerb.metrics.crossNodeDroppedLatency.getSnapshot().getMean())));
                 ++count;
             }
         }

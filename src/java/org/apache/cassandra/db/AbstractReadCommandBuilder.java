@@ -36,14 +36,14 @@ import org.apache.cassandra.utils.FBUtilities;
 public abstract class AbstractReadCommandBuilder
 {
     protected final ColumnFamilyStore cfs;
-    protected int nowInSeconds;
+    protected long nowInSeconds;
 
     private int cqlLimit = -1;
     private int pagingLimit = -1;
     protected boolean reversed = false;
 
     protected Set<ColumnIdentifier> columns;
-    protected final RowFilter filter = RowFilter.create();
+    protected final RowFilter filter = RowFilter.create(true);
 
     private ClusteringBound<?> lowerClusteringBound;
     private ClusteringBound<?> upperClusteringBound;
@@ -57,7 +57,7 @@ public abstract class AbstractReadCommandBuilder
         this.nowInSeconds = FBUtilities.nowInSeconds();
     }
 
-    public AbstractReadCommandBuilder withNowInSeconds(int nowInSec)
+    public AbstractReadCommandBuilder withNowInSeconds(long nowInSec)
     {
         this.nowInSeconds = nowInSec;
         return this;

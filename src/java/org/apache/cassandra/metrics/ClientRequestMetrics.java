@@ -31,16 +31,19 @@ import static org.apache.cassandra.metrics.CassandraMetricsRegistry.Metrics;
 
 public class ClientRequestMetrics extends LatencyMetrics
 {
+    public static final String TYPE_NAME = "ClientRequest";
     public final Meter timeouts;
     public final Meter unavailables;
     public final Meter failures;
     public final Meter aborts;
     public final Meter tombstoneAborts;
     public final Meter readSizeAborts;
+    public final Meter localRequests;
+    public final Meter remoteRequests;
 
     public ClientRequestMetrics(String scope)
     {
-        super("ClientRequest", scope);
+        super(TYPE_NAME, scope);
 
         timeouts = Metrics.meter(factory.createMetricName("Timeouts"));
         unavailables = Metrics.meter(factory.createMetricName("Unavailables"));
@@ -48,6 +51,8 @@ public class ClientRequestMetrics extends LatencyMetrics
         aborts = Metrics.meter(factory.createMetricName("Aborts"));
         tombstoneAborts = Metrics.meter(factory.createMetricName("TombstoneAborts"));
         readSizeAborts = Metrics.meter(factory.createMetricName("ReadSizeAborts"));
+        localRequests = Metrics.meter(factory.createMetricName("LocalRequests"));
+        remoteRequests = Metrics.meter(factory.createMetricName("RemoteRequests"));
     }
 
     public void markAbort(Throwable cause)
@@ -74,5 +79,7 @@ public class ClientRequestMetrics extends LatencyMetrics
         Metrics.remove(factory.createMetricName("Aborts"));
         Metrics.remove(factory.createMetricName("TombstoneAborts"));
         Metrics.remove(factory.createMetricName("ReadSizeAborts"));
+        Metrics.remove(factory.createMetricName("LocalRequests"));
+        Metrics.remove(factory.createMetricName("RemoteRequests"));
     }
 }

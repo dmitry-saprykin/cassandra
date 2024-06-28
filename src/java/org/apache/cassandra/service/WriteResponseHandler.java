@@ -18,13 +18,17 @@
 package org.apache.cassandra.service;
 
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+import java.util.function.Supplier;
 
+import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.locator.ReplicaPlan;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.net.Message;
 import org.apache.cassandra.db.WriteType;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.transport.Dispatcher;
 
 /**
  * Handles blocking writes for ONE, ANY, TWO, THREE, QUORUM, and ALL consistency levels.
@@ -37,22 +41,24 @@ public class WriteResponseHandler<T> extends AbstractWriteResponseHandler<T>
     private static final AtomicIntegerFieldUpdater<WriteResponseHandler> responsesUpdater
             = AtomicIntegerFieldUpdater.newUpdater(WriteResponseHandler.class, "responses");
 
-    public WriteResponseHandler(ReplicaPlan.ForTokenWrite replicaPlan,
+    public WriteResponseHandler(ReplicaPlan.ForWrite replicaPlan,
                                 Runnable callback,
                                 WriteType writeType,
-                                long queryStartNanoTime)
+                                Supplier<Mutation> hintOnFailure,
+                                Dispatcher.RequestTime requestTime)
     {
-        super(replicaPlan, callback, writeType, queryStartNanoTime);
+        super(replicaPlan, callback, writeType, hintOnFailure, requestTime);
         responses = blockFor();
     }
 
-    public WriteResponseHandler(ReplicaPlan.ForTokenWrite replicaPlan, WriteType writeType, long queryStartNanoTime)
+    public WriteResponseHandler(ReplicaPlan.ForWrite replicaPlan, WriteType writeType, Supplier<Mutation> hintOnFailure, Dispatcher.RequestTime requestTime)
     {
-        this(replicaPlan, null, writeType, queryStartNanoTime);
+        this(replicaPlan, null, writeType, hintOnFailure, requestTime);
     }
 
     public void onResponse(Message<T> m)
     {
+        replicaPlan.collectSuccess(m == null ? FBUtilities.getBroadcastAddressAndPort() : m.from());
         if (responsesUpdater.decrementAndGet(this) == 0)
             signal();
         //Must be last after all subclass processing

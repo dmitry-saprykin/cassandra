@@ -23,11 +23,13 @@ import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Random;
 import java.util.TreeMap;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -36,21 +38,36 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 import com.google.common.primitives.Ints;
-
+import com.vdurmont.semver4j.Semver;
 import org.junit.Assert;
+import org.junit.Assume;
 import org.junit.Test;
-
-import org.apache.cassandra.db.marshal.*;
-import org.apache.cassandra.dht.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.db.marshal.ListType;
+import org.apache.cassandra.db.marshal.UUIDType;
+import org.apache.cassandra.dht.ByteOrderedPartitioner;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.LengthPartitioner;
+import org.apache.cassandra.dht.LocalPartitioner;
+import org.apache.cassandra.dht.Murmur3Partitioner;
+import org.apache.cassandra.dht.OrderPreservingPartitioner;
+import org.apache.cassandra.dht.RandomPartitioner;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.fail;
 
 public class FBUtilitiesTest
 {
+
+    public static final Logger LOGGER = LoggerFactory.getLogger(FBUtilitiesTest.class);
+
     @Test
     public void testCompareByteSubArrays()
     {
@@ -156,7 +173,7 @@ public class FBUtilitiesTest
                 IPartitioner partitioner = FBUtilities.newPartitioner(name, Optional.of(type));
                 Assert.assertTrue(String.format("%s != LocalPartitioner", partitioner.toString()),
                                   LocalPartitioner.class.isInstance(partitioner));
-                Assert.assertEquals(partitioner.partitionOrdering(), type);
+                Assert.assertEquals(partitioner.partitionOrdering(null), type);
             }
     }
 
@@ -226,5 +243,177 @@ public class FBUtilitiesTest
         {
             executor.shutdown();
         }
+    }
+
+    @Test
+    public void testCamelToSnake()
+    {
+        AssertionError error = null;
+        for (Pair<String, String> a : Arrays.asList(Pair.create("Testing", "testing"),
+                                                    Pair.create("fooBarBaz", "foo_bar_baz"),
+                                                    Pair.create("foo_bar_baz", "foo_bar_baz"),
+                                                    Pair.create("TCM", "tcm")
+        ))
+        {
+            try
+            {
+                assertThat(FBUtilities.camelToSnake(a.left)).isEqualTo(a.right);
+            }
+            catch (AssertionError e)
+            {
+                if (error == null)
+                    error = e;
+                else
+                    error.addSuppressed(e);
+            }
+        }
+        if (error != null)
+            throw error;
+    }
+
+    @Test
+    public void testPrettyPrintAndParse()
+    {
+        String[] tests = new String[]{
+        "1", "", "", "1",
+        "1K", "", "", "1e3",
+        "1 KiB", " ", "B", "1024",
+        "10 B/s", " ", "B/s", "10",
+        "10.2 MiB/s", null, "B/s", "10695475.2",
+        "10e+5", "", "", "10e5",
+        "10*2^20", "", "", "10485760",
+        "1024*2^-10", "", "", "1",
+        "1024 miB", " ", "B", "1",
+        "1000000um", "", "m", "1",
+        "10e+25s", "", "s", "10e25",
+        "1.12345e-25", "", "", "1.12345e-25",
+        "10e+45", "", "", "10e45",
+        "1.12345e-45", "", "", "1.12345e-45",
+        "55.3 garbage", null, null, "55.3",
+        "0.00TiB", "", "B", "0",
+        "-23", null, null, "-23",
+        "-55 Gt", " ", "t", "-55e9",
+        "-123e+3", null, null, "-123000",
+        "-876ns", "", "s", "-876e-9",
+        Long.toString(Long.MAX_VALUE), null, null, Long.toString(Long.MAX_VALUE),
+        Long.toString(Long.MIN_VALUE), null, null, Long.toString(Long.MIN_VALUE),
+        "Infinity Kg", " ", "Kg", "+Infinity",
+        "NaN", "", "", "NaN",
+        "-Infinity", "", "", "-Infinity",
+        };
+
+        for (int i = 0; i < tests.length; i += 4)
+        {
+            String v = tests[i];
+            String sep = tests[i + 1];
+            String unit = tests[i + 2];
+            double exp = Double.parseDouble(tests[i+3]);
+            String vBin = FBUtilities.prettyPrintBinary(exp, unit == null ? "" : unit, sep == null ? " " : sep);
+            String vDec = FBUtilities.prettyPrintDecimal(exp, unit == null ? "w" : unit, sep == null ? "\t" : sep);
+            LOGGER.info("{} binary {} decimal {} expected {}", v, vBin, vDec, exp);
+            Assert.assertEquals(exp, FBUtilities.parseHumanReadable(v, sep, unit), getDelta(exp));
+            Assert.assertEquals(exp, FBUtilities.parseHumanReadable(vBin, sep, unit), getDelta(exp));
+            Assert.assertEquals(exp, FBUtilities.parseHumanReadable(vDec, sep, unit), getDelta(exp));
+
+            if (((long) exp) == exp)
+                Assert.assertEquals(exp,
+                                    FBUtilities.parseHumanReadable(FBUtilities.prettyPrintMemory((long) exp),
+                                                                   null,
+                                                                   "B"),
+                                    getDelta(exp));
+        }
+    }
+
+    private static double getDelta(double exp)
+    {
+        return Math.max(0.001 * Math.abs(exp), 1e-305);
+    }
+
+    @Test
+    public void testPrettyPrintAndParseRange()
+    {
+        String unit = "";
+        String sep = "";
+        for (int exp = -100; exp < 100; ++exp)
+        {
+            for (double base = -1.0; base <= 1.0; base += 0.12) // avoid hitting 0 exactly
+            {
+                for (boolean binary : new boolean[] {false, true})
+                {
+                    double value = binary
+                                   ? Math.scalb(base, exp * 10)
+                                   : base * Math.pow(10, exp);
+                    String vBin = FBUtilities.prettyPrintBinary(value, unit, sep);
+                    String vDec = FBUtilities.prettyPrintDecimal(value, unit, sep);
+                    LOGGER.info("{} binary {} decimal {}", value, vBin, vDec);
+                    Assert.assertEquals(value, FBUtilities.parseHumanReadable(vBin, sep, unit), getDelta(value));
+                    Assert.assertEquals(value, FBUtilities.parseHumanReadable(vDec, sep, unit), getDelta(value));
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testPrettyPrintAndParseRandom()
+    {
+        Random rand = new Random();
+        String unit = "";
+        String sep = "";
+        for (int i = 0; i < 1000; ++i)
+        {
+            long bits = rand.nextLong();
+            double value = Double.longBitsToDouble(bits);
+            if (Double.isNaN(value))
+                value = Double.NaN; // to avoid failures on non-bitwise-equal NaNs
+            String vBin = FBUtilities.prettyPrintBinary(value, unit, sep);
+            String vDec = FBUtilities.prettyPrintDecimal(value, unit, sep);
+            LOGGER.info("{} binary {} decimal {}", value, vBin, vDec);
+            Assert.assertEquals(value, FBUtilities.parseHumanReadable(vBin, sep, unit), getDelta(value));
+            Assert.assertEquals(value, FBUtilities.parseHumanReadable(vDec, sep, unit), getDelta(value));
+        }
+    }
+
+    @Test
+    public void testPrettyPrintLatency()
+    {
+        Assert.assertEquals("5000.000 ms", FBUtilities.prettyPrintLatency(5000));
+        Assert.assertEquals("100.000 ms", FBUtilities.prettyPrintLatency(100));
+        Assert.assertEquals("0.050 ms", FBUtilities.prettyPrintLatency(0.05));
+        Assert.assertEquals("0.001 ms", FBUtilities.prettyPrintLatency(0.0005));
+        Assert.assertEquals("0.000 ms", FBUtilities.prettyPrintLatency(0.0004));
+        Assert.assertEquals("NaN ms", FBUtilities.prettyPrintLatency(Double.NaN));
+        Assert.assertEquals("Infinity ms", FBUtilities.prettyPrintLatency(Double.POSITIVE_INFINITY));
+    }
+
+    @Test
+    public void testPrettyPrintRatio()
+    {
+        Assert.assertEquals("10.000", FBUtilities.prettyPrintRatio(10));
+        Assert.assertEquals("1.000", FBUtilities.prettyPrintRatio(1));
+        Assert.assertEquals("0.050", FBUtilities.prettyPrintRatio(0.05));
+        Assert.assertEquals("0.001", FBUtilities.prettyPrintRatio(0.0005));
+        Assert.assertEquals("0.000", FBUtilities.prettyPrintRatio(0.0004));
+        Assert.assertEquals("NaN", FBUtilities.prettyPrintRatio(Double.NaN));
+        Assert.assertEquals("Infinity", FBUtilities.prettyPrintRatio(Double.POSITIVE_INFINITY));
+    }
+
+    @Test
+    public void testPrettyPrintAverage()
+    {
+        Assert.assertEquals("100500.00", FBUtilities.prettyPrintAverage(100500));
+        Assert.assertEquals("1.50", FBUtilities.prettyPrintAverage(1.5));
+        Assert.assertEquals("0.05", FBUtilities.prettyPrintAverage(0.05));
+        Assert.assertEquals("0.00", FBUtilities.prettyPrintAverage(0.00));
+        Assert.assertEquals("NaN", FBUtilities.prettyPrintAverage(Double.NaN));
+        Assert.assertEquals("Infinity", FBUtilities.prettyPrintAverage(Double.POSITIVE_INFINITY));
+    }
+
+    @Test
+    public void testGetKernelVersion()
+    {
+        Assume.assumeTrue(FBUtilities.isLinux);
+        Semver kernelVersion = FBUtilities.getKernelVersion();
+        assertThat(kernelVersion).isGreaterThan(new Semver("0.0.0", Semver.SemverType.LOOSE));
+        assertThat(kernelVersion).isLessThan(new Semver("100.0.0", Semver.SemverType.LOOSE));
     }
 }

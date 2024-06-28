@@ -17,9 +17,9 @@
  */
 package org.apache.cassandra.cql3.validation.operations;
 
-import java.io.File;
 import java.util.List;
 
+import org.apache.cassandra.io.util.File;
 import org.junit.Test;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
@@ -33,6 +33,9 @@ import org.apache.cassandra.schema.TableId;
 
 public class DropRecreateAndRestoreTest extends CQLTester
 {
+    // don't run CQLTester after test, commitlog is messed up by testCreateWithIdRestore and we now need to commit a ForceSnapshot when resetting the CMS
+    public void afterTest() {}
+
     @Test
     public void testCreateWithIdRestore() throws Throwable
     {

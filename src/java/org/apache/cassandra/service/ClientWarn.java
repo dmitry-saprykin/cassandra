@@ -17,17 +17,15 @@
  */
 package org.apache.cassandra.service;
 
-import java.util.ArrayList;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.List;
 
-import io.netty.util.concurrent.FastThreadLocal;
-import org.apache.cassandra.concurrent.ExecutorLocal;
+import org.apache.cassandra.concurrent.ExecutorLocals;
 import org.apache.cassandra.utils.FBUtilities;
 
-public class ClientWarn implements ExecutorLocal<ClientWarn.State>
+public class ClientWarn extends ExecutorLocals.Impl
 {
     private static final String TRUNCATED = " [truncated]";
-    private static final FastThreadLocal<State> warnLocal = new FastThreadLocal<>();
     public static ClientWarn instance = new ClientWarn();
 
     private ClientWarn()
@@ -36,51 +34,69 @@ public class ClientWarn implements ExecutorLocal<ClientWarn.State>
 
     public State get()
     {
-        return warnLocal.get();
+        return ExecutorLocals.current().clientWarnState;
     }
 
     public void set(State value)
     {
-        warnLocal.set(value);
+        ExecutorLocals current = ExecutorLocals.current();
+        ExecutorLocals.Impl.set(current.traceState, value);
     }
 
     public void warn(String text)
     {
-        State state = warnLocal.get();
+        State state = get();
         if (state != null)
             state.add(text);
     }
 
     public void captureWarnings()
     {
-        warnLocal.set(new State());
+        set(new State());
+    }
+
+    /**
+     * Provides an additional control on capturing warnings. When executing SchemaTransformations in the
+     * metadata log follower or when committing on a CMS member, we don't want these to be triggered.
+     * @see org.apache.cassandra.schema.SchemaTransformation#enterExecution()
+     **/
+    public void pauseCapture()
+    {
+        State state = get();
+        if (state != null)
+            state.collecting = false;
+    }
+
+    public void resumeCapture()
+    {
+        State state = get();
+        if (state != null)
+            state.collecting = true;
     }
 
     public List<String> getWarnings()
     {
-        State state = warnLocal.get();
+        State state = get();
         if (state == null || state.warnings.isEmpty())
             return null;
         return state.warnings;
     }
 
-    public int numWarnings()
-    {
-        return getWarnings() == null ? 0 : getWarnings().size();
-    }
-
     public void resetWarnings()
     {
-        warnLocal.remove();
+        set(null);
     }
 
     public static class State
     {
-        private final List<String> warnings = new ArrayList<>();
+        private boolean collecting = true;
+        // This must be a thread-safe list. Even though it's wrapped in a ThreadLocal, it's propagated to each thread
+        // from shared state, so multiple threads can reference the same State.
+        private final List<String> warnings = new CopyOnWriteArrayList<>();
 
         private void add(String warning)
         {
-            if (warnings.size() < FBUtilities.MAX_UNSIGNED_SHORT)
+            if (collecting && warnings.size() < FBUtilities.MAX_UNSIGNED_SHORT)
                 warnings.add(maybeTruncate(warning));
         }
 
@@ -90,6 +106,5 @@ public class ClientWarn implements ExecutorLocal<ClientWarn.State>
                    ? warning.substring(0, FBUtilities.MAX_UNSIGNED_SHORT - TRUNCATED.length()) + TRUNCATED
                    : warning;
         }
-
     }
 }

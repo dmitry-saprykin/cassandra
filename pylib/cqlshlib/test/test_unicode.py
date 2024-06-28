@@ -15,13 +15,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import unicode_literals, with_statement
-
 import os
-import subprocess
 
 from .basecase import BaseTestCase
-from .cassconnect import (get_cassandra_connection, create_keyspace, testrun_cqlsh)
+from .cassconnect import (get_cassandra_connection, create_keyspace, remove_db, cqlsh_testrun)
+from cqlshlib.formatting import UNICODE_CONTROLCHARS_RE
 
 
 class TestCqlshUnicode(BaseTestCase):
@@ -37,8 +35,12 @@ class TestCqlshUnicode(BaseTestCase):
         env['LC_CTYPE'] = 'UTF-8'
         cls.default_env = env
 
+    @classmethod
+    def tearDownClass(cls):
+        remove_db()
+
     def test_unicode_value_round_trip(self):
-        with testrun_cqlsh(tty=True, env=self.default_env) as c:
+        with cqlsh_testrun(tty=True, env=self.default_env) as c:
             value = 'ϑΉӁװڜ'
             c.cmd_and_response("INSERT INTO t(k, v) VALUES (1, '%s');" % (value,))
             output = c.cmd_and_response('SELECT * FROM t;')
@@ -46,7 +48,7 @@ class TestCqlshUnicode(BaseTestCase):
 
     def test_unicode_identifier(self):
         col_name = 'テスト'
-        with testrun_cqlsh(tty=True, env=self.default_env) as c:
+        with cqlsh_testrun(tty=True, env=self.default_env) as c:
             c.cmd_and_response('ALTER TABLE t ADD "%s" int;' % (col_name,))
             # describe command reproduces name
             output = c.cmd_and_response('DESC t')
@@ -57,7 +59,7 @@ class TestCqlshUnicode(BaseTestCase):
             self.assertIn(col_name, output)
 
     def test_unicode_multiline_input(self):  # CASSANDRA-16400
-        with testrun_cqlsh(tty=True, env=self.default_env) as c:
+        with cqlsh_testrun(tty=True, env=self.default_env) as c:
             value = '値'
             c.send("INSERT INTO t(k, v) VALUES (1, \n'%s');\n" % (value,))
             c.read_to_next_prompt()
@@ -65,11 +67,14 @@ class TestCqlshUnicode(BaseTestCase):
             self.assertIn(value, output)
 
     def test_unicode_desc(self):  # CASSANDRA-16539
-        with testrun_cqlsh(tty=True, env=self.default_env) as c:
+        with cqlsh_testrun(tty=True, env=self.default_env) as c:
             v1 = 'ࠑ'
             v2 = 'Ξ'
             output = c.cmd_and_response('CREATE TYPE "%s" ( "%s" int );' % (v1, v2))
             output = c.cmd_and_response('DESC TYPES;')
             self.assertIn(v1, output)
-            output = c.cmd_and_response('DESC TYPE "%s";' %(v1,))
+            output = c.cmd_and_response('DESC TYPE "%s";' % (v1,))
             self.assertIn(v2, output)
+
+    def test_unicode_esc(self):  # CASSANDRA-17617
+        self.assertFalse(UNICODE_CONTROLCHARS_RE.match("01"))

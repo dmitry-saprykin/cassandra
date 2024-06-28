@@ -24,8 +24,6 @@ import java.util.*;
 
 import org.junit.BeforeClass;
 import org.junit.Test;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
 
 import org.apache.cassandra.*;
 import org.apache.cassandra.cql3.statements.schema.CreateTableStatement;
@@ -51,7 +49,6 @@ import static org.apache.cassandra.cql3.QueryProcessor.executeInternal;
 import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
 import static org.junit.Assert.*;
 
-@RunWith(OrderedJUnit4ClassRunner.class)
 public class QueryPagerTest
 {
     public static final String KEYSPACE1 = "QueryPagerTest";
@@ -59,7 +56,7 @@ public class QueryPagerTest
     public static final String KEYSPACE_CQL = "cql_keyspace";
     public static final String CF_CQL = "table2";
     public static final String CF_CQL_WITH_STATIC = "with_static";
-    public static final int nowInSec = FBUtilities.nowInSeconds();
+    public static final long nowInSec = FBUtilities.nowInSeconds();
 
     @BeforeClass
     public static void defineSchema() throws ConfigurationException
@@ -176,7 +173,7 @@ public class QueryPagerTest
         Slice slice = Slice.make(cmp.make(start), cmp.make(end));
         ClusteringIndexSliceFilter filter = new ClusteringIndexSliceFilter(Slices.with(cmp, slice), reversed);
 
-        return SinglePartitionReadCommand.create(metadata, nowInSec, ColumnFilter.all(metadata), RowFilter.NONE, DataLimits.NONE, Util.dk(key), filter);
+        return SinglePartitionReadCommand.create(metadata, nowInSec, ColumnFilter.all(metadata), RowFilter.none(), DataLimits.NONE, Util.dk(key), filter);
     }
 
     private static ReadCommand rangeNamesQuery(String keyStart, String keyEnd, int count, String... names)
@@ -329,7 +326,7 @@ public class QueryPagerTest
 
     public void multiQueryTest(boolean testPagingState, ProtocolVersion protocolVersion)
     {
-        ReadQuery command = new SinglePartitionReadCommand.Group(new ArrayList<SinglePartitionReadCommand>()
+        ReadQuery command = SinglePartitionReadCommand.Group.create(new ArrayList<SinglePartitionReadCommand>()
         {{
             add(sliceQuery("k1", "c2", "c6", 10));
             add(sliceQuery("k4", "c3", "c5", 10));

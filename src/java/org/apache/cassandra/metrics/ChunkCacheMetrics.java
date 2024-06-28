@@ -21,6 +21,7 @@ import java.util.concurrent.TimeUnit;
 import javax.annotation.Nonnull;
 
 import com.codahale.metrics.Timer;
+import com.github.benmanes.caffeine.cache.RemovalCause;
 import com.github.benmanes.caffeine.cache.stats.CacheStats;
 import com.github.benmanes.caffeine.cache.stats.StatsCounter;
 import org.apache.cassandra.cache.ChunkCache;
@@ -32,6 +33,7 @@ import static org.apache.cassandra.metrics.CassandraMetricsRegistry.Metrics;
  */
 public class ChunkCacheMetrics extends CacheMetrics implements StatsCounter
 {
+    public static final String TYPE_NAME = "ChunkCache";
     /** Latency of misses */
     public final Timer missLatency;
 
@@ -42,7 +44,7 @@ public class ChunkCacheMetrics extends CacheMetrics implements StatsCounter
      */
     public ChunkCacheMetrics(ChunkCache cache)
     {
-        super("ChunkCache", cache);
+        super(TYPE_NAME, cache);
         missLatency = Metrics.timer(factory.createMetricName("MissLatency"));
     }
 
@@ -72,7 +74,7 @@ public class ChunkCacheMetrics extends CacheMetrics implements StatsCounter
     }
 
     @Override
-    public void recordEviction()
+    public void recordEviction(int weight, RemovalCause cause)
     {
     }
 
@@ -80,6 +82,6 @@ public class ChunkCacheMetrics extends CacheMetrics implements StatsCounter
     @Override
     public CacheStats snapshot()
     {
-        return new CacheStats(hits.getCount(), misses.getCount(), missLatency.getCount(), 0L, missLatency.getCount(), 0L, 0L);
+        return CacheStats.of(hits.getCount(), misses.getCount(), missLatency.getCount(), 0L, missLatency.getCount(), 0L, 0L);
     }
 }

@@ -17,26 +17,27 @@
  */
 package org.apache.cassandra.db.compaction;
 
-import java.io.File;
-import java.util.*;
+import java.util.Collections;
 import java.util.function.LongPredicate;
-import java.util.function.Predicate;
 
 import com.google.common.base.Throwables;
 import com.google.common.collect.Sets;
 
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.db.SerializationHeader;
-import org.apache.cassandra.io.sstable.*;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.SSTableRewriter;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.format.SSTableWriter;
 import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
 import org.apache.cassandra.io.sstable.metadata.StatsMetadata;
+import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.OutputHandler;
-import org.apache.cassandra.utils.UUIDGen;
+
+import static org.apache.cassandra.utils.TimeUUID.Generator.nextTimeUUID;
 
 public class Upgrader
 {
@@ -58,13 +59,13 @@ public class Upgrader
         this.sstable = txn.onlyOne();
         this.outputHandler = outputHandler;
 
-        this.directory = new File(sstable.getFilename()).getParentFile();
+        this.directory = new File(sstable.getFilename()).parent();
 
         this.controller = new UpgradeController(cfs);
 
         this.strategyManager = cfs.getCompactionStrategyManager();
-        long estimatedTotalKeys = Math.max(cfs.metadata().params.minIndexInterval, SSTableReader.getApproximateKeyCount(Arrays.asList(this.sstable)));
-        long estimatedSSTables = Math.max(1, SSTableReader.getTotalBytes(Arrays.asList(this.sstable)) / strategyManager.getMaxSSTableBytes());
+        long estimatedTotalKeys = Math.max(cfs.metadata().params.minIndexInterval, SSTableReader.getApproximateKeyCount(Collections.singletonList(this.sstable)));
+        long estimatedSSTables = Math.max(1, SSTableReader.getTotalBytes(Collections.singletonList(this.sstable)) / strategyManager.getMaxSSTableBytes());
         this.estimatedRows = (long) Math.ceil((double) estimatedTotalKeys / estimatedSSTables);
     }
 
@@ -72,27 +73,31 @@ public class Upgrader
     {
         MetadataCollector sstableMetadataCollector = new MetadataCollector(cfs.getComparator());
         sstableMetadataCollector.sstableLevel(sstable.getSSTableLevel());
-        return SSTableWriter.create(cfs.newSSTableDescriptor(directory),
-                                    estimatedRows,
-                                    metadata.repairedAt,
-                                    metadata.pendingRepair,
-                                    metadata.isTransient,
-                                    cfs.metadata,
-                                    sstableMetadataCollector,
-                                    SerializationHeader.make(cfs.metadata(), Sets.newHashSet(sstable)),
-                                    cfs.indexManager.listIndexes(),
-                                    transaction);
+
+        Descriptor descriptor = cfs.newSSTableDescriptor(directory);
+        return descriptor.getFormat().getWriterFactory().builder(descriptor)
+                         .setKeyCount(estimatedRows)
+                         .setRepairedAt(metadata.repairedAt)
+                         .setPendingRepair(metadata.pendingRepair)
+                         .setTransientSSTable(metadata.isTransient)
+                         .setTableMetadataRef(cfs.metadata)
+                         .setMetadataCollector(sstableMetadataCollector)
+                         .setSerializationHeader(SerializationHeader.make(cfs.metadata(), Sets.newHashSet(sstable)))
+                         .addDefaultComponents(cfs.indexManager.listIndexGroups())
+                         .setSecondaryIndexGroups(cfs.indexManager.listIndexGroups())
+                         .build(transaction, cfs);
     }
 
     public void upgrade(boolean keepOriginals)
     {
         outputHandler.output("Upgrading " + sstable);
-        int nowInSec = FBUtilities.nowInSeconds();
+        long nowInSec = FBUtilities.nowInSeconds();
         try (SSTableRewriter writer = SSTableRewriter.construct(cfs, transaction, keepOriginals, CompactionTask.getMaxDataAge(transaction.originals()));
              AbstractCompactionStrategy.ScannerList scanners = strategyManager.getScanners(transaction.originals());
-             CompactionIterator iter = new CompactionIterator(transaction.opType(), scanners.scanners, controller, nowInSec, UUIDGen.getTimeUUID()))
+             CompactionIterator iter = new CompactionIterator(transaction.opType(), scanners.scanners, controller, nowInSec, nextTimeUUID()))
         {
             writer.switchWriter(createCompactionWriter(sstable.getSSTableMetadata()));
+            iter.setTargetDirectory(writer.currentWriter().getFilename());
             while (iter.hasNext())
                 writer.append(iter.next());
 
@@ -101,7 +106,8 @@ public class Upgrader
         }
         catch (Exception e)
         {
-            Throwables.propagate(e);
+            Throwables.throwIfUnchecked(e);
+            throw new RuntimeException(e);
         }
         finally
         {

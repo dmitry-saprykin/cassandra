@@ -19,7 +19,10 @@ package org.apache.cassandra.db;
 
 import java.util.*;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.Lists;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -29,13 +32,18 @@ import org.apache.cassandra.db.lifecycle.View;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
-import org.apache.cassandra.locator.TokenMetadata;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.SchemaChangeListener;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.tcm.ClusterMetadata;
+import org.apache.cassandra.tcm.membership.NodeId;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.concurrent.Refs;
+
+import static org.apache.cassandra.tcm.compatibility.TokenRingUtils.getAllRanges;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 
 /**
  * A very simplistic/crude partition count/size estimator.
@@ -46,7 +54,7 @@ import org.apache.cassandra.utils.concurrent.Refs;
  *
  * See CASSANDRA-7688.
  */
-public class SizeEstimatesRecorder extends SchemaChangeListener implements Runnable
+public class SizeEstimatesRecorder implements SchemaChangeListener, Runnable
 {
     private static final Logger logger = LoggerFactory.getLogger(SizeEstimatesRecorder.class);
 
@@ -59,8 +67,7 @@ public class SizeEstimatesRecorder extends SchemaChangeListener implements Runna
 
     public void run()
     {
-        TokenMetadata metadata = StorageService.instance.getTokenMetadata().cloneOnlyTokenMap();
-        if (!metadata.isMember(FBUtilities.getBroadcastAddressAndPort()))
+        if (!ClusterMetadata.current().directory.allAddresses().contains(FBUtilities.getBroadcastAddressAndPort()))
         {
             logger.debug("Node is not part of the ring; not recording size estimates");
             return;
@@ -70,6 +77,9 @@ public class SizeEstimatesRecorder extends SchemaChangeListener implements Runna
 
         for (Keyspace keyspace : Keyspace.nonLocalStrategy())
         {
+            if (keyspace.getMetadata().params.replication.isMeta())
+                continue;
+
             // In tools the call to describe_splits_ex() used to be coupled with the call to describe_local_ring() so
             // most access was for the local primary range; after creating the size_estimates table this was changed
             // to be the primary range.
@@ -85,11 +95,11 @@ public class SizeEstimatesRecorder extends SchemaChangeListener implements Runna
             // range.  If we publish multiple ranges downstream integrations may start to see duplicate data.
             // See CASSANDRA-15637
             Collection<Range<Token>> primaryRanges = StorageService.instance.getPrimaryRanges(keyspace.getName());
-            Collection<Range<Token>> localPrimaryRanges = StorageService.instance.getLocalPrimaryRange();
+            Collection<Range<Token>> localPrimaryRanges = getLocalPrimaryRange();
             boolean rangesAreEqual = primaryRanges.equals(localPrimaryRanges);
             for (ColumnFamilyStore table : keyspace.getColumnFamilyStores())
             {
-                long start = System.nanoTime();
+                long start = nanoTime();
 
                 // compute estimates for primary ranges for backwards compatability
                 Map<Range<Token>, Pair<Long, Long>> estimates = computeSizeEstimates(table, primaryRanges);
@@ -103,7 +113,7 @@ public class SizeEstimatesRecorder extends SchemaChangeListener implements Runna
                 }
                 SystemKeyspace.updateTableEstimates(table.metadata.keyspace, table.metadata.name, SystemKeyspace.TABLE_ESTIMATES_TYPE_LOCAL_PRIMARY, estimates);
 
-                long passed = System.nanoTime() - start;
+                long passed = nanoTime() - start;
                 if (logger.isTraceEnabled())
                     logger.trace("Spent {} milliseconds on estimating {}.{} size",
                                  TimeUnit.NANOSECONDS.toMillis(passed),
@@ -111,6 +121,33 @@ public class SizeEstimatesRecorder extends SchemaChangeListener implements Runna
                                  table.metadata.name);
             }
         }
+    }
+
+    @VisibleForTesting
+    public static Collection<Range<Token>> getLocalPrimaryRange()
+    {
+        ClusterMetadata metadata = ClusterMetadata.current();
+        NodeId localNodeId = metadata.myNodeId();
+        return getLocalPrimaryRange(metadata, localNodeId);
+    }
+
+    @VisibleForTesting
+    public static Collection<Range<Token>> getLocalPrimaryRange(ClusterMetadata metadata, NodeId nodeId)
+    {
+        String dc = metadata.directory.location(nodeId).datacenter;
+        Set<Token> tokens = new HashSet<>(metadata.tokenMap.tokens(nodeId));
+
+        // filter tokens to the single DC
+        List<Token> filteredTokens = Lists.newArrayList();
+        for (Token token : metadata.tokenMap.tokens())
+        {
+            NodeId owner = metadata.tokenMap.owner(token);
+            if (dc.equals(metadata.directory.location(owner).datacenter))
+                filteredTokens.add(token);
+        }
+        return getAllRanges(filteredTokens).stream()
+                                           .filter(t -> tokens.contains(t.right))
+                                           .collect(Collectors.toList());
     }
 
     @SuppressWarnings("resource")
@@ -175,8 +212,8 @@ public class SizeEstimatesRecorder extends SchemaChangeListener implements Runna
     }
 
     @Override
-    public void onDropTable(String keyspace, String table)
+    public void onDropTable(TableMetadata table, boolean dropData)
     {
-        SystemKeyspace.clearEstimates(keyspace, table);
+        SystemKeyspace.clearEstimates(table.keyspace, table.name);
     }
 }

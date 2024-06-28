@@ -33,15 +33,17 @@ import org.junit.Test;
 
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.UntypedResultSet;
-import org.apache.cassandra.db.SchemaCQLHelper;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.DecimalType;
+import org.apache.cassandra.db.marshal.DurationType;
 import org.apache.cassandra.db.marshal.TupleType;
+import org.apache.cassandra.utils.AbstractTypeGenerators;
 import org.apache.cassandra.utils.AbstractTypeGenerators.TypeSupport;
 import org.quicktheories.core.Gen;
 import org.quicktheories.generators.SourceDSL;
 
 import static org.apache.cassandra.db.SchemaCQLHelper.toCqlType;
 import static org.apache.cassandra.utils.AbstractTypeGenerators.getTypeSupport;
-import static org.apache.cassandra.utils.AbstractTypeGenerators.primitiveTypeGen;
 import static org.apache.cassandra.utils.AbstractTypeGenerators.tupleTypeGen;
 import static org.apache.cassandra.utils.FailingConsumer.orFail;
 import static org.apache.cassandra.utils.Generators.filter;
@@ -147,7 +149,7 @@ public class TupleTypeTest extends CQLTester
 
         assertInvalidSyntax("INSERT INTO %s (k, t) VALUES (0, ())");
 
-        assertInvalidMessage("Invalid tuple literal for t: too many elements. Type frozen<tuple<int, text, double>> expects 3 but got 4",
+        assertInvalidMessage("Expected 3 elements in value for tuple t, but got 4: (2, 'foo', 3.1, 'bar')",
                              "INSERT INTO %s (k, t) VALUES (0, (2, 'foo', 3.1, 'bar'))");
 
         createTable("CREATE TABLE %s (k int PRIMARY KEY, t frozen<tuple<int, tuple<int, text, double>>>)");
@@ -267,13 +269,12 @@ public class TupleTypeTest extends CQLTester
             for (ByteBuffer value : testcase.uniqueRows)
             {
                 map.put(value, count);
-                ByteBuffer[] tupleBuffers = tupleType.split(value);
+                Object[] tupleBuffers = tupleType.unpack(value).toArray();
 
-                // use cast to avoid warning
-                execute("INSERT INTO %s (id, value) VALUES (?, ?)", tuple((Object[]) tupleBuffers), count);
+                execute("INSERT INTO %s (id, value) VALUES (?, ?)", tuple(tupleBuffers), count);
 
-                assertRows(execute("SELECT * FROM %s WHERE id = ?", tuple((Object[]) tupleBuffers)),
-                           row(tuple((Object[]) tupleBuffers), count));
+                assertRows(execute("SELECT * FROM %s WHERE id = ?", tuple(tupleBuffers)),
+                           row(tuple(tupleBuffers), count));
                 count++;
             }
             assertRows(execute("SELECT * FROM %s LIMIT 100"),
@@ -300,19 +301,17 @@ public class TupleTypeTest extends CQLTester
             TupleType tupleType = testcase.type;
             createTable("CREATE TABLE %s (pk int, ck " + toCqlType(tupleType) + ", value int, PRIMARY KEY(pk, ck))" +
                         " WITH CLUSTERING ORDER BY (ck "+order.name()+")");
-            String cql = SchemaCQLHelper.getTableMetadataAsCQL(currentTableMetadata(), false, false, false);
             SortedMap<ByteBuffer, Integer> map = new TreeMap<>(order.apply(tupleType));
             int count = 0;
             for (ByteBuffer value : testcase.uniqueRows)
             {
                 map.put(value, count);
-                ByteBuffer[] tupleBuffers = tupleType.split(value);
+                Object[] tupleBuffers = tupleType.unpack(value).toArray();
 
-                // use cast to avoid warning
-                execute("INSERT INTO %s (pk, ck, value) VALUES (?, ?, ?)", 1, tuple((Object[]) tupleBuffers), count);
+                execute("INSERT INTO %s (pk, ck, value) VALUES (?, ?, ?)", 1, tuple(tupleBuffers), count);
 
-                assertRows(execute("SELECT * FROM %s WHERE pk = ? AND ck = ?", 1, tuple((Object[]) tupleBuffers)),
-                           row(1, tuple((Object[]) tupleBuffers), count));
+                assertRows(execute("SELECT * FROM %s WHERE pk = ? AND ck = ?", 1, tuple(tupleBuffers)),
+                           row(1, tuple(tupleBuffers), count));
                 count++;
             }
             UntypedResultSet results = execute("SELECT * FROM %s LIMIT 100");
@@ -334,7 +333,14 @@ public class TupleTypeTest extends CQLTester
 
     private static Gen<TypeAndRows> typesAndRowsGen(int numRows)
     {
-        Gen<TupleType> typeGen = tupleTypeGen(primitiveTypeGen(), SourceDSL.integers().between(1, 10));
+        Gen<AbstractType<?>> subTypeGen = AbstractTypeGenerators.builder()
+                                                                .withTypeKinds(AbstractTypeGenerators.TypeKind.PRIMITIVE)
+                                                                // ordering doesn't make sense for duration
+                                                                .withoutPrimitive(DurationType.instance)
+                                                                // data is "normalized" causing equality matches to fail
+                                                                .withoutPrimitive(DecimalType.instance)
+                                                                .build();
+        Gen<TupleType> typeGen = tupleTypeGen(subTypeGen, SourceDSL.integers().between(1, 10));
         Set<ByteBuffer> distinctRows = new HashSet<>(numRows); // reuse the memory
         Gen<TypeAndRows> gen = rnd -> {
             TypeAndRows c = new TypeAndRows();

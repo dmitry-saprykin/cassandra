@@ -26,6 +26,7 @@ import org.apache.cassandra.cql3.CQL3Type;
 import org.apache.cassandra.cql3.CQLStatement;
 import org.apache.cassandra.cql3.FieldIdentifier;
 import org.apache.cassandra.cql3.UTName;
+import org.apache.cassandra.db.guardrails.Guardrails;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.UserType;
 import org.apache.cassandra.schema.KeyspaceMetadata;
@@ -33,6 +34,7 @@ import org.apache.cassandra.schema.Keyspaces;
 import org.apache.cassandra.schema.Keyspaces.KeyspacesDiff;
 import org.apache.cassandra.schema.Types;
 import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.tcm.ClusterMetadata;
 import org.apache.cassandra.transport.Event.SchemaChange;
 import org.apache.cassandra.transport.Event.SchemaChange.Change;
 import org.apache.cassandra.transport.Event.SchemaChange.Target;
@@ -61,8 +63,22 @@ public final class CreateTypeStatement extends AlterSchemaStatement
         this.ifNotExists = ifNotExists;
     }
 
-    public Keyspaces apply(Keyspaces schema)
+    @Override
+    public void validate(ClientState state)
     {
+        super.validate(state);
+
+        Guardrails.fieldsPerUDT.guard(fieldNames.size(), typeName, false, state);
+
+        for (int i = 0; i < rawFieldTypes.size(); i++)
+        {
+            rawFieldTypes.get(i).validate(state, "Field " + fieldNames.get(i));
+        }
+    }
+
+    public Keyspaces apply(ClusterMetadata metadata)
+    {
+        Keyspaces schema = metadata.schema.getKeyspaces();
         KeyspaceMetadata keyspace = schema.getNullable(keyspaceName);
         if (null == keyspace)
             throw ire("Keyspace '%s' doesn't exist", keyspaceName);
@@ -106,7 +122,7 @@ public final class CreateTypeStatement extends AlterSchemaStatement
 
     public void authorize(ClientState client)
     {
-        client.ensureKeyspacePermission(keyspaceName, Permission.CREATE);
+        client.ensureAllTablesPermission(keyspaceName, Permission.CREATE);
     }
 
     @Override

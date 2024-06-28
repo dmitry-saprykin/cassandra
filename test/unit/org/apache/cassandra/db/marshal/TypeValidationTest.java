@@ -40,6 +40,7 @@ import java.util.UUID;
 import static org.apache.cassandra.utils.AbstractTypeGenerators.getTypeSupport;
 import static org.apache.cassandra.utils.AbstractTypeGenerators.primitiveTypeGen;
 import static org.apache.cassandra.utils.AbstractTypeGenerators.userTypeGen;
+import static org.apache.cassandra.utils.TimeUUID.Generator.nextTimeUUIDAsBytes;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.quicktheories.QuickTheory.qt;
 
@@ -61,7 +62,7 @@ public class TypeValidationTest
     @Test
     public void testValidTimeUUID()
     {
-        TimeUUIDType.instance.validate(ByteBuffer.wrap(UUIDGen.getTimeUUIDBytes()));
+        TimeUUIDType.instance.validate(ByteBuffer.wrap(nextTimeUUIDAsBytes()));
     }
 
     @Test
@@ -203,8 +204,8 @@ public class TypeValidationTest
         qt().forAll(tupleWithValueGen(baseGen)).checkAssert(pair -> {
             TupleType tuple = pair.left;
             ByteBuffer value = pair.right;
-            Assertions.assertThat(TupleType.buildValue(tuple.split(value)))
-                      .as("TupleType.buildValue(split(value)) == value")
+            Assertions.assertThat(tuple.pack(tuple.unpack(value)))
+                      .as("tuple.pack(tuple.unpack(value)) == value")
                       .isEqualTo(value);
         });
     }

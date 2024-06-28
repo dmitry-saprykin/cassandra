@@ -34,6 +34,7 @@ import org.junit.Test;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.commitlog.CommitLog;
+import org.apache.cassandra.distributed.test.log.ClusterMetadataTestHelper;
 import org.apache.cassandra.gms.GossipDigestSyn;
 import org.apache.cassandra.io.IVersionedAsymmetricSerializer;
 import org.apache.cassandra.io.IVersionedSerializer;
@@ -43,6 +44,7 @@ import org.apache.cassandra.locator.InetAddressAndPort;
 
 import static org.apache.cassandra.net.MessagingService.current_version;
 import static org.apache.cassandra.net.OutboundConnections.LARGE_MESSAGE_THRESHOLD;
+import static org.apache.cassandra.tcm.ClusterMetadata.EMPTY_METADATA_IDENTIFIER;
 
 public class OutboundConnectionsTest
 {
@@ -75,6 +77,7 @@ public class OutboundConnectionsTest
     public static void before()
     {
         DatabaseDescriptor.daemonInitialization();
+        ClusterMetadataTestHelper.setInstanceForTest();
         CommitLog.instance.start();
     }
 
@@ -94,7 +97,7 @@ public class OutboundConnectionsTest
     @Test
     public void getConnection_Gossip()
     {
-        GossipDigestSyn syn = new GossipDigestSyn("cluster", "partitioner", new ArrayList<>(0));
+        GossipDigestSyn syn = new GossipDigestSyn("cluster", "partitioner", EMPTY_METADATA_IDENTIFIER, new ArrayList<>(0));
         Message<GossipDigestSyn> message = Message.out(Verb.GOSSIP_DIGEST_SYN, syn);
         Assert.assertEquals(ConnectionType.URGENT_MESSAGES, connections.connectionFor(message).type());
     }

@@ -18,31 +18,25 @@
 
 package org.apache.cassandra.service.snapshot;
 
-import java.io.File;
-import java.io.IOException;
+import java.io.*;
 import java.time.Instant;
 import java.util.List;
 import java.util.Objects;
 
 import com.fasterxml.jackson.annotation.JsonAutoDetect;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.cassandra.config.Duration;
-import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
-import com.fasterxml.jackson.databind.DeserializationFeature;
+import org.apache.cassandra.config.DurationSpec;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.utils.JsonUtils;
 
 // Only serialize fields
 @JsonAutoDetect(fieldVisibility = JsonAutoDetect.Visibility.ANY,
                 getterVisibility = JsonAutoDetect.Visibility.NONE,
                 setterVisibility = JsonAutoDetect.Visibility.NONE)
+@JsonIgnoreProperties(ignoreUnknown = true)
 public class SnapshotManifest
 {
-    private static final ObjectMapper mapper = new ObjectMapper();
-    static {
-        mapper.registerModule(new JavaTimeModule());
-        mapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
-    }
-
     @JsonProperty("files")
     public final List<String> files;
 
@@ -52,19 +46,25 @@ public class SnapshotManifest
     @JsonProperty("expires_at")
     public final Instant expiresAt;
 
+    @JsonProperty("ephemeral")
+    public final boolean ephemeral;
+
     /** needed for jackson serialization */
     @SuppressWarnings("unused")
-    private SnapshotManifest() {
+    private SnapshotManifest()
+    {
         this.files = null;
         this.createdAt = null;
         this.expiresAt = null;
+        this.ephemeral = false;
     }
 
-    public SnapshotManifest(List<String> files, Duration ttl)
+    public SnapshotManifest(List<String> files, DurationSpec.IntSecondsBound ttl, Instant creationTime, boolean ephemeral)
     {
         this.files = files;
-        this.createdAt = Instant.now();
-        this.expiresAt = ttl == null ? null : createdAt.plusMillis(ttl.toMilliseconds());
+        this.createdAt = creationTime;
+        this.expiresAt = ttl == null ? null : createdAt.plusSeconds(ttl.toSeconds());
+        this.ephemeral = ephemeral;
     }
 
     public List<String> getFiles()
@@ -82,14 +82,19 @@ public class SnapshotManifest
         return expiresAt;
     }
 
+    public boolean isEphemeral()
+    {
+        return ephemeral;
+    }
+
     public void serializeToJsonFile(File outputFile) throws IOException
     {
-        mapper.writeValue(outputFile, this);
+        JsonUtils.serializeToJsonFile(this, outputFile);
     }
 
     public static SnapshotManifest deserializeFromJsonFile(File file) throws IOException
     {
-        return mapper.readValue(file, SnapshotManifest.class);
+        return JsonUtils.deserializeFromJsonFile(SnapshotManifest.class, file);
     }
 
     @Override
@@ -98,12 +103,15 @@ public class SnapshotManifest
         if (this == o) return true;
         if (o == null || getClass() != o.getClass()) return false;
         SnapshotManifest manifest = (SnapshotManifest) o;
-        return Objects.equals(files, manifest.files) && Objects.equals(createdAt, manifest.createdAt) && Objects.equals(expiresAt, manifest.expiresAt);
+        return Objects.equals(files, manifest.files)
+               && Objects.equals(createdAt, manifest.createdAt)
+               && Objects.equals(expiresAt, manifest.expiresAt)
+               && Objects.equals(ephemeral, manifest.ephemeral);
     }
 
     @Override
     public int hashCode()
     {
-        return Objects.hash(files, createdAt, expiresAt);
+        return Objects.hash(files, createdAt, expiresAt, ephemeral);
     }
 }

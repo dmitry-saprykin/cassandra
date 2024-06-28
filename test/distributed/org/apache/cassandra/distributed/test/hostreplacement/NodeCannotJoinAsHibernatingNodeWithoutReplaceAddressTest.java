@@ -24,29 +24,30 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.TimeUnit;
 
-import com.google.common.util.concurrent.Uninterruptibles;
 import org.junit.Assert;
 import org.junit.Test;
 
 import net.bytebuddy.ByteBuddy;
 import net.bytebuddy.dynamic.loading.ClassLoadingStrategy;
 import net.bytebuddy.implementation.MethodDelegation;
-import net.bytebuddy.implementation.bind.annotation.SuperCall;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.Constants;
 import org.apache.cassandra.distributed.api.Feature;
+import org.apache.cassandra.distributed.api.ICluster;
 import org.apache.cassandra.distributed.api.IInvokableInstance;
 import org.apache.cassandra.distributed.api.TokenSupplier;
 import org.apache.cassandra.distributed.impl.InstanceIDDefiner;
 import org.apache.cassandra.distributed.shared.ClusterUtils;
-import org.apache.cassandra.distributed.shared.Shared;
 import org.apache.cassandra.distributed.test.TestBaseImpl;
-import org.apache.cassandra.service.PendingRangeCalculatorService;
+import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.JVMStabilityInspector;
+import org.apache.cassandra.utils.Shared;
 import org.assertj.core.api.Assertions;
 
 import static net.bytebuddy.matcher.ElementMatchers.named;
+import static org.apache.cassandra.distributed.Constants.KEY_DTEST_FULL_STARTUP;
 
+// This test requires us to allow replace with the same address.
 public class NodeCannotJoinAsHibernatingNodeWithoutReplaceAddressTest extends TestBaseImpl
 {
     @Test
@@ -79,7 +80,8 @@ public class NodeCannotJoinAsHibernatingNodeWithoutReplaceAddressTest extends Te
                 SharedState.shutdownComplete.await(1, TimeUnit.MINUTES);
             }
 
-            IInvokableInstance inst = ClusterUtils.addInstance(cluster, toReplace.config(), c -> c.set("auto_bootstrap", true));
+            IInvokableInstance inst = ClusterUtils.addInstance(cluster, toReplace.config(), c -> c.set(KEY_DTEST_FULL_STARTUP, false)
+                                                                                                  .set("auto_bootstrap", true));
             ClusterUtils.updateAddress(inst, toReplaceAddress);
             Assertions.assertThatThrownBy(() -> inst.startup())
                       .hasMessageContaining("A node with address")
@@ -98,8 +100,8 @@ public class NodeCannotJoinAsHibernatingNodeWithoutReplaceAddressTest extends Te
 
         private static void shutdownBeforeNormal(ClassLoader cl)
         {
-            new ByteBuddy().rebase(PendingRangeCalculatorService.class)
-                           .method(named("blockUntilFinished"))
+            new ByteBuddy().rebase(StorageService.class)
+                           .method(named("doAuthSetup"))
                            .intercept(MethodDelegation.to(ShutdownBeforeNormal.class))
                            .make()
                            .load(cl, ClassLoadingStrategy.Default.INJECTION);
@@ -109,7 +111,7 @@ public class NodeCannotJoinAsHibernatingNodeWithoutReplaceAddressTest extends Te
     @Shared
     public static class SharedState
     {
-        public static volatile Cluster cluster;
+        public static volatile ICluster cluster;
         // Instance.shutdown can only be called once so only the caller knows when its done (isShutdown looks at a field set BEFORE shutting down..)
         // since the test needs to know when shutdown completes, add this static state so the caller (bytebuddy rewrite) can update it
         public static final CountDownLatch shutdownComplete = new CountDownLatch(1);
@@ -117,17 +119,17 @@ public class NodeCannotJoinAsHibernatingNodeWithoutReplaceAddressTest extends Te
 
     public static class ShutdownBeforeNormal
     {
-        public static void blockUntilFinished(@SuperCall Runnable fn)
+        public static void doAuthSetup()
         {
-            fn.run();
             int id = Integer.parseInt(InstanceIDDefiner.getInstanceId().replace("node", ""));
-            Cluster cluster = Objects.requireNonNull(SharedState.cluster);
+            ICluster cluster = Objects.requireNonNull(SharedState.cluster);
             // can't stop here as the stop method and start method share a lock; and block gets called in start...
             ForkJoinPool.commonPool().execute(() -> {
                 ClusterUtils.stopAbrupt(cluster, cluster.get(id));
                 SharedState.shutdownComplete.countDown();
             });
             JVMStabilityInspector.killCurrentJVM(new RuntimeException("Attempting to stop the instance"), false);
+            throw new RuntimeException();
         }
     }
 }

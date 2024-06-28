@@ -21,6 +21,7 @@ import java.nio.ByteBuffer;
 import java.util.Iterator;
 import java.util.Objects;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Function;
 
 import org.apache.cassandra.db.DeletionPurger;
@@ -35,7 +36,9 @@ import org.apache.cassandra.schema.DroppedColumn;
 import org.apache.cassandra.utils.BiLongAccumulator;
 import org.apache.cassandra.utils.LongAccumulator;
 import org.apache.cassandra.utils.ObjectSizes;
+import org.apache.cassandra.utils.SearchIterator;
 import org.apache.cassandra.utils.btree.BTree;
+import org.apache.cassandra.utils.memory.Cloner;
 
 /**
  * The data for a complex column, that is it's cells and potential complex
@@ -45,14 +48,19 @@ public class ComplexColumnData extends ColumnData implements Iterable<Cell<?>>
 {
     static final Cell<?>[] NO_CELLS = new Cell<?>[0];
 
-    private static final long EMPTY_SIZE = ObjectSizes.measure(new ComplexColumnData(ColumnMetadata.regularColumn("", "", "", SetType.getInstance(ByteType.instance, true)), NO_CELLS, new DeletionTime(0, 0)));
+    private static final long EMPTY_SIZE = ObjectSizes.measure(new ComplexColumnData(ColumnMetadata.regularColumn("",
+                                                                                                                  "",
+                                                                                                                  "",
+                                                                                                                  SetType.getInstance(ByteType.instance,
+                                                                                                                                      true)),
+                                                                                     NO_CELLS,
+                                                                                     DeletionTime.build(0, 0)));
 
     // The cells for 'column' sorted by cell path.
     private final Object[] cells;
 
     private final DeletionTime complexDeletion;
 
-    // Only ArrayBackedRow should call this.
     ComplexColumnData(ColumnMetadata column, Object[] cells, DeletionTime complexDeletion)
     {
         super(column);
@@ -93,9 +101,19 @@ public class ComplexColumnData extends ColumnData implements Iterable<Cell<?>>
         return complexDeletion;
     }
 
+    Object[] tree()
+    {
+        return cells;
+    }
+
     public Iterator<Cell<?>> iterator()
     {
         return BTree.iterator(cells);
+    }
+
+    public SearchIterator<CellPath, Cell> searchIterator()
+    {
+        return BTree.slice(cells, column().asymmetricCellPathComparator(), BTree.Dir.ASC);
     }
 
     public Iterator<Cell<?>> reverseIterator()
@@ -121,9 +139,16 @@ public class ComplexColumnData extends ColumnData implements Iterable<Cell<?>>
         return size;
     }
 
+    public long unsharedHeapSize()
+    {
+        long heapSize = EMPTY_SIZE + BTree.sizeOnHeapOf(cells) + complexDeletion.unsharedHeapSize();
+        return BTree.<Cell>accumulate(cells, (cell, value) -> value + cell.unsharedHeapSize(), heapSize);
+    }
+
+    @Override
     public long unsharedHeapSizeExcludingData()
     {
-        long heapSize = EMPTY_SIZE + ObjectSizes.sizeOfArray(cells);
+        long heapSize = EMPTY_SIZE + BTree.sizeOnHeapOf(cells);
         // TODO: this can be turned into a simple multiplication, at least while we have only one Cell implementation
         for (Cell<?> cell : this)
             heapSize += cell.unsharedHeapSizeExcludingData();
@@ -184,7 +209,7 @@ public class ComplexColumnData extends ColumnData implements Iterable<Cell<?>>
         });
     }
 
-    public ComplexColumnData purge(DeletionPurger purger, int nowInSec)
+    public ComplexColumnData purge(DeletionPurger purger, long nowInSec)
     {
         DeletionTime newDeletion = complexDeletion.isLive() || purger.shouldPurge(complexDeletion) ? DeletionTime.LIVE : complexDeletion;
         return transformAndFilter(newDeletion, (cell) -> cell.purge(purger, nowInSec));
@@ -195,22 +220,47 @@ public class ComplexColumnData extends ColumnData implements Iterable<Cell<?>>
         return transformAndFilter(complexDeletion, (cell) -> filter.fetchedCellIsQueried(column, cell.path()) ? null : cell);
     }
 
-    private ComplexColumnData transformAndFilter(DeletionTime newDeletion, Function<? super Cell<?>, ? extends Cell<?>> function)
+    public ComplexColumnData purgeDataOlderThan(long timestamp)
     {
-        Object[] transformed = BTree.transformAndFilter(cells, function);
+        DeletionTime newDeletion = complexDeletion.markedForDeleteAt() < timestamp ? DeletionTime.LIVE : complexDeletion;
+        return transformAndFilter(newDeletion, (cell) -> cell.purgeDataOlderThan(timestamp));
+    }
 
-        if (cells == transformed && newDeletion == complexDeletion)
+    private ComplexColumnData update(DeletionTime newDeletion, Object[] newCells)
+    {
+        if (cells == newCells && newDeletion == complexDeletion)
             return this;
 
-        if (newDeletion == DeletionTime.LIVE && BTree.isEmpty(transformed))
+        if (newDeletion == DeletionTime.LIVE && BTree.isEmpty(newCells))
             return null;
 
-        return new ComplexColumnData(column, transformed, newDeletion);
+        return new ComplexColumnData(column, newCells, newDeletion);
+    }
+
+    public ComplexColumnData transformAndFilter(Function<? super Cell<?>, ? extends Cell<?>> function)
+    {
+        return update(complexDeletion, BTree.transformAndFilter(cells, function));
+    }
+
+    public ComplexColumnData transformAndFilter(DeletionTime newDeletion, Function<? super Cell, ? extends Cell> function)
+    {
+        return update(newDeletion, BTree.transformAndFilter(cells, function));
+    }
+
+    public <V> ComplexColumnData transform(Function<? super Cell<?>, ? extends Cell<?>> function)
+    {
+        return update(complexDeletion, BTree.transform(cells, function));
+    }
+
+    @Override
+    public ColumnData clone(Cloner cloner)
+    {
+        return transform(c -> cloner.clone(c));
     }
 
     public ComplexColumnData updateAllTimestamp(long newTimestamp)
     {
-        DeletionTime newDeletion = complexDeletion.isLive() ? complexDeletion : new DeletionTime(newTimestamp - 1, complexDeletion.localDeletionTime());
+        DeletionTime newDeletion = complexDeletion.isLive() ? complexDeletion : DeletionTime.build(newTimestamp - 1, complexDeletion.localDeletionTime());
         return transformAndFilter(newDeletion, (cell) -> (Cell<?>) cell.updateAllTimestamp(newTimestamp));
     }
 
@@ -249,6 +299,21 @@ public class ComplexColumnData extends ColumnData implements Iterable<Cell<?>>
     public int hashCode()
     {
         return Objects.hash(column(), complexDeletion(), BTree.hashCode(cells));
+    }
+
+    @Override
+    public String toString()
+    {
+        return String.format("[%s=%s %s]",
+                             column().name,
+                             complexDeletion.toString(),
+                             BTree.toString(cells));
+    }
+
+    @VisibleForTesting
+    public static ComplexColumnData unsafeConstruct(ColumnMetadata column, Object[] cells, DeletionTime complexDeletion)
+    {
+        return new ComplexColumnData(column, cells, complexDeletion);
     }
 
     public static Builder builder()

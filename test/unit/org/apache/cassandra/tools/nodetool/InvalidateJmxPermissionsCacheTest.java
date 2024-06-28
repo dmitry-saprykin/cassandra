@@ -21,18 +21,20 @@ package org.apache.cassandra.tools.nodetool;
 import java.util.Set;
 import javax.security.auth.Subject;
 
+import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
-import org.junit.runner.RunWith;
 
-import org.apache.cassandra.OrderedJUnit4ClassRunner;
-import org.apache.cassandra.SchemaLoader;
+import org.apache.cassandra.auth.AuthCacheService;
 import org.apache.cassandra.auth.AuthTestUtils;
 import org.apache.cassandra.auth.AuthenticatedUser;
 import org.apache.cassandra.auth.CassandraPrincipal;
+import org.apache.cassandra.auth.IAuthorizer;
+import org.apache.cassandra.auth.IRoleManager;
 import org.apache.cassandra.auth.JMXResource;
 import org.apache.cassandra.auth.Permission;
 import org.apache.cassandra.auth.jmx.AuthorizationProxy;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.tools.ToolRunner;
 
@@ -41,32 +43,33 @@ import static org.apache.cassandra.auth.AuthTestUtils.ROLE_B;
 import static org.apache.cassandra.auth.AuthTestUtils.getRolePermissionsReadCount;
 import static org.assertj.core.api.Assertions.assertThat;
 
-@RunWith(OrderedJUnit4ClassRunner.class)
 public class InvalidateJmxPermissionsCacheTest extends CQLTester
 {
-    private static final AuthorizationProxy authorizationProxy = new NoAuthSetupAuthorizationProxy();
+    private static final AuthorizationProxy authorizationProxy = new AuthTestUtils.NoAuthSetupAuthorizationProxy();
 
     @BeforeClass
     public static void setup() throws Exception
     {
-        SchemaLoader.prepareServer();
-        AuthTestUtils.LocalCassandraRoleManager roleManager = new AuthTestUtils.LocalCassandraRoleManager();
-        AuthTestUtils.LocalCassandraAuthorizer authorizer = new AuthTestUtils.LocalCassandraAuthorizer();
-        SchemaLoader.setupAuth(roleManager,
-                new AuthTestUtils.LocalPasswordAuthenticator(),
-                authorizer,
-                new AuthTestUtils.LocalCassandraNetworkAuthorizer());
+        CQLTester.requireAuthentication();
+        IRoleManager roleManager = DatabaseDescriptor.getRoleManager();
+        roleManager.createRole(AuthenticatedUser.SYSTEM_USER, ROLE_A, AuthTestUtils.getLoginRoleOptions());
+        roleManager.createRole(AuthenticatedUser.SYSTEM_USER, ROLE_B, AuthTestUtils.getLoginRoleOptions());
+        AuthCacheService.initializeAndRegisterCaches();
+        requireNetwork();
+        startJMXServer();
+    }
 
+    @Before
+    public void grantInitialPermissions()
+    {
+        // Because we reset the CMS in CQLTester::afterTest, the per-test keyspaces created in CQLTester::beforeTest
+        // get dropped and re-created for every individual test. This means we need to recreate the perms here (we
+        // could markCMS() after granting the first time and add a flag to avoid re-granting but this is simpler).
         JMXResource rootJmxResource = JMXResource.root();
         Set<Permission> jmxPermissions = rootJmxResource.applicablePermissions();
-
-        roleManager.createRole(AuthenticatedUser.SYSTEM_USER, ROLE_A, AuthTestUtils.getLoginRoleOprions());
+        IAuthorizer authorizer = DatabaseDescriptor.getAuthorizer();
         authorizer.grant(AuthenticatedUser.SYSTEM_USER, jmxPermissions, rootJmxResource, ROLE_A);
-
-        roleManager.createRole(AuthenticatedUser.SYSTEM_USER, ROLE_B, AuthTestUtils.getLoginRoleOprions());
         authorizer.grant(AuthenticatedUser.SYSTEM_USER, jmxPermissions, rootJmxResource, ROLE_B);
-
-        startJMXServer();
     }
 
     @Test
@@ -181,12 +184,4 @@ public class InvalidateJmxPermissionsCacheTest extends CQLTester
         return subject;
     }
 
-    private static class NoAuthSetupAuthorizationProxy extends AuthorizationProxy
-    {
-        public NoAuthSetupAuthorizationProxy()
-        {
-            super();
-            this.isAuthSetupComplete = () -> true;
-        }
-    }
 }

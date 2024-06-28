@@ -17,7 +17,14 @@
  */
 package org.apache.cassandra.db.view;
 
-import java.util.*;
+import java.util.AbstractCollection;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.NavigableSet;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -27,19 +34,46 @@ import com.google.common.collect.Iterables;
 import com.google.common.collect.Iterators;
 import com.google.common.collect.PeekingIterator;
 
-import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.DeletionInfo;
+import org.apache.cassandra.db.DeletionTime;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.db.RangeTombstone;
+import org.apache.cassandra.db.ReadExecutionController;
+import org.apache.cassandra.db.ReadQuery;
+import org.apache.cassandra.db.SinglePartitionReadCommand;
+import org.apache.cassandra.db.Slice;
+import org.apache.cassandra.db.Slices;
+import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.db.commitlog.CommitLogPosition;
-import org.apache.cassandra.db.filter.*;
-import org.apache.cassandra.db.partitions.*;
-import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.db.filter.ClusteringIndexFilter;
+import org.apache.cassandra.db.filter.ClusteringIndexNamesFilter;
+import org.apache.cassandra.db.filter.ClusteringIndexSliceFilter;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.filter.DataLimits;
+import org.apache.cassandra.db.filter.RowFilter;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterators;
+import org.apache.cassandra.db.rows.BTreeRow;
+import org.apache.cassandra.db.rows.RangeTombstoneMarker;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.rows.Rows;
+import org.apache.cassandra.db.rows.Unfiltered;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.dht.Token;
-import org.apache.cassandra.schema.Schema;
-import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.service.StorageProxy;
+import org.apache.cassandra.tcm.ClusterMetadata;
+import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.btree.BTree;
 import org.apache.cassandra.utils.btree.BTreeSet;
+
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 
 
 /**
@@ -54,9 +88,9 @@ public class TableViews extends AbstractCollection<View>
     // list is the best option.
     private final List<View> views = new CopyOnWriteArrayList();
 
-    public TableViews(TableId id)
+    public TableViews(TableMetadata tableMetadata)
     {
-        baseTableMetadata = Schema.instance.getTableMetadataRef(id);
+        baseTableMetadata = tableMetadata.ref;
     }
 
     public boolean hasViews()
@@ -102,10 +136,10 @@ public class TableViews extends AbstractCollection<View>
         views.forEach(View::stopBuild);
     }
 
-    public void forceBlockingFlush()
+    public void forceBlockingFlush(ColumnFamilyStore.FlushReason reason)
     {
         for (ColumnFamilyStore viewCfs : allViewsCfs())
-            viewCfs.forceBlockingFlush();
+            viewCfs.forceBlockingFlush(reason);
     }
 
     public void dumpMemtables()
@@ -140,19 +174,19 @@ public class TableViews extends AbstractCollection<View>
     {
         assert update.metadata().id.equals(baseTableMetadata.id);
 
-        Collection<View> views = updatedViews(update);
+        Collection<View> views = updatedViews(update, ClusterMetadata.currentNullable());
         if (views.isEmpty())
             return;
 
         // Read modified rows
-        int nowInSec = FBUtilities.nowInSeconds();
-        long queryStartNanoTime = System.nanoTime();
+        long nowInSec = FBUtilities.nowInSeconds();
+        Dispatcher.RequestTime requestTime = Dispatcher.RequestTime.forImmediateExecution();
         SinglePartitionReadCommand command = readExistingRowsCommand(update, views, nowInSec);
         if (command == null)
             return;
 
         ColumnFamilyStore cfs = Keyspace.openAndGetStore(update.metadata());
-        long start = System.nanoTime();
+        long start = nanoTime();
         Collection<Mutation> mutations;
         try (ReadExecutionController orderGroup = command.executionController();
              UnfilteredRowIterator existings = UnfilteredPartitionIterators.getOnlyElement(command.executeLocally(orderGroup), command);
@@ -160,10 +194,10 @@ public class TableViews extends AbstractCollection<View>
         {
             mutations = Iterators.getOnlyElement(generateViewUpdates(views, updates, existings, nowInSec, false));
         }
-        Keyspace.openAndGetStore(update.metadata()).metric.viewReadTime.update(System.nanoTime() - start, TimeUnit.NANOSECONDS);
+        Keyspace.openAndGetStore(update.metadata()).metric.viewReadTime.update(nanoTime() - start, TimeUnit.NANOSECONDS);
 
         if (!mutations.isEmpty())
-            StorageProxy.mutateMV(update.partitionKey().getKey(), mutations, writeCommitLog, baseComplete, queryStartNanoTime);
+            StorageProxy.mutateMV(update.partitionKey().getKey(), mutations, writeCommitLog, baseComplete, requestTime);
     }
 
 
@@ -179,13 +213,13 @@ public class TableViews extends AbstractCollection<View>
      * but has simply some updated values. This will be empty for view building as we want to assume anything we'll pass
      * to {@code updates} is new.
      * @param nowInSec the current time in seconds.
-     * @param separateUpdates, if false, mutation is per partition.
+     * @param separateUpdates if false, mutation is per partition.
      * @return the mutations to apply to the {@code views}. This can be empty.
      */
     public Iterator<Collection<Mutation>> generateViewUpdates(Collection<View> views,
                                                               UnfilteredRowIterator updates,
                                                               UnfilteredRowIterator existings,
-                                                              int nowInSec,
+                                                              long nowInSec,
                                                               boolean separateUpdates)
     {
         assert updates.metadata().id.equals(baseTableMetadata.id);
@@ -359,7 +393,7 @@ public class TableViews extends AbstractCollection<View>
      * @param updates the updates applied to the base table.
      * @return the views affected by {@code updates}.
      */
-    public Collection<View> updatedViews(PartitionUpdate updates)
+    public Collection<View> updatedViews(PartitionUpdate updates, ClusterMetadata metadata)
     {
         List<View> matchingViews = new ArrayList<>(views.size());
 
@@ -368,7 +402,8 @@ public class TableViews extends AbstractCollection<View>
             ReadQuery selectQuery = view.getReadQuery();
             if (!selectQuery.selectsKey(updates.partitionKey()))
                 continue;
-
+            if (metadata != null && !metadata.schema.getKeyspaceMetadata(view.getDefinition().keyspace()).hasView(view.name))
+                continue;
             matchingViews.add(view);
         }
         return matchingViews;
@@ -383,7 +418,7 @@ public class TableViews extends AbstractCollection<View>
      * @param nowInSec the current time in seconds.
      * @return the command to use to read the base table rows required to generate view updates for {@code updates}.
      */
-    private SinglePartitionReadCommand readExistingRowsCommand(PartitionUpdate updates, Collection<View> views, int nowInSec)
+    private SinglePartitionReadCommand readExistingRowsCommand(PartitionUpdate updates, Collection<View> views, long nowInSec)
     {
         Slices.Builder sliceBuilder = null;
         DeletionInfo deletionInfo = updates.deletionInfo();
@@ -421,20 +456,23 @@ public class TableViews extends AbstractCollection<View>
 
         // If we had some slices from the deletions above, we'll continue using that. Otherwise, it's more efficient to build
         // a names query.
-        BTreeSet.Builder<Clustering<?>> namesBuilder = sliceBuilder == null ? BTreeSet.builder(metadata.comparator) : null;
-        for (Row row : updates)
+        NavigableSet<Clustering<?>> names;
+        try (BTree.FastBuilder<Clustering<?>> namesBuilder = sliceBuilder == null ? BTree.fastBuilder() : null)
         {
-            // Don't read the existing state if we can prove the update won't affect any views
-            if (!affectsAnyViews(key, row, views))
-                continue;
+            for (Row row : updates)
+            {
+                // Don't read the existing state if we can prove the update won't affect any views
+                if (!affectsAnyViews(key, row, views))
+                    continue;
 
-            if (namesBuilder == null)
-                sliceBuilder.add(Slice.make(row.clustering()));
-            else
-                namesBuilder.add(row.clustering());
+                if (namesBuilder == null)
+                    sliceBuilder.add(Slice.make(row.clustering()));
+                else
+                    namesBuilder.add(row.clustering());
+            }
+            names = namesBuilder == null ? null : BTreeSet.wrap(namesBuilder.build(), metadata.comparator);
         }
 
-        NavigableSet<Clustering<?>> names = namesBuilder == null ? null : namesBuilder.build();
         // If we have a slice builder, it means we had some deletions and we have to read. But if we had
         // only row updates, it's possible none of them affected the views, in which case we have nothing
         // to do.
@@ -456,7 +494,7 @@ public class TableViews extends AbstractCollection<View>
         // TODO: we could still make sense to special case for when there is a single view and a small number of updates (and
         // no deletions). Indeed, in that case we could check whether any of the update modify any of the restricted regular
         // column, and if that's not the case we could use view filter. We keep it simple for now though.
-        RowFilter rowFilter = RowFilter.NONE;
+        RowFilter rowFilter = RowFilter.none();
         return SinglePartitionReadCommand.create(metadata, nowInSec, queriedColumns, rowFilter, DataLimits.NONE, key, clusteringFilter);
     }
 

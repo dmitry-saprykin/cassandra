@@ -18,20 +18,26 @@
 package org.apache.cassandra.transport;
 
 import java.net.InetSocketAddress;
+import java.util.Collections;
 import java.util.Map;
 import java.util.Optional;
 
+import com.google.common.base.Joiner;
 import com.google.common.collect.ImmutableMap;
 
 import io.netty.handler.ssl.SslHandler;
 import org.apache.cassandra.auth.AuthenticatedUser;
+import org.apache.cassandra.auth.IAuthenticator;
 import org.apache.cassandra.service.ClientState;
+
+import static org.apache.cassandra.auth.IAuthenticator.AuthenticationMode.UNAUTHENTICATED;
 
 public final class ConnectedClient
 {
     public static final String ADDRESS = "address";
     public static final String USER = "user";
     public static final String VERSION = "version";
+    public static final String CLIENT_OPTIONS = "clientOptions";
     public static final String DRIVER_NAME = "driverName";
     public static final String DRIVER_VERSION = "driverVersion";
     public static final String REQUESTS = "requests";
@@ -39,6 +45,8 @@ public final class ConnectedClient
     public static final String SSL = "ssl";
     public static final String CIPHER = "cipher";
     public static final String PROTOCOL = "protocol";
+    public static final String AUTHENTICATION_MODE = "authenticationMode";
+    public static final String AUTHENTICATION_METADATA = "authenticationMetadata";
 
     private static final String UNDEFINED = "undefined";
 
@@ -83,6 +91,11 @@ public final class ConnectedClient
         return state().getDriverVersion();
     }
 
+    public Optional<Map<String,String>> clientOptions()
+    {
+        return state().getClientOptions();
+    }
+
     public long requestCount()
     {
         return connection.requests.getCount();
@@ -116,6 +129,24 @@ public final class ConnectedClient
              : Optional.empty();
     }
 
+    public Map<String, Object> authenticationMetadata()
+    {
+        AuthenticatedUser user = state().getUser();
+
+        return null != user
+                ? user.getMetadata()
+                : Collections.emptyMap();
+    }
+
+    public IAuthenticator.AuthenticationMode authenticationMode()
+    {
+        AuthenticatedUser user = state().getUser();
+
+        return null != user
+                ? user.getAuthenticationMode()
+                : UNAUTHENTICATED;
+    }
+
     private ClientState state()
     {
         return connection.getClientState();
@@ -132,6 +163,9 @@ public final class ConnectedClient
                            .put(ADDRESS, remoteAddress().toString())
                            .put(USER, username().orElse(UNDEFINED))
                            .put(VERSION, String.valueOf(protocolVersion()))
+                           .put(CLIENT_OPTIONS, Joiner.on(", ")
+                                                      .withKeyValueSeparator("=")
+                                                      .join(clientOptions().orElse(Collections.emptyMap())))
                            .put(DRIVER_NAME, driverName().orElse(UNDEFINED))
                            .put(DRIVER_VERSION, driverVersion().orElse(UNDEFINED))
                            .put(REQUESTS, String.valueOf(requestCount()))
@@ -139,6 +173,10 @@ public final class ConnectedClient
                            .put(SSL, Boolean.toString(sslEnabled()))
                            .put(CIPHER, sslCipherSuite().orElse(UNDEFINED))
                            .put(PROTOCOL, sslProtocol().orElse(UNDEFINED))
+                           .put(AUTHENTICATION_MODE, authenticationMode().toString())
+                           .put(AUTHENTICATION_METADATA, Joiner.on(", ")
+                                                               .withKeyValueSeparator("=")
+                                                               .join(authenticationMetadata()))
                            .build();
     }
 }

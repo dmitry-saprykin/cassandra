@@ -119,12 +119,12 @@ public class UFJavaTest extends CQLTester
     @Test
     public void testJavaFunctionInvalidReturn() throws Throwable
     {
-        assertInvalidMessage("cannot convert from long to Double",
+        assertInvalidMessage("cannot convert from boolean to double",
                              "CREATE OR REPLACE FUNCTION " + KEYSPACE + ".jfir(val double) " +
                              "RETURNS NULL ON NULL INPUT " +
                              "RETURNS double " +
                              "LANGUAGE JAVA\n" +
-                             "AS 'return 1L;';");
+                             "AS 'return true;';");
     }
 
     @Test
@@ -657,7 +657,7 @@ public class UFJavaTest extends CQLTester
                               "AS $$return " +
                               "     udt.getString(\"txt\");$$;",
                               fName1replace, type));
-        Assert.assertEquals(1, Schema.instance.getFunctions(parseFunctionName(fName1replace)).size());
+        Assert.assertEquals(1, Schema.instance.getUserFunctions(parseFunctionName(fName1replace)).size());
         execute(String.format("CREATE OR REPLACE FUNCTION %s( udt %s ) " +
                               "CALLED ON NULL INPUT " +
                               "RETURNS int " +
@@ -665,7 +665,7 @@ public class UFJavaTest extends CQLTester
                               "AS $$return " +
                               "     Integer.valueOf(udt.getInt(\"i\"));$$;",
                               fName2replace, type));
-        Assert.assertEquals(1, Schema.instance.getFunctions(parseFunctionName(fName2replace)).size());
+        Assert.assertEquals(1, Schema.instance.getUserFunctions(parseFunctionName(fName2replace)).size());
         execute(String.format("CREATE OR REPLACE FUNCTION %s( udt %s ) " +
                               "CALLED ON NULL INPUT " +
                               "RETURNS double " +
@@ -673,7 +673,7 @@ public class UFJavaTest extends CQLTester
                               "AS $$return " +
                               "     Double.valueOf(udt.getDouble(\"added\"));$$;",
                               fName3replace, type));
-        Assert.assertEquals(1, Schema.instance.getFunctions(parseFunctionName(fName3replace)).size());
+        Assert.assertEquals(1, Schema.instance.getUserFunctions(parseFunctionName(fName3replace)).size());
         execute(String.format("CREATE OR REPLACE FUNCTION %s( udt %s ) " +
                               "RETURNS NULL ON NULL INPUT " +
                               "RETURNS %s " +
@@ -681,7 +681,7 @@ public class UFJavaTest extends CQLTester
                               "AS $$return " +
                               "     udt;$$;",
                               fName4replace, type, type));
-        Assert.assertEquals(1, Schema.instance.getFunctions(parseFunctionName(fName4replace)).size());
+        Assert.assertEquals(1, Schema.instance.getUserFunctions(parseFunctionName(fName4replace)).size());
 
         assertRows(execute("SELECT " + fName1replace + "(udt) FROM %s WHERE key = 2"),
                    row("two"));
@@ -814,11 +814,11 @@ public class UFJavaTest extends CQLTester
                                                 "java",
                                                 "return 0;");
 
-        Assert.assertTrue(function.toCqlString(true, true).contains("CREATE FUNCTION IF NOT EXISTS"));
-        Assert.assertFalse(function.toCqlString(true, false).contains("CREATE FUNCTION IF NOT EXISTS"));
+        Assert.assertTrue(function.toCqlString(true, true, true).contains("CREATE FUNCTION IF NOT EXISTS"));
+        Assert.assertFalse(function.toCqlString(true, true, false).contains("CREATE FUNCTION IF NOT EXISTS"));
 
-        Assert.assertEquals(function.toCqlString(true, true), function.toCqlString(false, true));
-        Assert.assertEquals(function.toCqlString(true, false), function.toCqlString(false, false));
+        Assert.assertEquals(function.toCqlString(true, true, true), function.toCqlString(true, false, true));
+        Assert.assertEquals(function.toCqlString(true, true, false), function.toCqlString(true, false, false));
     }
 
     @Test
@@ -853,10 +853,10 @@ public class UFJavaTest extends CQLTester
                                                    Int32Type.instance,
                                                    null);
 
-        Assert.assertTrue(aggregate.toCqlString(true, true).contains("CREATE AGGREGATE IF NOT EXISTS"));
-        Assert.assertFalse(aggregate.toCqlString(true, false).contains("CREATE AGGREGATE IF NOT EXISTS"));
+        Assert.assertTrue(aggregate.toCqlString(true, true, true).contains("CREATE AGGREGATE IF NOT EXISTS"));
+        Assert.assertFalse(aggregate.toCqlString(true, true, false).contains("CREATE AGGREGATE IF NOT EXISTS"));
 
-        Assert.assertEquals(aggregate.toCqlString(true, true), aggregate.toCqlString(false, true));
-        Assert.assertEquals(aggregate.toCqlString(true, false), aggregate.toCqlString(false, false));
+        Assert.assertEquals(aggregate.toCqlString(true, true, true), aggregate.toCqlString(true, false, true));
+        Assert.assertEquals(aggregate.toCqlString(true, true, false), aggregate.toCqlString(true, false, false));
     }
 }

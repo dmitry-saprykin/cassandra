@@ -27,15 +27,15 @@ import java.util.regex.Pattern;
 import org.apache.commons.lang3.StringUtils;
 import org.junit.BeforeClass;
 import org.junit.Test;
-import org.junit.runner.RunWith;
 
-import org.apache.cassandra.OrderedJUnit4ClassRunner;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.tools.ToolRunner;
+import org.apache.cassandra.utils.JsonUtils;
+import org.yaml.snakeyaml.Yaml;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 
-@RunWith(OrderedJUnit4ClassRunner.class)
 public class TableStatsTest extends CQLTester
 {
     @BeforeClass
@@ -101,8 +101,8 @@ public class TableStatsTest extends CQLTester
                         "            bloom_filter_off_heap_memory_used, bloom_filter_space_used,\n" + 
                         "            compacted_partition_maximum_bytes, compacted_partition_mean_bytes,\n" + 
                         "            compacted_partition_minimum_bytes,\n" + 
-                        "            compression_metadata_off_heap_memory_used, dropped_mutations,\n" + 
-                        "            full_name, index_summary_off_heap_memory_used, local_read_count,\n" + 
+                        "            compression_metadata_off_heap_memory_used, full_name,\n" +
+                        "            index_summary_off_heap_memory_used, local_read_count,\n" +
                         "            local_read_latency_ms, local_write_latency_ms,\n" + 
                         "            maximum_live_cells_per_slice_last_five_minutes,\n" + 
                         "            maximum_tombstones_per_slice_last_five_minutes, memtable_cell_count,\n" + 
@@ -111,7 +111,8 @@ public class TableStatsTest extends CQLTester
                         "            off_heap_memory_used_total, pending_flushes, percent_repaired,\n" + 
                         "            read_latency, reads, space_used_by_snapshots_total, space_used_live,\n" + 
                         "            space_used_total, sstable_compression_ratio, sstable_count,\n" + 
-                        "            table_name, write_latency, writes)\n" + 
+                        "            table_name, write_latency, writes, max_sstable_size,\n" +
+                        "            local_read_write_ratio, twcs_max_duration)\n" +
                         "\n" + 
                         "        -t <top>, --top <top>\n" + 
                         "            Show only the top K tables for the sort key (specify the number K of\n" + 
@@ -137,12 +138,12 @@ public class TableStatsTest extends CQLTester
     {
         ToolRunner.ToolResult tool = ToolRunner.invokeNodetool("tablestats");
         tool.assertOnCleanExit();
-        assertThat(tool.getStdout()).contains("Keyspace : system_schema");
+        assertThat(tool.getStdout()).contains("Keyspace: system_schema");
         assertThat(StringUtils.countMatches(tool.getStdout(), "Table:")).isGreaterThan(1);
 
         tool = ToolRunner.invokeNodetool("tablestats", "system_distributed");
         tool.assertOnCleanExit();
-        assertThat(tool.getStdout()).contains("Keyspace : system_distributed");
+        assertThat(tool.getStdout()).contains("Keyspace: system_distributed");
         assertThat(tool.getStdout()).doesNotContain("Keyspace : system_schema");
         assertThat(StringUtils.countMatches(tool.getStdout(), "Table:")).isGreaterThan(1);
     }
@@ -152,7 +153,7 @@ public class TableStatsTest extends CQLTester
     {
         ToolRunner.ToolResult tool = ToolRunner.invokeNodetool("tablestats", "-i", "system_schema.aggregates");
         tool.assertOnCleanExit();
-        assertThat(tool.getStdout()).contains("Keyspace : system_schema");
+        assertThat(tool.getStdout()).contains("Keyspace: system_schema");
         assertThat(tool.getStdout()).doesNotContain("Table: system_schema.aggregates");
         assertThat(StringUtils.countMatches(tool.getStdout(), "Table:")).isGreaterThan(1);
     }
@@ -225,5 +226,33 @@ public class TableStatsTest extends CQLTester
         ToolRunner.ToolResult tool = ToolRunner.invokeNodetool("tablestats", "system.local");
         tool.assertCleanStdErr();
         assertThat(tool.getStdout()).doesNotContain("SSTables in correct location: ");
+    }
+
+    @Test
+    public void testFormatJson()
+    {
+        Arrays.asList("-F", "--format").forEach(arg -> {
+            ToolRunner.ToolResult tool = ToolRunner.invokeNodetool("tablestats", arg, "json");
+            tool.assertOnCleanExit();
+            String json = tool.getStdout();
+            assertThatCode(() -> JsonUtils.JSON_OBJECT_MAPPER.readTree(json)).doesNotThrowAnyException();
+            assertThat(json).containsPattern("\"sstable_count\"\\s*:\\s*[0-9]+")
+                            .containsPattern("\"old_sstable_count\"\\s*:\\s*[0-9]+");
+        });
+    }
+
+    @Test
+    public void testFormatYaml()
+    {
+        Arrays.asList("-F", "--format").forEach(arg -> {
+            ToolRunner.ToolResult tool = ToolRunner.invokeNodetool("tablestats", arg, "yaml");
+            tool.assertOnCleanExit();
+            String yaml = tool.getStdout();
+            org.yaml.snakeyaml.LoaderOptions loaderOptions = new org.yaml.snakeyaml.LoaderOptions();
+            loaderOptions.setMaxAliasesForCollections(100); // we now have > 50 tables
+            assertThatCode(() -> new Yaml(loaderOptions).load(yaml)).doesNotThrowAnyException();
+            assertThat(yaml).containsPattern("sstable_count:\\s*[0-9]+")
+                            .containsPattern("old_sstable_count:\\s*[0-9]+");
+        });
     }
 }

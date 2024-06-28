@@ -30,8 +30,11 @@ import java.security.ProtectionDomain;
 import java.util.Collections;
 import java.util.Enumeration;
 
-import io.netty.util.concurrent.FastThreadLocal;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
+import io.netty.util.concurrent.FastThreadLocal;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.utils.logging.LoggingSupportFactory;
 
 /**
@@ -45,6 +48,8 @@ import org.apache.cassandra.utils.logging.LoggingSupportFactory;
  */
 public final class ThreadAwareSecurityManager extends SecurityManager
 {
+    private static final Logger logger = LoggerFactory.getLogger(ThreadAwareSecurityManager.class);
+
     public static final PermissionCollection noPermissions = new PermissionCollection()
     {
         public void add(Permission permission)
@@ -66,6 +71,7 @@ public final class ThreadAwareSecurityManager extends SecurityManager
     private static final RuntimePermission CHECK_MEMBER_ACCESS_PERMISSION = new RuntimePermission("accessDeclaredMembers");
     private static final RuntimePermission MODIFY_THREAD_PERMISSION = new RuntimePermission("modifyThread");
     private static final RuntimePermission MODIFY_THREADGROUP_PERMISSION = new RuntimePermission("modifyThreadGroup");
+    private static final RuntimePermission SET_SECURITY_MANAGER_PERMISSION = new RuntimePermission("setSecurityManager");
 
     // Nashorn / Java 11
     private static final RuntimePermission NASHORN_GLOBAL_PERMISSION = new RuntimePermission("nashorn.createGlobal");
@@ -79,6 +85,14 @@ public final class ThreadAwareSecurityManager extends SecurityManager
     {
         if (installed)
             return;
+
+        // this line is needed - we need to make sure AccessControlException is loaded before we install this SM
+        // otherwise we may get into stackoverflow when javax.security is not allowed package, and ACE is tried to be
+        // loaded when it is going to be thrown from SM (class loader triggers SM to verify javax.security,
+        // it recognizes it as not allowed and attempts to throw it...)
+        //noinspection PlaceholderCountMatchesArgumentCount
+        logger.trace("Initialized thread aware security manager", AccessControlException.class.getName());
+
         System.setSecurityManager(new ThreadAwareSecurityManager());
         LoggingSupportFactory.getLoggingSupport().onStartup();
         installed = true;
@@ -194,6 +208,9 @@ public final class ThreadAwareSecurityManager extends SecurityManager
 
     public void checkPermission(Permission perm)
     {
+        if (!DatabaseDescriptor.enableUserDefinedFunctionsThreads() && !DatabaseDescriptor.allowExtraInsecureUDFs() && SET_SECURITY_MANAGER_PERMISSION.equals(perm))
+            throw new AccessControlException("Access denied");
+
         if (!isSecuredThread())
             return;
 

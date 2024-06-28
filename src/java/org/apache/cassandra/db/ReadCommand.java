@@ -23,6 +23,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.BiFunction;
 import java.util.function.LongPredicate;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 
 import javax.annotation.Nullable;
 
@@ -30,13 +31,19 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Sets;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.netty.util.concurrent.FastThreadLocal;
 import org.apache.cassandra.config.*;
-import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.db.filter.*;
+import org.apache.cassandra.exceptions.CoordinatorBehindException;
+import org.apache.cassandra.exceptions.QueryCancelledException;
+import org.apache.cassandra.exceptions.UnknownTableException;
+import org.apache.cassandra.metrics.TCMMetrics;
 import org.apache.cassandra.net.MessageFlag;
+import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.net.ParamType;
 import org.apache.cassandra.net.Verb;
 import org.apache.cassandra.db.partitions.*;
@@ -48,8 +55,6 @@ import org.apache.cassandra.db.transform.StoppingTransformation;
 import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.exceptions.UnknownIndexException;
 import org.apache.cassandra.index.Index;
-import org.apache.cassandra.index.IndexNotAvailableException;
-import org.apache.cassandra.index.IndexRegistry;
 import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.DataInputPlus;
@@ -65,13 +70,21 @@ import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.SchemaProvider;
 import org.apache.cassandra.service.ActiveRepairService;
 import org.apache.cassandra.service.ClientWarn;
+import org.apache.cassandra.tcm.ClusterMetadata;
+import org.apache.cassandra.tcm.Epoch;
 import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.utils.CassandraUInt;
+import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.NoSpamLogger;
+import org.apache.cassandra.utils.ObjectSizes;
+import org.apache.cassandra.utils.TimeUUID;
 
 import static com.google.common.collect.Iterables.any;
 import static com.google.common.collect.Iterables.filter;
-import static org.apache.cassandra.utils.MonotonicClock.approxTime;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 import static org.apache.cassandra.db.partitions.UnfilteredPartitionIterators.MergeListener.NOOP;
+import static org.apache.cassandra.utils.MonotonicClock.Global.approxTime;
 
 /**
  * General interface for storage-engine read commands (common to both range and
@@ -81,36 +94,42 @@ import static org.apache.cassandra.db.partitions.UnfilteredPartitionIterators.Me
  */
 public abstract class ReadCommand extends AbstractReadQuery
 {
-    private static final int TEST_ITERATION_DELAY_MILLIS = Integer.parseInt(System.getProperty("cassandra.test.read_iteration_delay_ms", "0"));
+    private static final int TEST_ITERATION_DELAY_MILLIS = CassandraRelevantProperties.TEST_READ_ITERATION_DELAY_MS.getInt();
 
     protected static final Logger logger = LoggerFactory.getLogger(ReadCommand.class);
     public static final IVersionedSerializer<ReadCommand> serializer = new Serializer();
+
+    // Expose the active command running so transitive calls can lookup this command.
+    // This is useful for a few reasons, but mainly because the CQL query is here.
+    private static final FastThreadLocal<ReadCommand> COMMAND = new FastThreadLocal<>();
 
     private final Kind kind;
 
     private final boolean isDigestQuery;
     private final boolean acceptsTransient;
+    private final Epoch serializedAtEpoch;
     // if a digest query, the version for which the digest is expected. Ignored if not a digest.
     private int digestVersion;
 
     private boolean trackWarnings;
 
     @Nullable
-    private final IndexMetadata index;
+    private final Index.QueryPlan indexQueryPlan;
 
     protected static abstract class SelectionDeserializer
     {
         public abstract ReadCommand deserialize(DataInputPlus in,
                                                 int version,
+                                                Epoch serializedAtEpoch,
                                                 boolean isDigest,
                                                 int digestVersion,
                                                 boolean acceptsTransient,
                                                 TableMetadata metadata,
-                                                int nowInSec,
+                                                long nowInSec,
                                                 ColumnFilter columnFilter,
                                                 RowFilter rowFilter,
                                                 DataLimits limits,
-                                                IndexMetadata index) throws IOException;
+                                                Index.QueryPlan indexQueryPlan) throws IOException;
     }
 
     protected enum Kind
@@ -126,16 +145,17 @@ public abstract class ReadCommand extends AbstractReadQuery
         }
     }
 
-    protected ReadCommand(Kind kind,
+    protected ReadCommand(Epoch serializedAtEpoch,
+                          Kind kind,
                           boolean isDigestQuery,
                           int digestVersion,
                           boolean acceptsTransient,
                           TableMetadata metadata,
-                          int nowInSec,
+                          long nowInSec,
                           ColumnFilter columnFilter,
                           RowFilter rowFilter,
                           DataLimits limits,
-                          IndexMetadata index,
+                          Index.QueryPlan indexQueryPlan,
                           boolean trackWarnings)
     {
         super(metadata, nowInSec, columnFilter, rowFilter, limits);
@@ -146,8 +166,14 @@ public abstract class ReadCommand extends AbstractReadQuery
         this.isDigestQuery = isDigestQuery;
         this.digestVersion = digestVersion;
         this.acceptsTransient = acceptsTransient;
-        this.index = index;
+        this.indexQueryPlan = indexQueryPlan;
         this.trackWarnings = trackWarnings;
+        this.serializedAtEpoch = serializedAtEpoch;
+    }
+
+    public static ReadCommand getCommand()
+    {
+        return COMMAND.get();
     }
 
     protected abstract void serializeSelection(DataOutputPlus out, int version) throws IOException;
@@ -180,6 +206,15 @@ public abstract class ReadCommand extends AbstractReadQuery
     public boolean isDigestQuery()
     {
         return isDigestQuery;
+    }
+
+    /**
+     * the schema version on the table when serializing this read command
+     * @return
+     */
+    public Epoch serializedAtEpoch()
+    {
+        return serializedAtEpoch;
     }
 
     /**
@@ -229,14 +264,26 @@ public abstract class ReadCommand extends AbstractReadQuery
     }
 
     /**
-     * Index (metadata) chosen for this query. Can be null.
+     * Index query plan chosen for this query. Can be null.
      *
-     * @return index (metadata) chosen for this query
+     * @return index query plan chosen for this query
      */
     @Nullable
-    public IndexMetadata indexMetadata()
+    public Index.QueryPlan indexQueryPlan()
     {
-        return index;
+        return indexQueryPlan;
+    }
+
+    @Override
+    public boolean isTopK()
+    {
+        return indexQueryPlan != null && indexQueryPlan.isTopK();
+    }
+
+    @VisibleForTesting
+    public Index.Searcher indexSearcher()
+    {
+        return indexQueryPlan == null ? null : indexQueryPlan.searcherFor(this);
     }
 
     /**
@@ -313,7 +360,6 @@ public abstract class ReadCommand extends AbstractReadQuery
      */
     public abstract boolean isReversed();
 
-    @SuppressWarnings("resource")
     public ReadResponse createResponse(UnfilteredPartitionIterator iterator, RepairedDataInfo rdi)
     {
         // validate that the sequence of RT markers is correct: open is followed by close, deletion times for both
@@ -325,7 +371,6 @@ public abstract class ReadCommand extends AbstractReadQuery
                : ReadResponse.createDataResponse(iterator, this, rdi);
     }
 
-    @SuppressWarnings("resource") // We don't need to close an empty iterator.
     public ReadResponse createEmptyResponse()
     {
         UnfilteredPartitionIterator iterator = EmptyIterators.unfilteredPartition(metadata());
@@ -337,30 +382,19 @@ public abstract class ReadCommand extends AbstractReadQuery
 
     long indexSerializedSize(int version)
     {
-        return null != index
-             ? IndexMetadata.serializer.serializedSize(index, version)
+        return null != indexQueryPlan
+             ? IndexMetadata.serializer.serializedSize(indexQueryPlan.getFirst().getIndexMetadata(), version)
              : 0;
     }
 
-    public Index getIndex(ColumnFamilyStore cfs)
-    {
-        return null != index
-             ? cfs.indexManager.getIndex(index)
-             : null;
-    }
-
-    static IndexMetadata findIndex(TableMetadata table, RowFilter rowFilter)
+    static Index.QueryPlan findIndexQueryPlan(TableMetadata table, RowFilter rowFilter)
     {
         if (table.indexes.isEmpty() || rowFilter.isEmpty())
             return null;
 
         ColumnFamilyStore cfs = Keyspace.openAndGetStore(table);
 
-        Index index = cfs.indexManager.getBestIndexFor(rowFilter);
-
-        return null != index
-             ? index.getIndexMetadata()
-             : null;
+        return cfs.indexManager.getBestIndexQueryPlanFor(rowFilter);
     }
 
     /**
@@ -371,8 +405,10 @@ public abstract class ReadCommand extends AbstractReadQuery
      */
     public void maybeValidateIndex()
     {
-        if (null != index)
-            IndexRegistry.obtain(metadata()).getIndex(index).validate(this);
+        if (null != indexQueryPlan)
+        {
+            indexQueryPlan.validate(this);
+        }
     }
 
     /**
@@ -382,72 +418,87 @@ public abstract class ReadCommand extends AbstractReadQuery
      *
      * @return an iterator over the result of executing this command locally.
      */
-    @SuppressWarnings("resource") // The result iterator is closed upon exceptions (we know it's fine to potentially not close the intermediary
                                   // iterators created inside the try as long as we do close the original resultIterator), or by closing the result.
     public UnfilteredPartitionIterator executeLocally(ReadExecutionController executionController)
     {
-        long startTimeNanos = System.nanoTime();
+        long startTimeNanos = nanoTime();
 
-        ColumnFamilyStore cfs = Keyspace.openAndGetStore(metadata());
-        Index index = getIndex(cfs);
-
-        Index.Searcher searcher = null;
-        if (index != null)
-        {
-            if (!cfs.indexManager.isIndexQueryable(index))
-                throw new IndexNotAvailableException(index);
-
-            searcher = index.searcherFor(this);
-            Tracing.trace("Executing read on {}.{} using index {}", cfs.metadata.keyspace, cfs.metadata.name, index.getIndexMetadata().name);
-        }
-
-        UnfilteredPartitionIterator iterator = (null == searcher) ? queryStorage(cfs, executionController) : searcher.search(executionController);
-        iterator = RTBoundValidator.validate(iterator, Stage.MERGED, false);
-
+        COMMAND.set(this);
         try
         {
-            iterator = withStateTracking(iterator);
-            iterator = RTBoundValidator.validate(withoutPurgeableTombstones(iterator, cfs, executionController), Stage.PURGED, false);
-            iterator = withMetricsRecording(iterator, cfs.metric, startTimeNanos);
+            ColumnFamilyStore cfs = Keyspace.openAndGetStore(metadata());
+            Index.QueryPlan indexQueryPlan = indexQueryPlan();
 
-            // If we've used a 2ndary index, we know the result already satisfy the primary expression used, so
-            // no point in checking it again.
-            RowFilter filter = (null == searcher) ? rowFilter() : index.getPostIndexQueryFilter(rowFilter());
-
-            /*
-             * TODO: We'll currently do filtering by the rowFilter here because it's convenient. However,
-             * we'll probably want to optimize by pushing it down the layer (like for dropped columns) as it
-             * would be more efficient (the sooner we discard stuff we know we don't care, the less useless
-             * processing we do on it).
-             */
-            iterator = filter.filter(iterator, nowInSec());
-
-            // apply the limits/row counter; this transformation is stopping and would close the iterator as soon
-            // as the count is observed; if that happens in the middle of an open RT, its end bound will not be included.
-            // If tracking repaired data, the counter is needed for overreading repaired data, otherwise we can
-            // optimise the case where this.limit = DataLimits.NONE which skips an unnecessary transform
-            if (executionController.isTrackingRepairedStatus())
+            Index.Searcher searcher = null;
+            if (indexQueryPlan != null)
             {
-                DataLimits.Counter limit =
+                cfs.indexManager.checkQueryability(indexQueryPlan);
+
+                searcher = indexQueryPlan.searcherFor(this);
+                Tracing.trace("Executing read on {}.{} using index{} {}",
+                              cfs.metadata.keyspace,
+                              cfs.metadata.name,
+                              indexQueryPlan.getIndexes().size() == 1 ? "" : "es",
+                              indexQueryPlan.getIndexes()
+                                            .stream()
+                                            .map(i -> i.getIndexMetadata().name)
+                                            .collect(Collectors.joining(",")));
+            }
+
+            UnfilteredPartitionIterator iterator = (null == searcher) ? queryStorage(cfs, executionController) : searcher.search(executionController);
+            iterator = RTBoundValidator.validate(iterator, Stage.MERGED, false);
+
+            try
+            {
+                iterator = withQuerySizeTracking(iterator);
+                iterator = maybeSlowDownForTesting(iterator);
+                iterator = withQueryCancellation(iterator);
+                iterator = RTBoundValidator.validate(withoutPurgeableTombstones(iterator, cfs, executionController), Stage.PURGED, false);
+                iterator = withMetricsRecording(iterator, cfs.metric, startTimeNanos);
+
+                // If we've used a 2ndary index, we know the result already satisfy the primary expression used, so
+                // no point in checking it again.
+                RowFilter filter = (null == searcher) ? rowFilter() : indexQueryPlan.postIndexQueryFilter();
+
+                /*
+                 * TODO: We'll currently do filtering by the rowFilter here because it's convenient. However,
+                 * we'll probably want to optimize by pushing it down the layer (like for dropped columns) as it
+                 * would be more efficient (the sooner we discard stuff we know we don't care, the less useless
+                 * processing we do on it).
+                 */
+                iterator = filter.filter(iterator, nowInSec());
+
+                // apply the limits/row counter; this transformation is stopping and would close the iterator as soon
+                // as the count is observed; if that happens in the middle of an open RT, its end bound will not be included.
+                // If tracking repaired data, the counter is needed for overreading repaired data, otherwise we can
+                // optimise the case where this.limit = DataLimits.NONE which skips an unnecessary transform
+                if (executionController.isTrackingRepairedStatus())
+                {
+                    DataLimits.Counter limit =
                     limits().newCounter(nowInSec(), false, selectsFullPartition(), metadata().enforceStrictLiveness());
-                iterator = limit.applyTo(iterator);
-                // ensure that a consistent amount of repaired data is read on each replica. This causes silent
-                // overreading from the repaired data set, up to limits(). The extra data is not visible to
-                // the caller, only iterated to produce the repaired data digest.
-                iterator = executionController.getRepairedDataInfo().extend(iterator, limit);
-            }
-            else
-            {
-                iterator = limits().filter(iterator, nowInSec(), selectsFullPartition());
-            }
+                    iterator = limit.applyTo(iterator);
+                    // ensure that a consistent amount of repaired data is read on each replica. This causes silent
+                    // overreading from the repaired data set, up to limits(). The extra data is not visible to
+                    // the caller, only iterated to produce the repaired data digest.
+                    iterator = executionController.getRepairedDataInfo().extend(iterator, limit);
+                }
+                else
+                {
+                    iterator = limits().filter(iterator, nowInSec(), selectsFullPartition());
+                }
 
-            // because of the above, we need to append an aritifical end bound if the source iterator was stopped short by a counter.
-            return RTBoundCloser.close(iterator);
+                // because of the above, we need to append an aritifical end bound if the source iterator was stopped short by a counter.
+                return RTBoundCloser.close(iterator);
+            }
+            catch (RuntimeException | Error e)
+            {
+                iterator.close();
+                throw e;
+            }
         }
-        catch (RuntimeException | Error e)
+        finally
         {
-            iterator.close();
-            throw e;
+            COMMAND.set(null);
         }
     }
 
@@ -478,7 +529,9 @@ public abstract class ReadCommand extends AbstractReadQuery
             private final boolean enforceStrictLiveness = metadata().enforceStrictLiveness();
 
             private int liveRows = 0;
+            private int lastReportedLiveRows = 0;
             private int tombstones = 0;
+            private int lastReportedTombstones = 0;
 
             private DecoratedKey currentKey;
 
@@ -539,16 +592,32 @@ public abstract class ReadCommand extends AbstractReadQuery
                     if (trackWarnings)
                     {
                         MessageParams.remove(ParamType.TOMBSTONE_WARNING);
-                        MessageParams.add(ParamType.TOMBSTONE_ABORT, tombstones);
+                        MessageParams.add(ParamType.TOMBSTONE_FAIL, tombstones);
                     }
                     throw new TombstoneOverwhelmingException(tombstones, query, ReadCommand.this.metadata(), currentKey, clustering);
                 }
             }
 
             @Override
+            protected void onPartitionClose()
+            {
+                int lr = liveRows - lastReportedLiveRows;
+                int ts = tombstones - lastReportedTombstones;
+
+                if (lr > 0)
+                    metric.topReadPartitionRowCount.addSample(currentKey.getKey(), lr);
+
+                if (ts > 0)
+                    metric.topReadPartitionTombstoneCount.addSample(currentKey.getKey(), ts);
+
+                lastReportedLiveRows = liveRows;
+                lastReportedTombstones = tombstones;
+            }
+
+            @Override
             public void onClose()
             {
-                recordLatency(metric, System.nanoTime() - startTimeNanos);
+                recordLatency(metric, nanoTime() - startTimeNanos);
 
                 metric.tombstoneScannedHistogram.update(tombstones);
                 metric.liveScannedHistogram.update(liveRows);
@@ -580,74 +649,192 @@ public abstract class ReadCommand extends AbstractReadQuery
         return Transformation.apply(iter, new MetricRecording());
     }
 
-    protected class CheckForAbort extends StoppingTransformation<UnfilteredRowIterator>
+    private boolean shouldTrackSize(DataStorageSpec.LongBytesBound warnThresholdBytes, DataStorageSpec.LongBytesBound abortThresholdBytes)
     {
-        long lastChecked = 0;
+        return trackWarnings
+               && !SchemaConstants.isSystemKeyspace(metadata().keyspace)
+               && !(warnThresholdBytes == null && abortThresholdBytes == null);
+    }
 
-        protected UnfilteredRowIterator applyToPartition(UnfilteredRowIterator partition)
+    private UnfilteredPartitionIterator withQuerySizeTracking(UnfilteredPartitionIterator iterator)
+    {
+        DataStorageSpec.LongBytesBound warnThreshold = DatabaseDescriptor.getLocalReadSizeWarnThreshold();
+        DataStorageSpec.LongBytesBound failThreshold = DatabaseDescriptor.getLocalReadSizeFailThreshold();
+        if (!shouldTrackSize(warnThreshold, failThreshold))
+            return iterator;
+        final long warnBytes = warnThreshold == null ? -1 : warnThreshold.toBytes();
+        final long failBytes = failThreshold == null ? -1 : failThreshold.toBytes();
+        class QuerySizeTracking extends Transformation<UnfilteredRowIterator>
         {
-            if (maybeAbort())
+            private long sizeInBytes = 0;
+
+            @Override
+            public UnfilteredRowIterator applyToPartition(UnfilteredRowIterator iter)
             {
-                partition.close();
-                return null;
+                sizeInBytes += ObjectSizes.sizeOnHeapOf(iter.partitionKey().getKey());
+                return Transformation.apply(iter, this);
             }
 
+            @Override
+            protected Row applyToStatic(Row row)
+            {
+                if (row == Rows.EMPTY_STATIC_ROW)
+                    return row;
+
+                return applyToRow(row);
+            }
+
+            @Override
+            protected Row applyToRow(Row row)
+            {
+                addSize(row.unsharedHeapSize());
+                return row;
+            }
+
+            @Override
+            protected RangeTombstoneMarker applyToMarker(RangeTombstoneMarker marker)
+            {
+                addSize(marker.unsharedHeapSize());
+                return marker;
+            }
+
+            @Override
+            protected DeletionTime applyToDeletion(DeletionTime deletionTime)
+            {
+                addSize(deletionTime.unsharedHeapSize());
+                return deletionTime;
+            }
+
+            private void addSize(long size)
+            {
+                this.sizeInBytes += size;
+                if (failBytes != -1 && this.sizeInBytes >= failBytes)
+                {
+                    String msg = String.format("Query %s attempted to read %d bytes but max allowed is %s; query aborted  (see local_read_size_fail_threshold)",
+                                               ReadCommand.this.toCQLString(), this.sizeInBytes, failThreshold);
+                    Tracing.trace(msg);
+                    MessageParams.remove(ParamType.LOCAL_READ_SIZE_WARN);
+                    MessageParams.add(ParamType.LOCAL_READ_SIZE_FAIL, this.sizeInBytes);
+                    throw new LocalReadSizeTooLargeException(msg);
+                }
+                else if (warnBytes != -1 && this.sizeInBytes >= warnBytes)
+                {
+                    MessageParams.add(ParamType.LOCAL_READ_SIZE_WARN, this.sizeInBytes);
+                }
+            }
+
+            @Override
+            protected void onClose()
+            {
+                ColumnFamilyStore cfs = Schema.instance.getColumnFamilyStoreInstance(metadata().id);
+                if (cfs != null)
+                    cfs.metric.localReadSize.update(sizeInBytes);
+            }
+        }
+
+        iterator = Transformation.apply(iterator, new QuerySizeTracking());
+        return iterator;
+    }
+
+    private class QueryCancellationChecker extends StoppingTransformation<UnfilteredRowIterator>
+    {
+        long lastCheckedAt = 0;
+
+        @Override
+        protected UnfilteredRowIterator applyToPartition(UnfilteredRowIterator partition)
+        {
+            maybeCancel();
             return Transformation.apply(partition, this);
         }
 
+        @Override
         protected Row applyToRow(Row row)
         {
-            if (TEST_ITERATION_DELAY_MILLIS > 0)
-                maybeDelayForTesting();
-
-            return maybeAbort() ? null : row;
+            maybeCancel();
+            return row;
         }
 
-        private boolean maybeAbort()
+        private void maybeCancel()
         {
-            /**
-             * TODO: this is not a great way to abort early; why not expressly limit checks to 10ms intervals?
+            /*
              * The value returned by approxTime.now() is updated only every
-             * {@link org.apache.cassandra.utils.MonotonicClock.SampledClock.CHECK_INTERVAL_MS}, by default 2 millis. Since MonitorableImpl
-             * relies on approxTime, we don't need to check unless the approximate time has elapsed.
+             * {@link org.apache.cassandra.utils.MonotonicClock.SampledClock.CHECK_INTERVAL_MS}, by default 2 millis.
+             * Since MonitorableImpl relies on approxTime, we don't need to check unless the approximate time has elapsed.
              */
-            if (lastChecked == approxTime.now())
-                return false;
-
-            lastChecked = approxTime.now();
+            if (lastCheckedAt == approxTime.now())
+                return;
+            lastCheckedAt = approxTime.now();
 
             if (isAborted())
             {
                 stop();
-                return true;
+                throw new QueryCancelledException(ReadCommand.this);
             }
-
-            return false;
-        }
-
-        private void maybeDelayForTesting()
-        {
-            if (!metadata().keyspace.startsWith("system"))
-                FBUtilities.sleepQuietly(TEST_ITERATION_DELAY_MILLIS);
         }
     }
 
-    protected UnfilteredPartitionIterator withStateTracking(UnfilteredPartitionIterator iter)
+    private UnfilteredPartitionIterator withQueryCancellation(UnfilteredPartitionIterator iter)
     {
-        return Transformation.apply(iter, new CheckForAbort());
+        return Transformation.apply(iter, new QueryCancellationChecker());
+    }
+
+    /**
+     *  A transformation used for simulating slow queries by tests.
+     */
+    private static class DelayInjector extends Transformation<UnfilteredRowIterator>
+    {
+        @Override
+        protected UnfilteredRowIterator applyToPartition(UnfilteredRowIterator partition)
+        {
+            FBUtilities.sleepQuietly(TEST_ITERATION_DELAY_MILLIS);
+            return Transformation.apply(partition, this);
+        }
+
+        @Override
+        protected Row applyToRow(Row row)
+        {
+            FBUtilities.sleepQuietly(TEST_ITERATION_DELAY_MILLIS);
+            return row;
+        }
+    }
+
+    private UnfilteredPartitionIterator maybeSlowDownForTesting(UnfilteredPartitionIterator iter)
+    {
+        if (TEST_ITERATION_DELAY_MILLIS > 0 && !SchemaConstants.isSystemKeyspace(metadata().keyspace))
+            return Transformation.apply(iter, new DelayInjector());
+        else
+            return iter;
     }
 
     /**
      * Creates a message for this command.
      */
-    public Message<ReadCommand> createMessage(boolean trackRepairedData)
+    public Message<ReadCommand> createMessage(boolean trackRepairedData, Dispatcher.RequestTime requestTime)
     {
-        Message<ReadCommand> msg = trackRepairedData
-                                   ? Message.outWithFlags(verb(), this, MessageFlag.CALL_BACK_ON_FAILURE, MessageFlag.TRACK_REPAIRED_DATA)
-                                   : Message.outWithFlag(verb(), this, MessageFlag.CALL_BACK_ON_FAILURE);
+        List<MessageFlag> flags = new ArrayList<>(3);
+        flags.add(MessageFlag.CALL_BACK_ON_FAILURE);
         if (trackWarnings)
-            msg = msg.withFlag(MessageFlag.TRACK_WARNINGS);
-        return msg;
+            flags.add(MessageFlag.TRACK_WARNINGS);
+        if (trackRepairedData)
+            flags.add(MessageFlag.TRACK_REPAIRED_DATA);
+
+        return Message.outWithFlags(verb(),
+                                    this,
+                                    requestTime,
+                                    flags);
+    }
+
+    protected abstract boolean intersects(SSTableReader sstable);
+
+    protected boolean hasRequiredStatics(SSTableReader sstable) {
+        // If some static columns are queried, we should always include the sstable: the clustering values stats of the sstable
+        // don't tell us if the sstable contains static values in particular.
+        return !columnFilter().fetchedColumns().statics.isEmpty() && sstable.header.hasStatic();
+    }
+
+    protected boolean hasPartitionLevelDeletions(SSTableReader sstable)
+    {
+        return sstable.getSSTableMetadata().hasPartitionLevelDeletions;
     }
 
     public abstract Verb verb();
@@ -679,35 +866,6 @@ public abstract class ReadCommand extends AbstractReadQuery
     }
 
     /**
-     * Recreate the CQL string corresponding to this query.
-     * <p>
-     * Note that in general the returned string will not be exactly the original user string, first
-     * because there isn't always a single syntax for a given query,  but also because we don't have
-     * all the information needed (we know the non-PK columns queried but not the PK ones as internally
-     * we query them all). So this shouldn't be relied too strongly, but this should be good enough for
-     * debugging purpose which is what this is for.
-     */
-    public String toCQLString()
-    {
-        StringBuilder sb = new StringBuilder().append("SELECT ")
-                                              .append(columnFilter().toCQLString())
-                                              .append(" FROM ")
-                                              .append(ColumnIdentifier.maybeQuote(metadata().keyspace))
-                                              .append('.')
-                                              .append(ColumnIdentifier.maybeQuote(metadata().name));
-
-        appendCQLWhereClause(sb);
-
-        if (limits() != DataLimits.NONE)
-            sb.append(' ').append(limits());
-
-        // ALLOW FILTERING might not be strictly necessary
-        sb.append(" ALLOW FILTERING");
-
-        return sb.toString();
-    }
-
-    /**
      * Return the queried token(s) for logging
      */
     public abstract String loggableTokens();
@@ -718,7 +876,6 @@ public abstract class ReadCommand extends AbstractReadQuery
         return toCQLString();
     }
 
-    @SuppressWarnings("resource") // resultant iterators are closed by their callers
     InputCollector<UnfilteredRowIterator> iteratorsForPartition(ColumnFamilyStore.ViewFragment view, ReadExecutionController controller)
     {
         final BiFunction<List<UnfilteredRowIterator>, RepairedDataInfo, UnfilteredRowIterator> merge =
@@ -735,7 +892,6 @@ public abstract class ReadCommand extends AbstractReadQuery
         return new InputCollector<>(view, controller, merge, postLimitPartitions);
     }
 
-    @SuppressWarnings("resource") // resultant iterators are closed by their callers
     InputCollector<UnfilteredPartitionIterator> iteratorsForRange(ColumnFamilyStore.ViewFragment view, ReadExecutionController controller)
     {
         final BiFunction<List<UnfilteredPartitionIterator>, RepairedDataInfo, UnfilteredPartitionIterator> merge =
@@ -819,8 +975,7 @@ public abstract class ReadCommand extends AbstractReadQuery
                 unrepairedIters.add(iter);
         }
 
-        @SuppressWarnings("resource") // the returned iterators are closed by the caller
-        List<T> finalizeIterators(ColumnFamilyStore cfs, int nowInSec, int oldestUnrepairedTombstone)
+        List<T> finalizeIterators(ColumnFamilyStore cfs, long nowInSec, long oldestUnrepairedTombstone)
         {
             if (repairedIters.isEmpty())
                 return unrepairedIters;
@@ -851,16 +1006,16 @@ public abstract class ReadCommand extends AbstractReadQuery
             if (!isTrackingRepairedStatus)
                 return false;
 
-            UUID pendingRepair = sstable.getPendingRepair();
+            TimeUUID pendingRepair = sstable.getPendingRepair();
             if (pendingRepair != ActiveRepairService.NO_PENDING_REPAIR)
             {
-                if (ActiveRepairService.instance.consistent.local.isSessionFinalized(pendingRepair))
+                if (ActiveRepairService.instance().consistent.local.isSessionFinalized(pendingRepair))
                     return true;
 
                 // In the edge case where compaction is backed up long enough for the session to
                 // timeout and be purged by LocalSessions::cleanup, consider the sstable unrepaired
                 // as it will be marked unrepaired when compaction catches up
-                if (!ActiveRepairService.instance.consistent.local.sessionExists(pendingRepair))
+                if (!ActiveRepairService.instance().consistent.local.sessionExists(pendingRepair))
                     return false;
 
                 repairedDataInfo.markInconclusive();
@@ -884,6 +1039,17 @@ public abstract class ReadCommand extends AbstractReadQuery
     @VisibleForTesting
     public static class Serializer implements IVersionedSerializer<ReadCommand>
     {
+        private static final NoSpamLogger noSpamLogger = NoSpamLogger.getLogger(logger, 10L, TimeUnit.SECONDS);
+        private static final NoSpamLogger.NoSpamLogStatement schemaMismatchStmt =
+            noSpamLogger.getStatement("Schema epoch mismatch during read command deserialization. " +
+                                      "TableId: {}, remote epoch: {}, local epoch: {}", 10L, TimeUnit.SECONDS);
+
+        private static final int IS_DIGEST = 0x01;
+        private static final int IS_FOR_THRIFT = 0x02;
+        private static final int HAS_INDEX = 0x04;
+        private static final int ACCEPTS_TRANSIENT = 0x08;
+        private static final int NEEDS_RECONCILIATION = 0x10;
+
         private final SchemaProvider schema;
 
         public Serializer()
@@ -899,22 +1065,22 @@ public abstract class ReadCommand extends AbstractReadQuery
 
         private static int digestFlag(boolean isDigest)
         {
-            return isDigest ? 0x01 : 0;
+            return isDigest ? IS_DIGEST : 0;
         }
 
         private static boolean isDigest(int flags)
         {
-            return (flags & 0x01) != 0;
+            return (flags & IS_DIGEST) != 0;
         }
 
         private static boolean acceptsTransient(int flags)
         {
-            return (flags & 0x08) != 0;
+            return (flags & ACCEPTS_TRANSIENT) != 0;
         }
 
         private static int acceptsTransientFlag(boolean acceptsTransient)
         {
-            return acceptsTransient ? 0x08 : 0;
+            return acceptsTransient ? ACCEPTS_TRANSIENT : 0;
         }
 
         // We don't set this flag anymore, but still look if we receive a
@@ -924,17 +1090,27 @@ public abstract class ReadCommand extends AbstractReadQuery
         // used by these release for thrift and would thus confuse things)
         private static boolean isForThrift(int flags)
         {
-            return (flags & 0x02) != 0;
+            return (flags & IS_FOR_THRIFT) != 0;
         }
 
         private static int indexFlag(boolean hasIndex)
         {
-            return hasIndex ? 0x04 : 0;
+            return hasIndex ? HAS_INDEX : 0;
         }
 
         private static boolean hasIndex(int flags)
         {
-            return (flags & 0x04) != 0;
+            return (flags & HAS_INDEX) != 0;
+        }
+
+        private static int needsReconciliationFlag(boolean needsReconciliation)
+        {
+            return needsReconciliation ? NEEDS_RECONCILIATION : 0;
+        }
+        
+        private static boolean needsReconciliation(int flags)
+        {
+            return (flags & NEEDS_RECONCILIATION) != 0;
         }
 
         public void serialize(ReadCommand command, DataOutputPlus out, int version) throws IOException
@@ -942,18 +1118,24 @@ public abstract class ReadCommand extends AbstractReadQuery
             out.writeByte(command.kind.ordinal());
             out.writeByte(
                     digestFlag(command.isDigestQuery())
-                    | indexFlag(null != command.indexMetadata())
+                    | indexFlag(null != command.indexQueryPlan())
                     | acceptsTransientFlag(command.acceptsTransient())
+                    | needsReconciliationFlag(command.rowFilter().needsReconciliation())
             );
             if (command.isDigestQuery())
-                out.writeUnsignedVInt(command.digestVersion());
+                out.writeUnsignedVInt32(command.digestVersion());
             command.metadata().id.serialize(out);
-            out.writeInt(command.nowInSec());
+            if (version >= MessagingService.VERSION_51)
+                Epoch.serializer.serialize(command.serializedAtEpoch, out);
+            out.writeInt(version >= MessagingService.VERSION_50 ? CassandraUInt.fromLong(command.nowInSec()) : (int) command.nowInSec());
             ColumnFilter.serializer.serialize(command.columnFilter(), out, version);
             RowFilter.serializer.serialize(command.rowFilter(), out, version);
             DataLimits.serializer.serialize(command.limits(), out, version, command.metadata().comparator);
-            if (null != command.index)
-                IndexMetadata.serializer.serialize(command.index, out, version);
+            // Using the name of one of the indexes in the plan to identify the index group because we want
+            // to keep compatibility with legacy nodes. Each replica can create its own different index query plan
+            // from the index name.
+            if (null != command.indexQueryPlan)
+                IndexMetadata.serializer.serialize(command.indexQueryPlan.getFirst().getIndexMetadata(), out, version);
 
             command.serializeSelection(out, version);
         }
@@ -968,20 +1150,48 @@ public abstract class ReadCommand extends AbstractReadQuery
             // better complain loudly than doing the wrong thing.
             if (isForThrift(flags))
                 throw new IllegalStateException("Received a command with the thrift flag set. "
-                                              + "This means thrift is in use in a mixed 3.0/3.X and 4.0+ cluster, "
-                                              + "which is unsupported. Make sure to stop using thrift before "
-                                              + "upgrading to 4.0");
+                                                + "This means thrift is in use in a mixed 3.0/3.X and 4.0+ cluster, "
+                                                + "which is unsupported. Make sure to stop using thrift before "
+                                                + "upgrading to 4.0");
 
             boolean hasIndex = hasIndex(flags);
             int digestVersion = isDigest ? (int)in.readUnsignedVInt() : 0;
-            TableMetadata metadata = schema.getExistingTableMetadata(TableId.deserialize(in));
-            int nowInSec = in.readInt();
-            ColumnFilter columnFilter = ColumnFilter.serializer.deserialize(in, version, metadata);
-            RowFilter rowFilter = RowFilter.serializer.deserialize(in, version, metadata);
-            DataLimits limits = DataLimits.serializer.deserialize(in, version,  metadata.comparator);
-            IndexMetadata index = hasIndex ? deserializeIndexMetadata(in, version, metadata) : null;
+            boolean needsReconciliation = needsReconciliation(flags);
+            TableId tableId = TableId.deserialize(in);
 
-            return kind.selectionDeserializer.deserialize(in, version, isDigest, digestVersion, acceptsTransient, metadata, nowInSec, columnFilter, rowFilter, limits, index);
+            Epoch schemaVersion = Epoch.EMPTY;
+            if (version >= MessagingService.VERSION_51)
+                schemaVersion = Epoch.serializer.deserialize(in);
+            TableMetadata tableMetadata;
+            try
+            {
+                tableMetadata = schema.getExistingTableMetadata(tableId);
+            }
+            catch (UnknownTableException e)
+            {
+                ClusterMetadata metadata = ClusterMetadata.current();
+                Epoch localCurrentEpoch = metadata.epoch;
+                if (schemaVersion != null && localCurrentEpoch.isAfter(schemaVersion))
+                {
+                    TCMMetrics.instance.coordinatorBehindSchema.mark();
+                    throw new CoordinatorBehindException(e.getMessage());
+                }
+                throw e;
+            }
+            long nowInSec = version >= MessagingService.VERSION_50 ? CassandraUInt.toLong(in.readInt()) : in.readInt();
+            ColumnFilter columnFilter = ColumnFilter.serializer.deserialize(in, version, tableMetadata);
+            RowFilter rowFilter = RowFilter.serializer.deserialize(in, version, tableMetadata, needsReconciliation);
+            DataLimits limits = DataLimits.serializer.deserialize(in, version,  tableMetadata);
+            Index.QueryPlan indexQueryPlan = null;
+            if (hasIndex)
+            {
+                IndexMetadata index = deserializeIndexMetadata(in, version, tableMetadata);
+                Index.Group indexGroup =  Keyspace.openAndGetStore(tableMetadata).indexManager.getIndexGroup(index);
+                if (indexGroup != null)
+                    indexQueryPlan = indexGroup.queryPlanFor(rowFilter);
+            }
+
+            return kind.selectionDeserializer.deserialize(in, version, schemaVersion, isDigest, digestVersion, acceptsTransient, tableMetadata, nowInSec, columnFilter, rowFilter, limits, indexQueryPlan);
         }
 
         private IndexMetadata deserializeIndexMetadata(DataInputPlus in, int version, TableMetadata metadata) throws IOException
@@ -1006,7 +1216,8 @@ public abstract class ReadCommand extends AbstractReadQuery
             return 2 // kind + flags
                    + (command.isDigestQuery() ? TypeSizes.sizeofUnsignedVInt(command.digestVersion()) : 0)
                    + command.metadata().id.serializedSize()
-                   + TypeSizes.sizeof(command.nowInSec())
+                   + (version >= MessagingService.VERSION_51 ? Epoch.serializer.serializedSize(command.metadata().epoch) : 0)
+                   + TypeSizes.INT_SIZE // command.nowInSec() is serialized as uint
                    + ColumnFilter.serializer.serializedSize(command.columnFilter(), version)
                    + RowFilter.serializer.serializedSize(command.rowFilter(), version)
                    + DataLimits.serializer.serializedSize(command.limits(), version, command.metadata().comparator)

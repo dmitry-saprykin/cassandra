@@ -277,13 +277,14 @@ public class RepairedDataVerifierTest
     {
         StubReadCommand(int key, TableMetadata metadata, boolean isDigest)
         {
-            super(isDigest,
+            super(metadata.epoch,
+                  isDigest,
                   0,
                   false,
                   metadata,
                   FBUtilities.nowInSeconds(),
                   ColumnFilter.all(metadata),
-                  RowFilter.NONE,
+                  RowFilter.none(),
                   DataLimits.NONE,
                   metadata.partitioner.decorateKey(ByteBufferUtil.bytes(key)),
                   new ClusteringIndexSliceFilter(Slices.ALL, false),

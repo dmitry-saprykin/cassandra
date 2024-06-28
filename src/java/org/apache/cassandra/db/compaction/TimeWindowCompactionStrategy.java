@@ -30,6 +30,8 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.*;
@@ -45,6 +47,7 @@ import org.apache.cassandra.schema.CompactionParams;
 import org.apache.cassandra.utils.Pair;
 
 import static com.google.common.collect.Iterables.filter;
+import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
 
 public class TimeWindowCompactionStrategy extends AbstractCompactionStrategy
 {
@@ -55,6 +58,9 @@ public class TimeWindowCompactionStrategy extends AbstractCompactionStrategy
     private final Set<SSTableReader> sstables = new HashSet<>();
     private long lastExpiredCheck;
     private long highestWindowSeen;
+
+    // This is accessed in both the threading context of compaction / repair and also JMX
+    private volatile Map<Long, Integer> sstableCountByBuckets = Collections.emptyMap();
 
     public TimeWindowCompactionStrategy(ColumnFamilyStore cfs, Map<String, String> options)
     {
@@ -74,8 +80,7 @@ public class TimeWindowCompactionStrategy extends AbstractCompactionStrategy
     }
 
     @Override
-    @SuppressWarnings("resource") // transaction is closed by AbstractCompactionTask::execute
-    public AbstractCompactionTask getNextBackgroundTask(int gcBefore)
+    public AbstractCompactionTask getNextBackgroundTask(long gcBefore)
     {
         List<SSTableReader> previousCandidate = null;
         while (true)
@@ -107,7 +112,7 @@ public class TimeWindowCompactionStrategy extends AbstractCompactionStrategy
      * @param gcBefore
      * @return
      */
-    private synchronized List<SSTableReader> getNextBackgroundSSTables(final int gcBefore)
+    private synchronized List<SSTableReader> getNextBackgroundSSTables(final long gcBefore)
     {
         if (Iterables.isEmpty(cfs.getSSTables(SSTableSet.LIVE)))
             return Collections.emptyList();
@@ -117,12 +122,12 @@ public class TimeWindowCompactionStrategy extends AbstractCompactionStrategy
         // Find fully expired SSTables. Those will be included no matter what.
         Set<SSTableReader> expired = Collections.emptySet();
 
-        if (System.currentTimeMillis() - lastExpiredCheck > options.expiredSSTableCheckFrequency)
+        if (currentTimeMillis() - lastExpiredCheck > options.expiredSSTableCheckFrequency)
         {
             logger.debug("TWCS expired check sufficiently far in the past, checking for fully expired SSTables");
             expired = CompactionController.getFullyExpiredSSTables(cfs, uncompacting, options.ignoreOverlaps ? Collections.emptySet() : cfs.getOverlappingLiveSSTables(uncompacting),
                                                                    gcBefore, options.ignoreOverlaps);
-            lastExpiredCheck = System.currentTimeMillis();
+            lastExpiredCheck = currentTimeMillis();
         }
         else
         {
@@ -141,7 +146,7 @@ public class TimeWindowCompactionStrategy extends AbstractCompactionStrategy
         return compactionCandidates;
     }
 
-    private List<SSTableReader> getNextNonExpiredSSTables(Iterable<SSTableReader> nonExpiringSSTables, final int gcBefore)
+    private List<SSTableReader> getNextNonExpiredSSTables(Iterable<SSTableReader> nonExpiringSSTables, final long gcBefore)
     {
         List<SSTableReader> mostInteresting = getCompactionCandidates(nonExpiringSSTables);
 
@@ -178,6 +183,7 @@ public class TimeWindowCompactionStrategy extends AbstractCompactionStrategy
                 this.highestWindowSeen);
 
         this.estimatedRemainingTasks = mostInteresting.estimatedRemainingTasks;
+        this.sstableCountByBuckets = buckets.left.keySet().stream().collect(Collectors.toMap(Function.identity(), k -> buckets.left.get(k).size()));
         if (!mostInteresting.sstables.isEmpty())
             return mostInteresting.sstables;
         return null;
@@ -196,7 +202,7 @@ public class TimeWindowCompactionStrategy extends AbstractCompactionStrategy
     }
 
     @Override
-    protected Set<SSTableReader> getSSTables()
+    protected synchronized Set<SSTableReader> getSSTables()
     {
         return ImmutableSet.copyOf(sstables);
     }
@@ -373,8 +379,7 @@ public class TimeWindowCompactionStrategy extends AbstractCompactionStrategy
     }
 
     @Override
-    @SuppressWarnings("resource") // transaction is closed by AbstractCompactionTask::execute
-    public synchronized Collection<AbstractCompactionTask> getMaximalTask(int gcBefore, boolean splitOutput)
+    public synchronized Collection<AbstractCompactionTask> getMaximalTask(long gcBefore, boolean splitOutput)
     {
         Iterable<SSTableReader> filteredSSTables = filterSuspectSSTables(sstables);
         if (Iterables.isEmpty(filteredSSTables))
@@ -385,9 +390,22 @@ public class TimeWindowCompactionStrategy extends AbstractCompactionStrategy
         return Collections.singleton(new TimeWindowCompactionTask(cfs, txn, gcBefore, options.ignoreOverlaps));
     }
 
+    /**
+     * TWCS should not group sstables for anticompaction - this can mix new and old data
+     */
     @Override
-    @SuppressWarnings("resource") // transaction is closed by AbstractCompactionTask::execute
-    public synchronized AbstractCompactionTask getUserDefinedTask(Collection<SSTableReader> sstables, int gcBefore)
+    public Collection<Collection<SSTableReader>> groupSSTablesForAntiCompaction(Collection<SSTableReader> sstablesToGroup)
+    {
+        Collection<Collection<SSTableReader>> groups = new ArrayList<>(sstablesToGroup.size());
+        for (SSTableReader sstable : sstablesToGroup)
+        {
+            groups.add(Collections.singleton(sstable));
+        }
+        return groups;
+    }
+
+    @Override
+    public synchronized AbstractCompactionTask getUserDefinedTask(Collection<SSTableReader> sstables, long gcBefore)
     {
         assert !sstables.isEmpty(); // checked for by CM.submitUserDefined
 
@@ -411,6 +429,10 @@ public class TimeWindowCompactionStrategy extends AbstractCompactionStrategy
         return Long.MAX_VALUE;
     }
 
+    public Map<Long, Integer> getSSTableCountByBuckets()
+    {
+        return sstableCountByBuckets;
+    }
 
     public static Map<String, String> validateOptions(Map<String, String> options) throws ConfigurationException
     {

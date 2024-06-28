@@ -18,29 +18,38 @@
 package org.apache.cassandra.db.compaction;
 
 import java.nio.ByteBuffer;
-import java.util.*;
-import java.util.concurrent.*;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingDeque;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 import com.google.common.collect.Lists;
-
-import org.apache.cassandra.db.lifecycle.SSTableSet;
-import org.apache.cassandra.db.rows.UnfilteredRowIterator;
-import org.apache.cassandra.io.sstable.ISSTableScanner;
-import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.junit.BeforeClass;
-import org.junit.Ignore;
 import org.junit.Test;
 
 import org.apache.cassandra.SchemaLoader;
-import org.apache.cassandra.Util;
 import org.apache.cassandra.UpdateBuilder;
-import org.apache.cassandra.db.*;
+import org.apache.cassandra.Util;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.db.lifecycle.SSTableSet;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.io.sstable.ISSTableScanner;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.schema.CompactionParams;
 import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.service.ActiveRepairService;
-import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.FBUtilities;
 
 import static org.junit.Assert.assertFalse;
@@ -77,7 +86,7 @@ public class LongLeveledCompactionStrategyTest
         CompactionStrategyManager mgr = store.getCompactionStrategyManager();
         LeveledCompactionStrategy lcs = (LeveledCompactionStrategy) mgr.getStrategies().get(1).get(0);
 
-        ByteBuffer value = ByteBuffer.wrap(new byte[100 * 1024]); // 100 KB value, make it easy to have multiple files
+        ByteBuffer value = ByteBuffer.wrap(new byte[100 * 1024]); // 100 KiB value, make it easy to have multiple files
 
         populateSSTables(store);
 
@@ -128,7 +137,7 @@ public class LongLeveledCompactionStrategyTest
 
                 if (level > 0)
                 {// overlap check for levels greater than 0
-                    Set<SSTableReader> overlaps = LeveledManifest.overlapping(sstable.first.getToken(), sstable.last.getToken(), sstables);
+                    Set<SSTableReader> overlaps = LeveledManifest.overlapping(sstable.getFirst().getToken(), sstable.getLast().getToken(), sstables);
                     assert overlaps.size() == 1 && overlaps.contains(sstable);
                 }
             }
@@ -140,7 +149,7 @@ public class LongLeveledCompactionStrategyTest
     {
         Keyspace keyspace = Keyspace.open(KEYSPACE1);
         ColumnFamilyStore store = keyspace.getColumnFamilyStore(CF_STANDARDLVL2);
-        ByteBuffer value = ByteBuffer.wrap(new byte[100 * 1024]); // 100 KB value, make it easy to have multiple files
+        ByteBuffer value = ByteBuffer.wrap(new byte[100 * 1024]); // 100 KiB value, make it easy to have multiple files
 
         populateSSTables(store);
 
@@ -149,7 +158,7 @@ public class LongLeveledCompactionStrategyTest
         CompactionStrategyManager mgr = store.getCompactionStrategyManager();
         LeveledCompactionStrategy lcs = (LeveledCompactionStrategy) mgr.getStrategies().get(1).get(0);
 
-        value = ByteBuffer.wrap(new byte[10 * 1024]); // 10 KB value
+        value = ByteBuffer.wrap(new byte[10 * 1024]); // 10 KiB value
 
         // Adds 10 partitions
         for (int r = 0; r < 10; r++)
@@ -164,7 +173,7 @@ public class LongLeveledCompactionStrategyTest
         }
 
         //Flush sstable
-        store.forceBlockingFlush();
+        Util.flush(store);
 
         store.runWithCompactionsDisabled(new Callable<Void>()
         {
@@ -200,9 +209,7 @@ public class LongLeveledCompactionStrategyTest
                 }
                 return null;
             }
-        }, true, true);
-
-
+        }, OperationType.COMPACTION, true, true);
     }
 
     @Test
@@ -247,7 +254,7 @@ public class LongLeveledCompactionStrategyTest
 
     private void populateSSTables(ColumnFamilyStore store)
     {
-        ByteBuffer value = ByteBuffer.wrap(new byte[100 * 1024]); // 100 KB value, make it easy to have multiple files
+        ByteBuffer value = ByteBuffer.wrap(new byte[100 * 1024]); // 100 KiB value, make it easy to have multiple files
 
         // Enough data to have a level 1 and 2
         int rows = 128;
@@ -263,7 +270,7 @@ public class LongLeveledCompactionStrategyTest
 
             Mutation rm = new Mutation(builder.build());
             rm.apply();
-            store.forceBlockingFlush();
+            Util.flush(store);
         }
     }
 }

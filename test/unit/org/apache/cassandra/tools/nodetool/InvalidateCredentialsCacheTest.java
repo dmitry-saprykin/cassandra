@@ -20,16 +20,15 @@ package org.apache.cassandra.tools.nodetool;
 
 import org.junit.BeforeClass;
 import org.junit.Test;
-import org.junit.runner.RunWith;
 
 import com.datastax.driver.core.EndPoint;
 import com.datastax.driver.core.PlainTextAuthProvider;
-import org.apache.cassandra.OrderedJUnit4ClassRunner;
-import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.auth.AuthTestUtils;
 import org.apache.cassandra.auth.AuthenticatedUser;
 import org.apache.cassandra.auth.IAuthenticator;
+import org.apache.cassandra.auth.IRoleManager;
 import org.apache.cassandra.auth.PasswordAuthenticator;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.tools.ToolRunner;
 
@@ -38,7 +37,6 @@ import static org.apache.cassandra.auth.AuthTestUtils.ROLE_B;
 import static org.apache.cassandra.auth.AuthTestUtils.getRolesReadCount;
 import static org.assertj.core.api.Assertions.assertThat;
 
-@RunWith(OrderedJUnit4ClassRunner.class)
 public class InvalidateCredentialsCacheTest extends CQLTester
 {
     private static IAuthenticator.SaslNegotiator roleANegotiator;
@@ -47,26 +45,20 @@ public class InvalidateCredentialsCacheTest extends CQLTester
     @BeforeClass
     public static void setup() throws Exception
     {
-        SchemaLoader.prepareServer();
-        AuthTestUtils.LocalCassandraRoleManager roleManager = new AuthTestUtils.LocalCassandraRoleManager();
-        PasswordAuthenticator authenticator = new AuthTestUtils.LocalPasswordAuthenticator();
-        SchemaLoader.setupAuth(roleManager,
-                authenticator,
-                new AuthTestUtils.LocalCassandraAuthorizer(),
-                new AuthTestUtils.LocalCassandraNetworkAuthorizer());
-
-        roleManager.createRole(AuthenticatedUser.SYSTEM_USER, ROLE_A, AuthTestUtils.getLoginRoleOprions());
-        roleManager.createRole(AuthenticatedUser.SYSTEM_USER, ROLE_B, AuthTestUtils.getLoginRoleOprions());
-
-        roleANegotiator = authenticator.newSaslNegotiator(null);
+        CQLTester.requireAuthentication();
+        IRoleManager roleManager = DatabaseDescriptor.getRoleManager();
+        roleManager.createRole(AuthenticatedUser.SYSTEM_USER, ROLE_A, AuthTestUtils.getLoginRoleOptions());
+        roleManager.createRole(AuthenticatedUser.SYSTEM_USER, ROLE_B, AuthTestUtils.getLoginRoleOptions());
+        PasswordAuthenticator passwordAuthenticator = (PasswordAuthenticator) DatabaseDescriptor.getAuthenticator();
+        roleANegotiator = passwordAuthenticator.newSaslNegotiator(null);
         roleANegotiator.evaluateResponse(new PlainTextAuthProvider(ROLE_A.getRoleName(), "ignored")
                 .newAuthenticator((EndPoint) null, null)
                 .initialResponse());
-        roleBNegotiator = authenticator.newSaslNegotiator(null);
+        roleBNegotiator = passwordAuthenticator.newSaslNegotiator(null);
         roleBNegotiator.evaluateResponse(new PlainTextAuthProvider(ROLE_B.getRoleName(), "ignored")
                 .newAuthenticator((EndPoint) null, null)
                 .initialResponse());
-
+        requireNetwork();
         startJMXServer();
     }
 

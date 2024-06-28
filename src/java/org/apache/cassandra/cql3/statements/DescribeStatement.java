@@ -46,6 +46,7 @@ import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.service.pager.PagingState;
+import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
@@ -67,17 +68,17 @@ public abstract class DescribeStatement<T> extends CQLStatement.Raw implements C
     private static final String CF = "describe";
 
     /**
-     * The columns returned by the describe queries that only list elements names (e.g. DESCRIBE KEYSPACES, DESCRIBE TABLES...) 
+     * The columns returned by the describe queries that only list elements names (e.g. DESCRIBE KEYSPACES, DESCRIBE TABLES...)
      */
-    private static final List<ColumnSpecification> LIST_METADATA = 
+    private static final List<ColumnSpecification> LIST_METADATA =
             ImmutableList.of(new ColumnSpecification(KS, CF, new ColumnIdentifier("keyspace_name", true), UTF8Type.instance),
                              new ColumnSpecification(KS, CF, new ColumnIdentifier("type", true), UTF8Type.instance),
                              new ColumnSpecification(KS, CF, new ColumnIdentifier("name", true), UTF8Type.instance));
 
     /**
-     * The columns returned by the describe queries that returns the CREATE STATEMENT for the different elements (e.g. DESCRIBE KEYSPACE, DESCRIBE TABLE ...) 
+     * The columns returned by the describe queries that returns the CREATE STATEMENT for the different elements (e.g. DESCRIBE KEYSPACE, DESCRIBE TABLE ...)
      */
-    private static final List<ColumnSpecification> ELEMENT_METADATA = 
+    private static final List<ColumnSpecification> ELEMENT_METADATA =
             ImmutableList.<ColumnSpecification>builder().addAll(LIST_METADATA)
                                                         .add(new ColumnSpecification(KS, CF, new ColumnIdentifier("create_statement", true), UTF8Type.instance))
                                                         .build();
@@ -124,7 +125,7 @@ public abstract class DescribeStatement<T> extends CQLStatement.Raw implements C
     }
 
     @Override
-    public final ResultMessage execute(QueryState state, QueryOptions options, long queryStartNanoTime) throws RequestValidationException, RequestExecutionException
+    public final ResultMessage execute(QueryState state, QueryOptions options, Dispatcher.RequestTime requestTime) throws RequestValidationException, RequestExecutionException
     {
         return executeLocally(state, options);
     }
@@ -132,13 +133,9 @@ public abstract class DescribeStatement<T> extends CQLStatement.Raw implements C
     @Override
     public ResultMessage executeLocally(QueryState state, QueryOptions options)
     {
-        Keyspaces keyspaces = Schema.instance.snapshot();
+        Keyspaces keyspaces = Schema.instance.distributedAndLocalKeyspaces();
         UUID schemaVersion = Schema.instance.getVersion();
-
-        keyspaces = Keyspaces.builder()
-                             .add(keyspaces)
-                             .add(VirtualKeyspaceRegistry.instance.virtualKeyspacesMetadata())
-                             .build();
+        keyspaces = keyspaces.with(VirtualKeyspaceRegistry.instance.virtualKeyspacesMetadata());
 
         PagingState pagingState = options.getPagingState();
 
@@ -173,9 +170,7 @@ public abstract class DescribeStatement<T> extends CQLStatement.Raw implements C
         ResultSet result = new ResultSet(resultMetadata, rows);
 
         if (pageSize > 0 && rows.size() == pageSize)
-        {
             result.metadata.setHasMorePages(getPagingState(offset + pageSize, schemaVersion));
-        }
 
         return new ResultMessage.Rows(result);
     }
@@ -308,7 +303,7 @@ public abstract class DescribeStatement<T> extends CQLStatement.Raw implements C
      */
     public static DescribeStatement<SchemaElement> functions()
     {
-        return new Listing(ks -> ks.functions.udfs());
+        return new Listing(ks -> ks.userFunctions.udfs());
     }
 
     /**
@@ -316,7 +311,7 @@ public abstract class DescribeStatement<T> extends CQLStatement.Raw implements C
      */
     public static DescribeStatement<SchemaElement> aggregates()
     {
-        return new Listing(ks -> ks.functions.udas());
+        return new Listing(ks -> ks.userFunctions.udas());
     }
 
     /**
@@ -376,7 +371,7 @@ public abstract class DescribeStatement<T> extends CQLStatement.Raw implements C
                 return ImmutableList.of(bytes(element.elementKeyspaceQuotedIfNeeded()),
                                         bytes(element.elementType().toString()),
                                         bytes(element.elementNameQuotedIfNeeded()),
-                                        bytes(element.toCqlString(withInternals, false)));
+                                        bytes(element.toCqlString(true, withInternals, false)));
             }
         };
     }
@@ -387,7 +382,7 @@ public abstract class DescribeStatement<T> extends CQLStatement.Raw implements C
     public static class Element extends DescribeStatement<SchemaElement>
     {
         /**
-         * The keyspace name 
+         * The keyspace name
          */
         private final String keyspace;
 
@@ -426,7 +421,7 @@ public abstract class DescribeStatement<T> extends CQLStatement.Raw implements C
             return ImmutableList.of(bytes(element.elementKeyspaceQuotedIfNeeded()),
                                     bytes(element.elementType().toString()),
                                     bytes(element.elementNameQuotedIfNeeded()),
-                                    bytes(element.toCqlString(withInternals, false)));
+                                    bytes(element.toCqlString(true, withInternals, false)));
         }
     }
 
@@ -445,8 +440,8 @@ public abstract class DescribeStatement<T> extends CQLStatement.Raw implements C
         if (!onlyKeyspace)
         {
             s = Stream.concat(s, ks.types.sortedStream());
-            s = Stream.concat(s, ks.functions.udfs().sorted(SchemaElement.NAME_COMPARATOR));
-            s = Stream.concat(s, ks.functions.udas().sorted(SchemaElement.NAME_COMPARATOR));
+            s = Stream.concat(s, ks.userFunctions.udfs().sorted(SchemaElement.NAME_COMPARATOR));
+            s = Stream.concat(s, ks.userFunctions.udas().sorted(SchemaElement.NAME_COMPARATOR));
             s = Stream.concat(s, ks.tables.stream().sorted(SchemaElement.NAME_COMPARATOR)
                                                    .flatMap(tm -> getTableElements(ks, tm)));
         }
@@ -472,7 +467,7 @@ public abstract class DescribeStatement<T> extends CQLStatement.Raw implements C
     {
         return new Element(keyspace, name, (ks, t) -> {
 
-            TableMetadata table = checkNotNull(ks.getTableOrViewNullable(t),
+            TableMetadata table = checkNotNull(ks.getTableNullable(t),
                                                "Table '%s' not found in keyspace '%s'", t, ks.name);
 
             return Stream.concat(Stream.of(table), table.indexes.stream()
@@ -534,7 +529,7 @@ public abstract class DescribeStatement<T> extends CQLStatement.Raw implements C
     {
         return new Element(keyspace, name, (ks, n) -> {
 
-            return checkNotEmpty(ks.functions.getUdfs(new FunctionName(ks.name, n)),
+            return checkNotEmpty(ks.userFunctions.getUdfs(new FunctionName(ks.name, n)),
                                  "User defined function '%s' not found in '%s'", n, ks.name).stream()
                                                                                              .sorted(SchemaElement.NAME_COMPARATOR);
         });
@@ -547,7 +542,7 @@ public abstract class DescribeStatement<T> extends CQLStatement.Raw implements C
     {
         return new Element(keyspace, name, (ks, n) -> {
 
-            return checkNotEmpty(ks.functions.getUdas(new FunctionName(ks.name, n)),
+            return checkNotEmpty(ks.userFunctions.getUdas(new FunctionName(ks.name, n)),
                                  "User defined aggregate '%s' not found in '%s'", n, ks.name).stream()
                                                                                               .sorted(SchemaElement.NAME_COMPARATOR);
         });
@@ -576,7 +571,7 @@ public abstract class DescribeStatement<T> extends CQLStatement.Raw implements C
                     }
 
                     @Override
-                    public String toCqlString(boolean withInternals, boolean ifNotExists)
+                    public String toCqlString(boolean withWarnings, boolean withInternals, boolean ifNotExists)
                     {
                         return index.toCqlString(table, ifNotExists);
                     }
@@ -681,7 +676,7 @@ public abstract class DescribeStatement<T> extends CQLStatement.Raw implements C
                 list.add(trimIfPresent(DatabaseDescriptor.getPartitionerName(), "org.apache.cassandra.dht."));
                 list.add(trimIfPresent(DatabaseDescriptor.getEndpointSnitch().getClass().getName(),
                                             "org.apache.cassandra.locator."));
- 
+
                 String useKs = state.getRawKeyspace();
                 if (mustReturnsRangeOwnerships(useKs))
                 {
@@ -721,7 +716,7 @@ public abstract class DescribeStatement<T> extends CQLStatement.Raw implements C
             @Override
             protected List<ByteBuffer> toRow(List<Object> elements, boolean withInternals)
             {
-                ImmutableList.Builder<ByteBuffer> builder = ImmutableList.builder(); 
+                ImmutableList.Builder<ByteBuffer> builder = ImmutableList.builder();
 
                 builder.add(UTF8Type.instance.decompose((String) elements.get(CLUSTER_NAME_INDEX)),
                             UTF8Type.instance.decompose((String) elements.get(PARTITIONER_NAME_INDEX)),

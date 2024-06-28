@@ -18,25 +18,29 @@
 
 package org.apache.cassandra.config;
 
-import java.io.File;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.Map;
 
 import com.google.common.collect.ImmutableMap;
+import org.apache.cassandra.io.util.File;
 import org.junit.Assert;
 import org.junit.Test;
 
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.assertj.core.api.Assertions;
+import org.yaml.snakeyaml.constructor.ConstructorException;
 
-import static org.apache.cassandra.config.EncryptionOptions.TlsEncryptionPolicy.UNENCRYPTED;
-import static org.apache.cassandra.config.EncryptionOptions.TlsEncryptionPolicy.OPTIONAL;
-import static org.apache.cassandra.config.EncryptionOptions.TlsEncryptionPolicy.ENCRYPTED;
 import static org.apache.cassandra.config.EncryptionOptions.ServerEncryptionOptions.InternodeEncryption.all;
 import static org.apache.cassandra.config.EncryptionOptions.ServerEncryptionOptions.InternodeEncryption.dc;
 import static org.apache.cassandra.config.EncryptionOptions.ServerEncryptionOptions.InternodeEncryption.none;
 import static org.apache.cassandra.config.EncryptionOptions.ServerEncryptionOptions.InternodeEncryption.rack;
-import static org.junit.Assert.*;
+import static org.apache.cassandra.config.EncryptionOptions.TlsEncryptionPolicy.ENCRYPTED;
+import static org.apache.cassandra.config.EncryptionOptions.TlsEncryptionPolicy.OPTIONAL;
+import static org.apache.cassandra.config.EncryptionOptions.TlsEncryptionPolicy.UNENCRYPTED;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 
 public class EncryptionOptionsTest
 {
@@ -55,8 +59,25 @@ public class EncryptionOptionsTest
 
         public static EncryptionOptionsTestCase of(Boolean optional, String keystorePath, Boolean enabled, EncryptionOptions.TlsEncryptionPolicy expected)
         {
-            return new EncryptionOptionsTestCase(new EncryptionOptions(keystorePath, "dummypass", "dummytruststore", "dummypass",
-                                                                       Collections.emptyList(), null, null, null, "JKS", false, false, enabled, optional)
+            return new EncryptionOptionsTestCase(new EncryptionOptions(new ParameterizedClass("org.apache.cassandra.security.DefaultSslContextFactory",
+                                                                                              new HashMap<>()),
+                                                                       keystorePath, "dummypass",
+                                                                       "dummytruststore", "dummypass",
+                                                                       Collections.emptyList(), null, null, null, "JKS", "false", false, enabled, optional, null, null)
+                                                 .applyConfig(),
+                                                 expected,
+                                                 String.format("optional=%s keystore=%s enabled=%s", optional, keystorePath, enabled));
+        }
+
+        public static EncryptionOptionsTestCase of(Boolean optional, String keystorePath, Boolean enabled,
+                                                   Map<String,String> customSslContextFactoryParams,
+                                                   EncryptionOptions.TlsEncryptionPolicy expected)
+        {
+            return new EncryptionOptionsTestCase(new EncryptionOptions(new ParameterizedClass("org.apache.cassandra.security.DefaultSslContextFactory",
+                                                                                              customSslContextFactoryParams),
+                                                                       keystorePath, "dummypass",
+                                                                       "dummytruststore", "dummypass",
+                                                                       Collections.emptyList(), null, null, null, "JKS", "false", false, enabled, optional, null, null)
                                                  .applyConfig(),
                                                  expected,
                                                  String.format("optional=%s keystore=%s enabled=%s", optional, keystorePath, enabled));
@@ -105,8 +126,9 @@ public class EncryptionOptionsTest
                                                          EncryptionOptions.ServerEncryptionOptions.InternodeEncryption internodeEncryption,
                                                          EncryptionOptions.TlsEncryptionPolicy expected)
         {
-            return new ServerEncryptionOptionsTestCase(new EncryptionOptions.ServerEncryptionOptions(keystorePath, "dummypass", "dummytruststore", "dummypass",
-                                                                                               Collections.emptyList(), null, null, null, "JKS", false, false, optional, internodeEncryption, false)
+            return new ServerEncryptionOptionsTestCase(new EncryptionOptions.ServerEncryptionOptions(new ParameterizedClass("org.apache.cassandra.security.DefaultSslContextFactory",
+                                                                                                                            new HashMap<>()), keystorePath, "dummypass", keystorePath, "dummypass", "dummytruststore", "dummypass",
+                                                                                               Collections.emptyList(), null, null, null, "JKS", "false", false, optional, internodeEncryption, false, null, null)
                                                        .applyConfig(),
                                                  expected,
                                                  String.format("optional=%s keystore=%s internode=%s", optional, keystorePath, internodeEncryption));
@@ -139,6 +161,51 @@ public class EncryptionOptionsTest
         Assertions.assertThatThrownBy(() -> YamlConfigurationLoader.fromMap(yaml, Config.class))
                   .isInstanceOf(ConfigurationException.class)
                   .hasMessage("Invalid yaml. Please remove properties [isOptional] from your cassandra.yaml");
+    }
+
+    @Test
+    public void testMaxCertificateValidityPeriod()
+    {
+        Map<String, Object> yaml = ImmutableMap.of(
+        "server_encryption_options", ImmutableMap.of(
+            "max_certificate_validity_period", "2d"
+            ),
+        "client_encryption_options", ImmutableMap.of(
+            "max_certificate_validity_period", "10d"
+            )
+        );
+
+        Config config = YamlConfigurationLoader.fromMap(yaml, Config.class);
+        assertEquals(new DurationSpec.IntMinutesBound("2d"), config.server_encryption_options.max_certificate_validity_period);
+        assertEquals(new DurationSpec.IntMinutesBound("10d"), config.client_encryption_options.max_certificate_validity_period);
+    }
+
+    @Test
+    public void testFailsToParseInvalidMaxCertificateValidityPeriodValue()
+    {
+        Map<String, Object> yaml = ImmutableMap.of(
+        "server_encryption_options", ImmutableMap.of(
+            "max_certificate_validity_period", "not-a-valid-input"
+            )
+        );
+
+        Assertions.assertThatThrownBy(() -> YamlConfigurationLoader.fromMap(yaml, Config.class))
+                  .isInstanceOf(ConstructorException.class)
+                  .hasMessageContaining("Cannot create property=server_encryption_options for JavaBean=org.apache.cassandra.config.Config@");
+    }
+
+    @Test
+    public void testFailsToParseNegativeMaxCertificateValidityPeriod()
+    {
+        Map<String, Object> yaml = ImmutableMap.of(
+        "server_encryption_options", ImmutableMap.of(
+            "max_certificate_validity_period", "-2d"
+            )
+        );
+
+        Assertions.assertThatThrownBy(() -> YamlConfigurationLoader.fromMap(yaml, Config.class))
+                  .isInstanceOf(ConstructorException.class)
+                  .hasMessageContaining("Cannot create property=server_encryption_options for JavaBean=org.apache.cassandra.config.Config@");
     }
 
     final ServerEncryptionOptionsTestCase[] serverEncryptionOptionTestCases = {
@@ -174,5 +241,18 @@ public class EncryptionOptionsTest
         {
             Assert.assertSame(testCase.description, testCase.expected, testCase.encryptionOptions.tlsEncryptionPolicy());
         }
+    }
+
+    @Test(expected =  IllegalArgumentException.class)
+    public void testMisplacedConfigKey()
+    {
+        Map<String, String> customSslContextFactoryParams = new HashMap<>();
+
+        for(EncryptionOptions.ConfigKey configKey: EncryptionOptions.ConfigKey.values())
+        {
+            customSslContextFactoryParams.put(configKey.getKeyName(), "my-custom-value");
+        }
+
+        EncryptionOptionsTestCase.of(null, absentKeystore, true, customSslContextFactoryParams, ENCRYPTED);
     }
 }

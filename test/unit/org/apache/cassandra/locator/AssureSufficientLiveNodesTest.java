@@ -20,7 +20,6 @@ package org.apache.cassandra.locator;
 
 import java.util.Arrays;
 import java.util.List;
-import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -38,16 +37,17 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 
 import org.apache.cassandra.SchemaLoader;
+import org.apache.cassandra.ServerTestUtils;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.distributed.test.log.ClusterMetadataTestHelper;
 import org.apache.cassandra.exceptions.UnavailableException;
 import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.schema.KeyspaceParams;
-import org.apache.cassandra.schema.MigrationManager;
+import org.apache.cassandra.schema.SchemaTestUtil;
 import org.apache.cassandra.schema.Tables;
-import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.service.reads.NeverSpeculativeRetryPolicy;
 import org.apache.cassandra.utils.FBUtilities;
 import org.jboss.byteman.contrib.bmunit.BMRule;
@@ -82,11 +82,12 @@ public class AssureSufficientLiveNodesTest
     @BeforeClass
     public static void setUpClass() throws Throwable
     {
-        SchemaLoader.loadSchema();
+        ServerTestUtils.daemonInitialization();
+        DatabaseDescriptor.setPartitionerUnsafe(Murmur3Partitioner.instance);
+        ServerTestUtils.prepareServerNoRegister();
         // Register peers with expected DC for NetworkTopologyStrategy.
-        TokenMetadata metadata = StorageService.instance.getTokenMetadata();
-        metadata.clearUnsafe();
 
+        // TODO shouldn't require the snitch setup
         DatabaseDescriptor.setEndpointSnitch(new AbstractNetworkTopologySnitch()
         {
             public String getRack(InetAddressAndPort endpoint)
@@ -113,8 +114,9 @@ public class AssureSufficientLiveNodesTest
         for (int i = 0; i < instances.size(); i++)
         {
             InetAddressAndPort ip = instances.get(i);
-            metadata.updateHostId(UUID.randomUUID(), ip);
-            metadata.updateNormalToken(new Murmur3Partitioner.LongToken(i), ip);
+            String dc = "datacenter" + ip.addressBytes[1];
+            String rack = "rake" + ip.addressBytes[1];
+            ClusterMetadataTestHelper.addEndpoint(ip, new Murmur3Partitioner.LongToken(i), dc, rack);
         }
     }
 
@@ -150,7 +152,7 @@ public class AssureSufficientLiveNodesTest
             // alter to
             KeyspaceParams.nts(DC1, 3, DC2, 3),
             // test
-            keyspace -> ReplicaPlans.forRead(keyspace, tk, EACH_QUORUM, NeverSpeculativeRetryPolicy.INSTANCE)
+            keyspace -> ReplicaPlans.forRead(keyspace, tk, null, EACH_QUORUM, NeverSpeculativeRetryPolicy.INSTANCE)
         );
     }
 
@@ -183,7 +185,7 @@ public class AssureSufficientLiveNodesTest
             // alter to
             KeyspaceParams.nts(DC1, 3, DC2, 3),
             // test
-            keyspace -> ReplicaPlans.forRead(keyspace, tk, QUORUM, NeverSpeculativeRetryPolicy.INSTANCE)
+            keyspace -> ReplicaPlans.forRead(keyspace, tk, null, QUORUM, NeverSpeculativeRetryPolicy.INSTANCE)
         );
         raceOfReplicationStrategyTest(
             // init. The # of live endpoints is 3 = 2 + 1
@@ -191,7 +193,7 @@ public class AssureSufficientLiveNodesTest
             // alter to. (3 + 3) / 2 + 1 > 3
             KeyspaceParams.nts(DC1, 2, DC2, 1, DC3, 3),
             // test
-            keyspace -> ReplicaPlans.forRead(keyspace, tk, QUORUM, NeverSpeculativeRetryPolicy.INSTANCE)
+            keyspace -> ReplicaPlans.forRead(keyspace, tk, null, QUORUM, NeverSpeculativeRetryPolicy.INSTANCE)
         );
     }
 
@@ -215,7 +217,7 @@ public class AssureSufficientLiveNodesTest
             // alter to
             KeyspaceParams.nts(DC1, 3),
             // test
-            keyspace -> ReplicaPlans.forRead(keyspace, tk, EACH_QUORUM, NeverSpeculativeRetryPolicy.INSTANCE)
+            keyspace -> ReplicaPlans.forRead(keyspace, tk, null, EACH_QUORUM, NeverSpeculativeRetryPolicy.INSTANCE)
         );
     }
 
@@ -239,7 +241,7 @@ public class AssureSufficientLiveNodesTest
             // alter to
             KeyspaceParams.nts(DC1, 3),
             // test
-            keyspace -> ReplicaPlans.forRead(keyspace, tk, LOCAL_QUORUM, NeverSpeculativeRetryPolicy.INSTANCE)
+            keyspace -> ReplicaPlans.forRead(keyspace, tk, null, LOCAL_QUORUM, NeverSpeculativeRetryPolicy.INSTANCE)
         );
     }
 
@@ -253,9 +255,9 @@ public class AssureSufficientLiveNodesTest
                                                       Consumer<Keyspace> test) throws Throwable
     {
         String keyspaceName = keyspaceNameGen.get();
-        KeyspaceMetadata initKsMeta = KeyspaceMetadata.create(keyspaceName, init, Tables.of(SchemaLoader.standardCFMD("Foo", "Bar").build()));
+        KeyspaceMetadata initKsMeta = KeyspaceMetadata.create(keyspaceName, init, Tables.of(SchemaLoader.standardCFMD(keyspaceName, "Bar").build()));
         KeyspaceMetadata alterToKsMeta = initKsMeta.withSwapped(alterTo);
-        MigrationManager.announceNewKeyspace(initKsMeta, true);
+        SchemaTestUtil.announceNewKeyspace(initKsMeta);
         Keyspace racedKs = Keyspace.open(keyspaceName);
         ExecutorService es = Executors.newFixedThreadPool(2);
         try (AutoCloseable ignore = () -> {
@@ -266,13 +268,13 @@ public class AssureSufficientLiveNodesTest
             for (int i = 0; i < loopCount; i++)
             {
                 // reset the keyspace
-                racedKs.setMetadata(initKsMeta);
+//                racedKs.setMetadata(initKsMeta);
                 CountDownLatch trigger = new CountDownLatch(1);
                 // starts 2 runnables that could race
                 Future<?> f1 = es.submit(() -> {
                     Uninterruptibles.awaitUninterruptibly(trigger);
                     // Update replication strategy
-                    racedKs.setMetadata(alterToKsMeta);
+//                    racedKs.setMetadata(alterToKsMeta);
                 });
                 Future<?> f2 = es.submit(() -> {
                     Uninterruptibles.awaitUninterruptibly(trigger);

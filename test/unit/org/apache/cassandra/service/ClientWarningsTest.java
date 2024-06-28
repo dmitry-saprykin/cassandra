@@ -21,24 +21,25 @@ import java.util.Collection;
 import java.util.stream.Collectors;
 
 import org.apache.commons.lang3.StringUtils;
-
 import org.junit.BeforeClass;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 
+import org.apache.cassandra.Util;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.EncryptionOptions;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.exceptions.RequestTimeoutException;
 import org.apache.cassandra.transport.Message;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.transport.SimpleClient;
 import org.apache.cassandra.transport.messages.QueryMessage;
 
-import static junit.framework.Assert.assertEquals;
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
 
 @RunWith(Parameterized.class)
@@ -60,7 +61,7 @@ public class ClientWarningsTest extends CQLTester
     public static void setUp()
     {
         requireNetwork();
-        DatabaseDescriptor.setBatchSizeWarnThresholdInKB(1);
+        DatabaseDescriptor.setBatchSizeWarnThresholdInKiB(1);
     }
 
     @Test
@@ -73,12 +74,12 @@ public class ClientWarningsTest extends CQLTester
         {
             client.connect(false);
 
-            QueryMessage query = new QueryMessage(createBatchStatement2(1), QueryOptions.DEFAULT);
-            Message.Response resp = client.execute(query);
+            Message.Response resp = executeWithRetries(client,
+                                                        new QueryMessage(createBatchStatement2(1), QueryOptions.DEFAULT));
             assertNull(resp.getWarnings());
 
-            query = new QueryMessage(createBatchStatement2(DatabaseDescriptor.getBatchSizeWarnThreshold()), QueryOptions.DEFAULT);
-            resp = client.execute(query);
+            resp = executeWithRetries(client,
+                                      new QueryMessage(createBatchStatement2(DatabaseDescriptor.getBatchSizeWarnThreshold()), QueryOptions.DEFAULT));
             assertEquals(1, resp.getWarnings().size());
         }
     }
@@ -93,12 +94,14 @@ public class ClientWarningsTest extends CQLTester
         {
             client.connect(false);
 
-            QueryMessage query = new QueryMessage(createBatchStatement2(DatabaseDescriptor.getBatchSizeWarnThreshold() / 2 + 1), QueryOptions.DEFAULT);
-            Message.Response resp = client.execute(query);
+            Message.Response resp = executeWithRetries(client,
+                                                       new QueryMessage(createBatchStatement2(DatabaseDescriptor.getBatchSizeWarnThreshold() / 2 + 1), QueryOptions.DEFAULT));
             assertEquals(1, resp.getWarnings().size());
 
-            query = new QueryMessage(createBatchStatement(DatabaseDescriptor.getBatchSizeWarnThreshold()), QueryOptions.DEFAULT);
-            resp = client.execute(query);
+
+            resp = executeWithRetries(client,
+                                      new QueryMessage(createBatchStatement(DatabaseDescriptor.getBatchSizeWarnThreshold()), QueryOptions.DEFAULT));
+
             assertNull(resp.getWarnings());
         }
     }
@@ -115,35 +118,50 @@ public class ClientWarningsTest extends CQLTester
 
             for (int i = 0; i < iterations; i++)
             {
-                QueryMessage query = new QueryMessage(String.format("INSERT INTO %s.%s (pk, ck, v) VALUES (1, %s, 1)",
-                                                                    KEYSPACE,
-                                                                    currentTable(),
-                                                                    i), QueryOptions.DEFAULT);
-                client.execute(query);
+                executeWithRetries(client,
+                                   new QueryMessage(String.format("INSERT INTO %s.%s (pk, ck, v) VALUES (1, %s, 1)",
+                                                                  KEYSPACE,
+                                                                  currentTable(),
+                                                                  i), QueryOptions.DEFAULT));
             }
             ColumnFamilyStore store = Keyspace.open(KEYSPACE).getColumnFamilyStore(currentTable());
-            store.forceBlockingFlush();
+            Util.flush(store);
 
             for (int i = 0; i < iterations; i++)
             {
-                QueryMessage query = new QueryMessage(String.format("DELETE v FROM %s.%s WHERE pk = 1 AND ck = %s",
-                                                                    KEYSPACE,
-                                                                    currentTable(),
-                                                                    i), QueryOptions.DEFAULT);
-                client.execute(query);
+                executeWithRetries(client,
+                                   new QueryMessage(String.format("DELETE v FROM %s.%s WHERE pk = 1 AND ck = %s",
+                                                                  KEYSPACE,
+                                                                  currentTable(),
+                                                                  i), QueryOptions.DEFAULT));
             }
-            store.forceBlockingFlush();
+            Util.flush(store);
 
             {
-                QueryMessage query = new QueryMessage(String.format("SELECT * FROM %s.%s WHERE pk = 1",
-                                                                    KEYSPACE,
-                                                                    currentTable()), QueryOptions.DEFAULT);
-                Message.Response resp = client.execute(query);
+                Message.Response resp = executeWithRetries(client,
+                                                           new QueryMessage(String.format("SELECT * FROM %s.%s WHERE pk = 1",
+                                                                                          KEYSPACE,
+                                                                                          currentTable()), QueryOptions.DEFAULT));
                 assertEquals(1, resp.getWarnings().size());
             }
         }
     }
 
+    private static Message.Response executeWithRetries(SimpleClient client, QueryMessage query)
+    {
+        for (int i = 0; i < 10; i++)
+        {
+            try
+            {
+                return client.execute(query);
+            }
+            catch (RequestTimeoutException t)
+            {
+                logger.warn("Timed out. Retrying.");
+            }
+        }
+        throw new RuntimeException("Could not execute query after 10 tries");
+    }
     @Test
     public void testLargeBatchWithProtoV2() throws Exception
     {
@@ -153,8 +171,8 @@ public class ClientWarningsTest extends CQLTester
         {
             client.connect(false);
 
-            QueryMessage query = new QueryMessage(createBatchStatement(DatabaseDescriptor.getBatchSizeWarnThreshold()), QueryOptions.DEFAULT);
-            Message.Response resp = client.execute(query);
+            Message.Response resp = executeWithRetries(client,
+                                                       new QueryMessage(createBatchStatement(DatabaseDescriptor.getBatchSizeWarnThreshold()), QueryOptions.DEFAULT));
             assertNull(resp.getWarnings());
         }
     }

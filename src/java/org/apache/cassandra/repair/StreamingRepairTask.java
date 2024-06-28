@@ -17,11 +17,11 @@
  */
 package org.apache.cassandra.repair;
 
-import java.util.UUID;
 import java.util.Collections;
 import java.util.Collection;
 
 import com.google.common.annotations.VisibleForTesting;
+
 import org.apache.cassandra.locator.RangesAtEndpoint;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -29,17 +29,22 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.locator.InetAddressAndPort;
-import org.apache.cassandra.net.Message;
-import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.repair.messages.RepairMessage;
 import org.apache.cassandra.repair.messages.SyncResponse;
+import org.apache.cassandra.repair.state.SyncState;
 import org.apache.cassandra.streaming.PreviewKind;
 import org.apache.cassandra.streaming.StreamEvent;
 import org.apache.cassandra.streaming.StreamEventHandler;
 import org.apache.cassandra.streaming.StreamPlan;
 import org.apache.cassandra.streaming.StreamState;
 import org.apache.cassandra.streaming.StreamOperation;
+import org.apache.cassandra.utils.TimeUUID;
 
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static org.apache.cassandra.net.Verb.SYNC_RSP;
+import static org.apache.cassandra.utils.MonotonicClock.Global.approxTime;
+
 
 /**
  * StreamingRepairTask performs data streaming between two remote replicas, neither of which is repair coordinator.
@@ -49,17 +54,21 @@ public class StreamingRepairTask implements Runnable, StreamEventHandler
 {
     private static final Logger logger = LoggerFactory.getLogger(StreamingRepairTask.class);
 
+    private final SharedContext ctx;
+    private final SyncState state;
     private final RepairJobDesc desc;
     private final boolean asymmetric;
     private final InetAddressAndPort initiator;
     private final InetAddressAndPort src;
     private final InetAddressAndPort dst;
     private final Collection<Range<Token>> ranges;
-    private final UUID pendingRepair;
+    private final TimeUUID pendingRepair;
     private final PreviewKind previewKind;
 
-    public StreamingRepairTask(RepairJobDesc desc, InetAddressAndPort initiator, InetAddressAndPort src, InetAddressAndPort dst, Collection<Range<Token>> ranges,  UUID pendingRepair, PreviewKind previewKind, boolean asymmetric)
+    public StreamingRepairTask(SharedContext ctx, SyncState state, RepairJobDesc desc, InetAddressAndPort initiator, InetAddressAndPort src, InetAddressAndPort dst, Collection<Range<Token>> ranges, TimeUUID pendingRepair, PreviewKind previewKind, boolean asymmetric)
     {
+        this.ctx = ctx;
+        this.state = state;
         this.desc = desc;
         this.initiator = initiator;
         this.src = src;
@@ -73,12 +82,17 @@ public class StreamingRepairTask implements Runnable, StreamEventHandler
     public void run()
     {
         logger.info("[streaming task #{}] Performing {}streaming repair of {} ranges with {}", desc.sessionId, asymmetric ? "asymmetric " : "", ranges.size(), dst);
-        createStreamPlan(dst).execute();
+        long start = approxTime.now();
+        StreamPlan streamPlan = createStreamPlan(dst);
+        logger.info("[streaming task #{}] Stream plan created in {}ms", desc.sessionId, MILLISECONDS.convert(approxTime.now() - start, NANOSECONDS));
+        state.phase.start();
+        ctx.streamExecutor().execute(streamPlan);
     }
 
     @VisibleForTesting
     StreamPlan createStreamPlan(InetAddressAndPort dest)
     {
+        state.phase.planning();
         StreamPlan sp = new StreamPlan(StreamOperation.REPAIR, 1, false, pendingRepair, previewKind)
                .listeners(this)
                .flushBeforeTransfer(pendingRepair == null) // sstables are isolated at the beginning of an incremental repair session, so flushing isn't neccessary
@@ -91,6 +105,7 @@ public class StreamingRepairTask implements Runnable, StreamEventHandler
         return sp;
     }
 
+    @Override
     public void handleStreamEvent(StreamEvent event)
     {
         // Nothing to do here, all we care about is the final success or failure and that's handled by
@@ -100,17 +115,21 @@ public class StreamingRepairTask implements Runnable, StreamEventHandler
     /**
      * If we succeeded on both stream in and out, respond back to coordinator
      */
+    @Override
     public void onSuccess(StreamState state)
     {
         logger.info("[repair #{}] streaming task succeed, returning response to {}", desc.sessionId, initiator);
-        MessagingService.instance().send(Message.out(SYNC_RSP, new SyncResponse(desc, src, dst, true, state.createSummaries())), initiator);
+        this.state.phase.success();
+        RepairMessage.sendMessageWithRetries(ctx, new SyncResponse(desc, src, dst, true, state.createSummaries()), SYNC_RSP, initiator);
     }
 
     /**
      * If we failed on either stream in or out, respond fail to coordinator
      */
+    @Override
     public void onFailure(Throwable t)
     {
-        MessagingService.instance().send(Message.out(SYNC_RSP, new SyncResponse(desc, src, dst, false, Collections.emptyList())), initiator);
+        this.state.phase.fail(t);
+        RepairMessage.sendMessageWithRetries(ctx, new SyncResponse(desc, src, dst, false, Collections.emptyList()), SYNC_RSP, initiator);
     }
 }

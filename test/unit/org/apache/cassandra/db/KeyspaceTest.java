@@ -23,7 +23,6 @@ import java.util.*;
 
 import org.assertj.core.api.Assertions;
 import org.junit.Test;
-import org.mockito.Mockito;
 
 import org.apache.cassandra.Util;
 import org.apache.cassandra.cql3.CQLTester;
@@ -32,12 +31,13 @@ import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.RowIterator;
+import org.apache.cassandra.io.sstable.AbstractRowIndexEntry;
 import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.filter.*;
 import org.apache.cassandra.db.partitions.PartitionIterator;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.format.big.BigTableReader;
 import org.apache.cassandra.metrics.ClearableHistogram;
-import org.apache.cassandra.schema.SchemaProvider;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 
@@ -54,7 +54,7 @@ public class KeyspaceTest extends CQLTester
     }
 
     @Override
-    protected UntypedResultSet execute(String query, Object... values) throws Throwable
+    protected UntypedResultSet execute(String query, Object... values)
     {
         return executeFormattedQuery(formatQuery(KEYSPACE_PER_TEST, query), values);
     }
@@ -86,7 +86,7 @@ public class KeyspaceTest extends CQLTester
             Util.assertEmpty(Util.cmd(cfs, "0").columns("c").includeRow(1).build());
 
             if (round == 0)
-                cfs.forceBlockingFlush();
+                Util.flush(cfs);
         }
     }
 
@@ -121,7 +121,7 @@ public class KeyspaceTest extends CQLTester
             }
 
             if (round == 0)
-                cfs.forceBlockingFlush();
+                Util.flush(cfs);
         }
     }
 
@@ -138,7 +138,7 @@ public class KeyspaceTest extends CQLTester
         for (String key : new String[]{"0", "2"})
             Util.assertEmpty(Util.cmd(cfs, key).build());
 
-        cfs.forceBlockingFlush();
+        Util.flush(cfs);
 
         for (String key : new String[]{"0", "2"})
             Util.assertEmpty(Util.cmd(cfs, key).build());
@@ -210,7 +210,7 @@ public class KeyspaceTest extends CQLTester
             assertRowsInSlice(cfs, "0", 288, 299, 12, true, prefix);
 
             if (round == 0)
-                cfs.forceBlockingFlush();
+                Util.flush(cfs);
         }
     }
 
@@ -223,7 +223,7 @@ public class KeyspaceTest extends CQLTester
         for (int i = 0; i < 10; i++)
             execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", "0", i, i);
 
-        cfs.forceBlockingFlush();
+        Util.flush(cfs);
 
         for (int i = 10; i < 20; i++)
         {
@@ -290,7 +290,7 @@ public class KeyspaceTest extends CQLTester
                          ? DataLimits.NONE
                          : DataLimits.cqlLimits(rowLimit);
         return SinglePartitionReadCommand.create(
-                cfs.metadata(), FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata()), RowFilter.NONE, limit, Util.dk(key), filter);
+                cfs.metadata(), FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata()), RowFilter.none(), limit, Util.dk(key), filter);
     }
 
     @Test
@@ -337,7 +337,7 @@ public class KeyspaceTest extends CQLTester
             assertRowsInResult(cfs, command);
 
             if (round == 0)
-                cfs.forceBlockingFlush();
+                Util.flush(cfs);
         }
     }
 
@@ -360,7 +360,7 @@ public class KeyspaceTest extends CQLTester
             assertRowsInResult(cfs, command, 1);
 
             if (round == 0)
-                cfs.forceBlockingFlush();
+                Util.flush(cfs);
         }
     }
 
@@ -373,7 +373,7 @@ public class KeyspaceTest extends CQLTester
         for (int i = 1; i < 7; i++)
             execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", "0", i, i);
 
-        cfs.forceBlockingFlush();
+        Util.flush(cfs);
 
         // overwrite three rows with -1
         for (int i = 1; i < 4; i++)
@@ -385,7 +385,7 @@ public class KeyspaceTest extends CQLTester
             assertRowsInResult(cfs, command, -1, -1, 4);
 
             if (round == 0)
-                cfs.forceBlockingFlush();
+                Util.flush(cfs);
         }
     }
 
@@ -398,7 +398,7 @@ public class KeyspaceTest extends CQLTester
         for (int i = 1000; i < 2000; i++)
             execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", "0", i, i);
 
-        cfs.forceBlockingFlush();
+        Util.flush(cfs);
 
         validateSliceLarge(cfs);
 
@@ -408,8 +408,11 @@ public class KeyspaceTest extends CQLTester
 
         // verify that we do indeed have multiple index entries
         SSTableReader sstable = cfs.getLiveSSTables().iterator().next();
-        RowIndexEntry<?> indexEntry = sstable.getPosition(Util.dk("0"), SSTableReader.Operator.EQ);
-        assert indexEntry.columnsIndexCount() > 2;
+        if (sstable instanceof BigTableReader)
+        {
+            AbstractRowIndexEntry indexEntry = ((BigTableReader) sstable).getRowIndexEntry(Util.dk("0"), SSTableReader.Operator.EQ);
+            assert indexEntry.blockCount() > 2;
+        }
 
         validateSliceLarge(cfs);
     }
@@ -440,7 +443,7 @@ public class KeyspaceTest extends CQLTester
             for (int i = 1000 + (j*100); i < 1000 + ((j+1)*100); i++)
                 execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?) USING TIMESTAMP ?", "0", i, i, (long)i);
 
-            cfs.forceBlockingFlush();
+            Util.flush(cfs);
         }
 
         ((ClearableHistogram)cfs.metric.sstablesPerReadHistogram.cf).clear();
@@ -473,17 +476,17 @@ public class KeyspaceTest extends CQLTester
     {
         ClusteringIndexSliceFilter filter = slices(cfs, 1000, null, false);
         SinglePartitionReadCommand command = SinglePartitionReadCommand.create(
-                cfs.metadata(), FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata()), RowFilter.NONE, DataLimits.cqlLimits(3), Util.dk("0"), filter);
+                cfs.metadata(), FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata()), RowFilter.none(), DataLimits.cqlLimits(3), Util.dk("0"), filter);
         assertRowsInResult(cfs, command, 1000, 1001, 1002);
 
         filter = slices(cfs, 1195, null, false);
         command = SinglePartitionReadCommand.create(
-                cfs.metadata(), FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata()), RowFilter.NONE, DataLimits.cqlLimits(3), Util.dk("0"), filter);
+                cfs.metadata(), FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata()), RowFilter.none(), DataLimits.cqlLimits(3), Util.dk("0"), filter);
         assertRowsInResult(cfs, command, 1195, 1196, 1197);
 
         filter = slices(cfs, null, 1996, true);
         command = SinglePartitionReadCommand.create(
-                cfs.metadata(), FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata()), RowFilter.NONE, DataLimits.cqlLimits(1000), Util.dk("0"), filter);
+                cfs.metadata(), FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata()), RowFilter.none(), DataLimits.cqlLimits(1000), Util.dk("0"), filter);
         int[] expectedValues = new int[997];
         for (int i = 0, v = 1996; v >= 1000; i++, v--)
             expectedValues[i] = v;
@@ -491,34 +494,31 @@ public class KeyspaceTest extends CQLTester
 
         filter = slices(cfs, 1990, null, false);
         command = SinglePartitionReadCommand.create(
-                cfs.metadata(), FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata()), RowFilter.NONE, DataLimits.cqlLimits(3), Util.dk("0"), filter);
+                cfs.metadata(), FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata()), RowFilter.none(), DataLimits.cqlLimits(3), Util.dk("0"), filter);
         assertRowsInResult(cfs, command, 1990, 1991, 1992);
 
         filter = slices(cfs, null, null, true);
         command = SinglePartitionReadCommand.create(
-                cfs.metadata(), FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata()), RowFilter.NONE, DataLimits.cqlLimits(3), Util.dk("0"), filter);
+                cfs.metadata(), FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata()), RowFilter.none(), DataLimits.cqlLimits(3), Util.dk("0"), filter);
         assertRowsInResult(cfs, command, 1999, 1998, 1997);
 
         filter = slices(cfs, null, 9000, true);
         command = SinglePartitionReadCommand.create(
-                cfs.metadata(), FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata()), RowFilter.NONE, DataLimits.cqlLimits(3), Util.dk("0"), filter);
+                cfs.metadata(), FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata()), RowFilter.none(), DataLimits.cqlLimits(3), Util.dk("0"), filter);
         assertRowsInResult(cfs, command, 1999, 1998, 1997);
 
         filter = slices(cfs, 9000, null, false);
         command = SinglePartitionReadCommand.create(
-                cfs.metadata(), FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata()), RowFilter.NONE, DataLimits.cqlLimits(3), Util.dk("0"), filter);
+                cfs.metadata(), FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata()), RowFilter.none(), DataLimits.cqlLimits(3), Util.dk("0"), filter);
         assertRowsInResult(cfs, command);
     }
 
     @Test
     public void shouldThrowOnMissingKeyspace()
     {
-        SchemaProvider schema = Mockito.mock(SchemaProvider.class);
         String ksName = "MissingKeyspace";
-        
-        Mockito.when(schema.getKeyspaceMetadata(ksName)).thenReturn(null);
 
-        Assertions.assertThatThrownBy(() -> Keyspace.open(ksName, schema, false))
+        Assertions.assertThatThrownBy(() -> Keyspace.open(ksName))
                   .isInstanceOf(AssertionError.class)
                   .hasMessage("Unknown keyspace " + ksName);
     }

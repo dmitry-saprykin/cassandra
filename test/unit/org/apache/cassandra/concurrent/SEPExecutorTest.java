@@ -30,15 +30,25 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.Assert;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.utils.FBUtilities;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.MINUTES;
+import static org.apache.cassandra.concurrent.DebuggableThreadPoolExecutorTest.checkLocalStateIsPropagated;
+import static org.assertj.core.api.Assertions.assertThat;
 
 public class SEPExecutorTest
 {
+    @BeforeClass
+    public static void beforeClass()
+    {
+        DatabaseDescriptor.daemonInitialization();
+    }
+
     @Test
     public void shutdownTest() throws Throwable
     {
@@ -87,7 +97,7 @@ public class SEPExecutorTest
         final AtomicInteger notifiedMaxPoolSize = new AtomicInteger();
 
         SharedExecutorPool sharedPool;
-        LocalAwareExecutorService executor;
+        LocalAwareExecutorPlus executor;
 
         Thread makeBusy;
         AtomicBoolean stayBusy;
@@ -132,7 +142,7 @@ public class SEPExecutorTest
             sharedPool.shutdownAndWait(1L, MINUTES);
         }
 
-        public LocalAwareExecutorService getExecutor()
+        public LocalAwareExecutorPlus getExecutor()
         {
             return executor;
         }
@@ -147,7 +157,7 @@ public class SEPExecutorTest
     public void changingMaxWorkersMeetsConcurrencyGoalsTest() throws InterruptedException, TimeoutException
     {
         BusyExecutor busyExecutor = new BusyExecutor("ChangingMaxWorkersMeetsConcurrencyGoalsTest", "resizetest");
-        LocalAwareExecutorService executor = busyExecutor.getExecutor();
+        LocalAwareExecutorPlus executor = busyExecutor.getExecutor();
 
         busyExecutor.start();
         try
@@ -179,12 +189,11 @@ public class SEPExecutorTest
         }
     }
 
-
     @Test
     public void stoppedWorkersProcessTasksWhenConcurrencyIncreases() throws InterruptedException
     {
         BusyExecutor busyExecutor = new BusyExecutor("StoppedWorkersProcessTasksWhenConcurrencyIncreases", "stoptest");
-        LocalAwareExecutorService executor = busyExecutor.getExecutor();
+        LocalAwareExecutorPlus executor = busyExecutor.getExecutor();
         busyExecutor.start();
         try
         {
@@ -249,7 +258,7 @@ public class SEPExecutorTest
         }
     }
 
-    void assertMaxTaskConcurrency(LocalAwareExecutorService executor, int concurrency) throws InterruptedException
+    void assertMaxTaskConcurrency(LocalAwareExecutorPlus executor, int concurrency) throws InterruptedException
     {
         executor.setMaximumPoolSize(concurrency);
 
@@ -261,4 +270,21 @@ public class SEPExecutorTest
         // Will return true if all of the LatchWaiters count down before the timeout
         Assert.assertTrue("Test tasks did not hit max concurrency goal", concurrencyGoal.await(3L, TimeUnit.SECONDS));
     }
+
+    @Test
+    public void testLocalStatePropagation() throws InterruptedException, TimeoutException
+    {
+        SharedExecutorPool sharedPool = new SharedExecutorPool("TestPool");
+        try
+        {
+            LocalAwareExecutorPlus executor = sharedPool.newExecutor(1, "TEST", "TEST");
+            assertThat(executor).isInstanceOf(LocalAwareExecutorPlus.class);
+            checkLocalStateIsPropagated(executor);
+        }
+        finally
+        {
+            sharedPool.shutdownAndWait(1, TimeUnit.SECONDS);
+        }
+    }
+
 }

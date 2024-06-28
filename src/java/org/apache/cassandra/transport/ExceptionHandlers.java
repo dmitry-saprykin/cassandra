@@ -24,7 +24,6 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 import com.google.common.base.Predicate;
-import com.google.common.base.Predicates;
 import com.google.common.collect.ImmutableSet;
 
 import org.slf4j.Logger;
@@ -34,6 +33,7 @@ import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelPromise;
+import io.netty.channel.unix.Errors;
 import org.apache.cassandra.exceptions.OverloadedException;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.metrics.ClientMetrics;
@@ -127,6 +127,11 @@ public class ExceptionHandlers
         {
             // Once the threshold for overload is breached, it will very likely spam the logs...
             NoSpamLogger.log(logger, NoSpamLogger.Level.INFO, 1, TimeUnit.MINUTES, cause.getMessage());
+        }
+        else if (Throwables.anyCauseMatches(cause, t -> t instanceof Errors.NativeIoException))
+        {
+            ClientMetrics.instance.markUnknownException();
+            logger.trace("Native exception in client networking", cause);
         }
         else
         {

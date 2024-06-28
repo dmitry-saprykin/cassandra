@@ -17,14 +17,13 @@
  */
 package org.apache.cassandra.io.util;
 
-import java.io.File;
 import java.io.IOException;
 
 import org.apache.cassandra.utils.ChecksumType;
 
 public final class ChecksummedRandomAccessReader
 {
-    @SuppressWarnings("resource") // The Rebufferer owns both the channel and the validator and handles closing both.
+    @SuppressWarnings({ "resource", "RedundantSuppression" }) // The Rebufferer owns both the channel and the validator and handles closing both.
     public static RandomAccessReader open(File file, File crcFile) throws IOException
     {
         ChannelProxy channel = new ChannelProxy(file);
@@ -32,7 +31,7 @@ public final class ChecksummedRandomAccessReader
         {
             DataIntegrityMetadata.ChecksumValidator validator = new DataIntegrityMetadata.ChecksumValidator(ChecksumType.CRC32,
                                                                                                             RandomAccessReader.open(crcFile),
-                                                                                                            file.getPath());
+                                                                                                            file.path());
             Rebufferer rebufferer = new ChecksummedRebufferer(channel, validator);
             return new RandomAccessReader.RandomAccessReaderWithOwnChannel(rebufferer);
         }

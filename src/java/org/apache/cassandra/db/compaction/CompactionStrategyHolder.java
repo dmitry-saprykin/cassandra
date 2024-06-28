@@ -21,15 +21,15 @@ package org.apache.cassandra.db.compaction;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
-import java.util.UUID;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Iterables;
 
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.SerializationHeader;
+import org.apache.cassandra.db.commitlog.CommitLogPosition;
+import org.apache.cassandra.db.commitlog.IntervalSet;
 import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
-import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.index.Index;
@@ -37,9 +37,9 @@ import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.ISSTableScanner;
 import org.apache.cassandra.io.sstable.SSTableMultiWriter;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
-import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
 import org.apache.cassandra.schema.CompactionParams;
 import org.apache.cassandra.service.ActiveRepairService;
+import org.apache.cassandra.utils.TimeUUID;
 
 public class CompactionStrategyHolder extends AbstractStrategyHolder
 {
@@ -102,7 +102,7 @@ public class CompactionStrategyHolder extends AbstractStrategyHolder
     }
 
     @Override
-    public Collection<TaskSupplier> getBackgroundTaskSuppliers(int gcBefore)
+    public Collection<TaskSupplier> getBackgroundTaskSuppliers(long gcBefore)
     {
         List<TaskSupplier> suppliers = new ArrayList<>(strategies.size());
         for (AbstractCompactionStrategy strategy : strategies)
@@ -112,7 +112,7 @@ public class CompactionStrategyHolder extends AbstractStrategyHolder
     }
 
     @Override
-    public Collection<AbstractCompactionTask> getMaximalTasks(int gcBefore, boolean splitOutput)
+    public Collection<AbstractCompactionTask> getMaximalTasks(long gcBefore, boolean splitOutput)
     {
         List<AbstractCompactionTask> tasks = new ArrayList<>(strategies.size());
         for (AbstractCompactionStrategy strategy : strategies)
@@ -125,7 +125,7 @@ public class CompactionStrategyHolder extends AbstractStrategyHolder
     }
 
     @Override
-    public Collection<AbstractCompactionTask> getUserDefinedTasks(GroupedSSTableContainer sstables, int gcBefore)
+    public Collection<AbstractCompactionTask> getUserDefinedTasks(GroupedSSTableContainer sstables, long gcBefore)
     {
         List<AbstractCompactionTask> tasks = new ArrayList<>(strategies.size());
         for (int i = 0; i < strategies.size(); i++)
@@ -136,6 +136,12 @@ public class CompactionStrategyHolder extends AbstractStrategyHolder
             tasks.add(strategies.get(i).getUserDefinedTask(sstables.getGroup(i), gcBefore));
         }
         return tasks;
+    }
+
+    @Override
+    public void addSSTable(SSTableReader sstable)
+    {
+        getStrategyFor(sstable).addSSTable(sstable);
     }
 
     @Override
@@ -183,7 +189,6 @@ public class CompactionStrategyHolder extends AbstractStrategyHolder
     }
 
     @Override
-    @SuppressWarnings("resource")
     public List<ISSTableScanner> getScanners(GroupedSSTableContainer sstables, Collection<Range<Token>> ranges)
     {
         List<ISSTableScanner> scanners = new ArrayList<>(strategies.size());
@@ -219,11 +224,12 @@ public class CompactionStrategyHolder extends AbstractStrategyHolder
     public SSTableMultiWriter createSSTableMultiWriter(Descriptor descriptor,
                                                        long keyCount,
                                                        long repairedAt,
-                                                       UUID pendingRepair,
+                                                       TimeUUID pendingRepair,
                                                        boolean isTransient,
-                                                       MetadataCollector collector,
+                                                       IntervalSet<CommitLogPosition> commitLogPositions,
+                                                       int sstableLevel,
                                                        SerializationHeader header,
-                                                       Collection<Index> indexes,
+                                                       Collection<Index.Group> indexGroups,
                                                        LifecycleNewTracker lifecycleNewTracker)
     {
         if (isRepaired)
@@ -245,9 +251,10 @@ public class CompactionStrategyHolder extends AbstractStrategyHolder
                                                  repairedAt,
                                                  pendingRepair,
                                                  isTransient,
-                                                 collector,
+                                                 commitLogPositions,
+                                                 sstableLevel,
                                                  header,
-                                                 indexes,
+                                                 indexGroups,
                                                  lifecycleNewTracker);
     }
 
@@ -261,5 +268,15 @@ public class CompactionStrategyHolder extends AbstractStrategyHolder
     public boolean containsSSTable(SSTableReader sstable)
     {
         return Iterables.any(strategies, acs -> acs.getSSTables().contains(sstable));
+    }
+
+    public int getEstimatedRemainingTasks()
+    {
+        int tasks = 0;
+        for (AbstractCompactionStrategy strategy : strategies)
+        {
+            tasks += strategy.getEstimatedRemainingTasks();
+        }
+        return tasks;
     }
 }

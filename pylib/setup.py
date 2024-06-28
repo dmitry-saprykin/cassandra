@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -25,6 +25,7 @@ def get_extensions():
 
     from Cython.Build import cythonize
     return cythonize("cqlshlib/copyutil.py")
+
 
 setup(
     name="cassandra-pylib",

@@ -19,11 +19,8 @@ package org.apache.cassandra.hints;
 
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import org.apache.cassandra.gms.ApplicationState;
 import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.schema.Schema;
-
-import static org.apache.cassandra.utils.FBUtilities.getBroadcastAddressAndPort;
 
 /**
  * A simple dispatch trigger that's being run every 10 seconds.
@@ -65,7 +62,7 @@ final class HintsDispatchTrigger implements Runnable
                .filter(store -> !isScheduled(store))
                .filter(HintsStore::isLive)
                .filter(store -> store.isWriting() || store.hasFiles())
-               .filter(store -> Schema.instance.isSameVersion(Gossiper.instance.getSchemaVersion(store.address())))
+               .filter(store -> Schema.instance.getVersion().equals(Gossiper.instance.getSchemaVersion(store.address())))
                .forEach(this::schedule);
     }
 

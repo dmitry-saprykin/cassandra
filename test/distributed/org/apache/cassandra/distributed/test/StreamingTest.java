@@ -34,7 +34,6 @@ import com.google.common.annotations.VisibleForTesting;
 import org.junit.Assert;
 import org.junit.Test;
 
-import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.api.IInvokableInstance;
 import org.apache.cassandra.locator.InetAddressAndPort;
@@ -122,7 +121,10 @@ public class StreamingTest extends TestBaseImpl
             // verify on follower's stream session
             MessageStateSinkImpl followerSink = new MessageStateSinkImpl();
             followerSink.messages(initiator, Arrays.asList(STREAM_INIT, PREPARE_SYN, PREPARE_ACK, RECEIVED));
-            followerSink.states(initiator,  Arrays.asList(PREPARING, STREAMING, StreamSession.State.COMPLETE));
+            // why 2 completes?  There is a race condition bug with sending COMPLETE where the socket gets closed
+            // by the initator, which then triggers a ClosedChannelException, which then checks the current state (PREPARING)
+            // to solve this, COMPLETE is set before sending the message, and reset when closing the stream
+            followerSink.states(initiator,  Arrays.asList(PREPARING, STREAMING, StreamSession.State.COMPLETE, StreamSession.State.COMPLETE));
             followerNode.runOnInstance(() -> StreamSession.sink = followerSink);
         }
 
@@ -150,7 +152,7 @@ public class StreamingTest extends TestBaseImpl
         @Override
         public void recordState(InetAddressAndPort from, StreamSession.State state)
         {
-            Queue<Integer> states = stateTransitions.get(from.address);
+            Queue<Integer> states = stateTransitions.get(from.getAddress());
             if (states.peek() == null)
                 Assert.fail("Unexpected state " + state);
 
@@ -164,7 +166,7 @@ public class StreamingTest extends TestBaseImpl
             if (message == StreamMessage.Type.KEEP_ALIVE)
                 return;
 
-            Queue<Integer> messages = messageSink.get(from.address);
+            Queue<Integer> messages = messageSink.get(from.getAddress());
             if (messages.peek() == null)
                 Assert.fail("Unexpected message " + message);
 
@@ -175,10 +177,10 @@ public class StreamingTest extends TestBaseImpl
         @Override
         public void onClose(InetAddressAndPort from)
         {
-            Queue<Integer> states = stateTransitions.get(from.address);
+            Queue<Integer> states = stateTransitions.get(from.getAddress());
             Assert.assertTrue("Missing states: " + states, states.isEmpty());
 
-            Queue<Integer> messages = messageSink.get(from.address);
+            Queue<Integer> messages = messageSink.get(from.getAddress());
             Assert.assertTrue("Missing messages: " + messages, messages.isEmpty());
         }
     }

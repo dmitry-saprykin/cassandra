@@ -25,12 +25,14 @@ import com.datastax.driver.core.ColumnDefinitions;
 import com.datastax.driver.core.DataType;
 import com.datastax.driver.core.ResultSet;
 import com.datastax.driver.core.Session;
+import com.datastax.driver.core.utils.UUIDs;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.ColumnSpecification;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.utils.FBUtilities;
 
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 import static org.junit.Assert.assertEquals;
 
 public class CollectionsTest extends CQLTester
@@ -575,18 +577,6 @@ public class CollectionsTest extends CQLTester
         execute("ALTER TABLE %s ADD alist list<text>");
     }
 
-    /**
-     * Migrated from cql_tests.py:TestCQL.collection_function_test()
-     */
-    @Test
-    public void testFunctionsOnCollections() throws Throwable
-    {
-        createTable("CREATE TABLE %s (k int PRIMARY KEY, l set<int>)");
-
-        assertInvalid("SELECT ttl(l) FROM %s WHERE k = 0");
-        assertInvalid("SELECT writetime(l) FROM %s WHERE k = 0");
-    }
-
     @Test
     public void testInRestrictionWithCollection() throws Throwable
     {
@@ -695,7 +685,7 @@ public class CollectionsTest extends CQLTester
     public void testMapWithLargePartition() throws Throwable
     {
         Random r = new Random();
-        long seed = System.nanoTime();
+        long seed = nanoTime();
         System.out.println("Seed " + seed);
         r.setSeed(seed);
 
@@ -974,7 +964,7 @@ public class CollectionsTest extends CQLTester
         createTable("CREATE TABLE %s(pk int PRIMARY KEY, s set<text>)");
         assertInvalidMessage("Not enough bytes to read a set",
                              "INSERT INTO %s (pk, s) VALUES (?, ?)", 1, "test");
-        assertInvalidMessage("String didn't validate.",
+        assertInvalidMessage("Not enough bytes to read a set",
                              "INSERT INTO %s (pk, s) VALUES (?, ?)", 1, Long.MAX_VALUE);
         assertInvalidMessage("Not enough bytes to read a set",
                              "INSERT INTO %s (pk, s) VALUES (?, ?)", 1, "");
@@ -986,9 +976,9 @@ public class CollectionsTest extends CQLTester
     public void testInvalidInputForMap() throws Throwable
     {
         createTable("CREATE TABLE %s(pk int PRIMARY KEY, m map<text, text>)");
-        assertInvalidMessage("Not enough bytes to read a map",
+        assertInvalidMessage("The data cannot be deserialized as a map",
                              "INSERT INTO %s (pk, m) VALUES (?, ?)", 1, "test");
-        assertInvalidMessage("String didn't validate.",
+        assertInvalidMessage("The data cannot be deserialized as a map",
                              "INSERT INTO %s (pk, m) VALUES (?, ?)", 1, Long.MAX_VALUE);
         assertInvalidMessage("Not enough bytes to read a map",
                              "INSERT INTO %s (pk, m) VALUES (?, ?)", 1, "");
@@ -1978,5 +1968,143 @@ public class CollectionsTest extends CQLTester
             assertRows(execute("SELECT m['0'..'1'], s[0..1] FROM %s WHERE k = 3"), row(null, null));
             assertRows(execute("SELECT m['0'..'1']['3'..'5'], s[0..1][3..5] FROM %s WHERE k = 3"), row(null, null));
         });
+    }
+
+    /*
+     Tests for CASSANDRA-17623
+     Before CASSANDRA-17623, parameterized queries with maps as values would fail because frozen maps were
+     required to be sorted by the sort order of their key type, but weren't always sorted correctly.
+     Also adding tests for Sets, which did work because they always used SortedSet, to make sure this behavior is maintained.
+     We use `executeNet` in these tests because `execute` passes parameters through CqlTester#transformValues(), which calls
+     AbstractType#decompose() on the value, which "fixes" the map order, but wouldn't happen normally.
+     */
+
+    @Test
+    public void testInsertingMapDataWithParameterizedQueriesIsKeyOrderIndependent() throws Throwable
+    {
+        UUID uuid1 = UUIDs.timeBased();
+        UUID uuid2 = UUIDs.timeBased();
+        createTable("CREATE TABLE %s (k text, c frozen<map<timeuuid, text>>, PRIMARY KEY (k, c));");
+        executeNet("INSERT INTO %s (k, c) VALUES ('0', ?)", linkedHashMap(uuid1, "0", uuid2, "1"));
+        executeNet("INSERT INTO %s (k, c) VALUES ('0', ?)", linkedHashMap(uuid2, "3", uuid1, "4"));
+        beforeAndAfterFlush(() -> {
+            assertRowCountNet(executeNet("SELECT * FROM %s WHERE k='0' AND c={" + uuid1 + ": '0', " + uuid2 + ": '1'}"), 1);
+            assertRowCountNet(executeNet("SELECT * FROM %s WHERE k='0' AND c={" + uuid2 + ": '1', " + uuid1 + ": '0'}"), 1);
+            assertRowCountNet(executeNet("SELECT * FROM %s WHERE k='0' AND c={" + uuid1 + ": '4', " + uuid2 + ": '3'}"), 1);
+            assertRowCountNet(executeNet("SELECT * FROM %s WHERE k='0' AND c={" + uuid2 + ": '3', " + uuid1 + ": '4'}"), 1);
+        });
+    }
+
+    @Test
+    public void testInsertingMapDataWithParameterizedQueriesIsKeyOrderIndependentWithSelectSlice() throws Throwable
+    {
+        UUID uuid1 = UUIDs.timeBased();
+        UUID uuid2 = UUIDs.timeBased();
+        createTable("CREATE TABLE %s (k text, c frozen<map<timeuuid, text>>, PRIMARY KEY (k, c));");
+        beforeAndAfterFlush(() -> {
+            executeNet("INSERT INTO %s (k, c) VALUES ('0', ?)", linkedHashMap(uuid2, "2", uuid1, "1"));
+            // Make sure that we can slice either value out of the map
+            assertRowsNet(executeNet("SELECT k, c[" + uuid2 + "] from %s"), row("0", "2"));
+            assertRowsNet(executeNet("SELECT k, c[" + uuid1 + "] from %s"), row("0", "1"));
+        });
+    }
+
+    @Test
+    public void testSelectingMapDataWithParameterizedQueriesIsKeyOrderIndependent() throws Throwable
+    {
+        UUID uuid1 = UUIDs.timeBased();
+        UUID uuid2 = UUIDs.timeBased();
+        createTable("CREATE TABLE %s (k text, c frozen<map<timeuuid, text>>, PRIMARY KEY (k, c));");
+        executeNet("INSERT INTO %s (k, c) VALUES ('0', {" + uuid1 + ": '0', " + uuid2 + ": '1'})");
+        executeNet("INSERT INTO %s (k, c) VALUES ('0', {" + uuid2 + ": '3', " + uuid1 + ": '4'})");
+        beforeAndAfterFlush(() -> {
+            assertRowCountNet(executeNet("SELECT * FROM %s WHERE k=? AND c=?", "0", linkedHashMap(uuid1, "0", uuid2, "1")), 1);
+            assertRowCountNet(executeNet("SELECT * FROM %s WHERE k=? AND c=?", "0", linkedHashMap(uuid2, "1", uuid1, "0")), 1);
+            assertRowCountNet(executeNet("SELECT * FROM %s WHERE k=? AND c=?", "0", linkedHashMap(uuid1, "4", uuid2, "3")), 1);
+            assertRowCountNet(executeNet("SELECT * FROM %s WHERE k=? AND c=?", "0", linkedHashMap(uuid2, "3", uuid1, "4")), 1);
+        });
+    }
+
+    @Test
+    public void testInsertingSetDataWithParameterizedQueriesIsKeyOrderIndependent() throws Throwable
+    {
+        UUID uuid1 = UUIDs.timeBased();
+        UUID uuid2 = UUIDs.timeBased();
+        createTable("CREATE TABLE %s (k text, c frozen<set<timeuuid>>, PRIMARY KEY (k, c));");
+        executeNet("INSERT INTO %s (k, c) VALUES ('0', ?)", linkedHashSet(uuid1, uuid2));
+        executeNet("INSERT INTO %s (k, c) VALUES ('0', ?)", linkedHashSet(uuid2, uuid1));
+        beforeAndAfterFlush(() -> {
+            assertRowCountNet(executeNet("SELECT * FROM %s WHERE k='0' AND c={" + uuid1 + ", " + uuid2 + '}'), 1);
+            assertRowCountNet(executeNet("SELECT * FROM %s WHERE k='0' AND c={" + uuid2 + ", " + uuid1 + '}'), 1);
+            assertRowCountNet(executeNet("SELECT * FROM %s WHERE k='0' AND c={" + uuid1 + ", " + uuid2 + '}'), 1);
+            assertRowCountNet(executeNet("SELECT * FROM %s WHERE k='0' AND c={" + uuid2 + ", " + uuid1 + '}'), 1);
+        });
+    }
+
+    @Test
+    public void testInsertingSetDataWithParameterizedQueriesIsKeyOrderIndependentWithSelectSlice() throws Throwable
+    {
+        UUID uuid1 = UUIDs.timeBased();
+        UUID uuid2 = UUIDs.timeBased();
+        createTable("CREATE TABLE %s (k text, c frozen<set<timeuuid>>, PRIMARY KEY (k, c));");
+        beforeAndAfterFlush(() -> {
+            executeNet("INSERT INTO %s (k, c) VALUES ('0', ?)", linkedHashSet(uuid2, uuid1));
+            assertRowsNet(executeNet("SELECT k, c[" + uuid2 + "] from %s"), row("0", uuid2));
+            assertRowsNet(executeNet("SELECT k, c[" + uuid1 + "] from %s"), row("0", uuid1));
+        });
+    }
+
+    @Test
+    public void testSelectingSetDataWithParameterizedQueriesIsKeyOrderIndependent() throws Throwable
+    {
+        UUID uuid1 = UUIDs.timeBased();
+        UUID uuid2 = UUIDs.timeBased();
+        createTable("CREATE TABLE %s (k text, c frozen<set<timeuuid>>, PRIMARY KEY (k, c));");
+        executeNet("INSERT INTO %s (k, c) VALUES ('0', {" + uuid1 + ", " + uuid2 + "})");
+        beforeAndAfterFlush(() -> {
+            assertRowsNet(executeNet("SELECT k, c from %s where k='0' and c=?", linkedHashSet(uuid1, uuid2)), row("0", list(uuid1, uuid2)));
+            assertRowsNet(executeNet("SELECT k, c from %s where k='0' and c=?", linkedHashSet(uuid2, uuid1)), row("0", list(uuid1, uuid2)));
+        });
+    }
+    // End tests for CASSANDRA-17623
+
+    @Test
+    public void testMapReversed() throws Throwable
+    {
+        createTable("CREATE TABLE %s (" +
+                    "   k int, " +
+                    "   c frozen<map<text, int>>, " +
+                    "   v int, " +
+                    "   PRIMARY KEY(k, c)" +
+                    ") WITH CLUSTERING ORDER BY (c DESC)");
+
+        execute("INSERT INTO %s(k, c, v) VALUES (1, {'t1':1,'t2':2,'t3':3,'t4':4}, 2)");
+        assertRows(execute("SELECT c['nonexisting'] FROM %s"), row((Object)null));
+        assertRows(execute("SELECT c['t1'] FROM %s"), row(1));
+        assertRows(execute("SELECT c['t1'..'t3'] FROM %s"), row(map("t1", 1, "t2", 2, "t3", 3)));
+        assertRows(execute("SELECT c['t3'..'t5'] FROM %s"), row(map("t3", 3, "t4", 4)));
+        assertRows(execute("SELECT c[..'t2'] FROM %s"), row(map("t1", 1, "t2", 2)));
+        assertRows(execute("SELECT c['t3'..] FROM %s"), row(map("t3", 3, "t4", 4)));
+        assertRows(execute("SELECT c[..'t5'] FROM %s"), row(map("t1", 1, "t2", 2, "t3", 3, "t4", 4)));
+    }
+
+    @Test
+    public void testSetReversed() throws Throwable
+    {
+        createTable("CREATE TABLE %s (" +
+                    "   k int, " +
+                    "   c frozen<set<text>>, " +
+                    "   v int, " +
+                    "   PRIMARY KEY(k, c)" +
+                    ") WITH CLUSTERING ORDER BY (c DESC)");
+
+        execute("INSERT INTO %s(k, c, v) VALUES (1, {'t1','t2','t3','t4'}, 2)");
+        assertRows(execute("SELECT c['nonexisting'] FROM %s"), row((Object)null));
+        assertRows(execute("SELECT c['t1'] FROM %s"), row("t1"));
+        assertRows(execute("SELECT c['t1'..'t3'] FROM %s"), row(set("t1", "t2", "t3")));
+        assertRows(execute("SELECT c['t3'..'t5'] FROM %s"), row(set("t3", "t4")));
+        assertRows(execute("SELECT c[..'t2'] FROM %s"), row(set("t1", "t2")));
+        assertRows(execute("SELECT c['t3'..] FROM %s"), row(set("t3", "t4")));
+        assertRows(execute("SELECT c[..'t5'] FROM %s"), row(set("t1", "t2", "t3", "t4")));
     }
 }

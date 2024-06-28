@@ -14,12 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from datetime import datetime, timedelta
-import time
+from datetime import datetime, timezone
 
 from cassandra.query import QueryTrace, TraceUnavailable
 from cqlshlib.displaying import MAGENTA
-from cqlshlib.formatting import CqlType
 
 
 def print_trace_session(shell, session, session_id, partial_session=False):
@@ -74,8 +72,6 @@ def make_trace_rows(trace):
     if trace.duration:
         finished_at = (datetime_from_utc_to_local(trace.started_at) + trace.duration)
         rows.append(['Request complete', str(finished_at), trace.coordinator, total_micro_seconds(trace.duration), trace.client])
-    else:
-        finished_at = trace.duration = "--"
 
     return rows
 
@@ -88,6 +84,8 @@ def total_micro_seconds(td):
 
 
 def datetime_from_utc_to_local(utc_datetime):
-    now_timestamp = time.time()
-    offset = datetime.fromtimestamp(now_timestamp) - datetime.utcfromtimestamp(now_timestamp)
-    return utc_datetime + offset
+    """
+    Convert a naive UTC datetime to the local timezone.
+    This is necessary because the driver always returns naive datetime objects.
+    """
+    return utc_datetime.replace(tzinfo=timezone.utc).astimezone()

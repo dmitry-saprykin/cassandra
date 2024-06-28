@@ -17,30 +17,40 @@
  */
 package org.apache.cassandra.index.sasi.disk;
 
-import java.io.*;
+import java.io.Closeable;
+import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.*;
+import java.nio.channels.FileChannel;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.NavigableMap;
+import java.util.TreeMap;
 import java.util.stream.Collectors;
-
-import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.index.sasi.Term;
-import org.apache.cassandra.index.sasi.plan.Expression;
-import org.apache.cassandra.index.sasi.plan.Expression.Op;
-import org.apache.cassandra.index.sasi.utils.MappedBuffer;
-import org.apache.cassandra.index.sasi.utils.RangeUnionIterator;
-import org.apache.cassandra.index.sasi.utils.AbstractIterator;
-import org.apache.cassandra.index.sasi.utils.RangeIterator;
-import org.apache.cassandra.db.marshal.AbstractType;
-import org.apache.cassandra.io.FSReadError;
-import org.apache.cassandra.io.util.ChannelProxy;
-import org.apache.cassandra.io.util.FileUtils;
-import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.FBUtilities;
 
 import com.google.common.base.Function;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Iterators;
 import com.google.common.collect.PeekingIterator;
+
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.index.sasi.Term;
+import org.apache.cassandra.index.sasi.plan.Expression;
+import org.apache.cassandra.index.sasi.plan.Expression.Op;
+import org.apache.cassandra.index.sasi.utils.MappedBuffer;
+import org.apache.cassandra.index.sasi.utils.RangeUnionIterator;
+import org.apache.cassandra.index.sasi.utils.RangeIterator;
+import org.apache.cassandra.io.FSReadError;
+import org.apache.cassandra.io.util.ChannelProxy;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.io.util.FileInputStreamPlus;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.utils.AbstractGuavaIterator;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
 
 import static org.apache.cassandra.index.sasi.disk.OnDiskBlock.SearchResult;
 
@@ -115,19 +125,16 @@ public class OnDiskIndex implements Iterable<OnDiskIndex.DataTerm>, Closeable
 
     protected final ByteBuffer minTerm, maxTerm, minKey, maxKey;
 
-    @SuppressWarnings("resource")
     public OnDiskIndex(File index, AbstractType<?> cmp, Function<Long, DecoratedKey> keyReader)
     {
         keyFetcher = keyReader;
 
         comparator = cmp;
-        indexPath = index.getAbsolutePath();
+        indexPath = index.absolutePath();
 
-        RandomAccessFile backingFile = null;
-        try
+
+        try (FileInputStreamPlus backingFile = new FileInputStreamPlus(index))
         {
-            backingFile = new RandomAccessFile(index, "r");
-
             descriptor = new Descriptor(backingFile.readUTF());
 
             termSize = OnDiskIndexBuilder.TermSize.of(backingFile.readShort());
@@ -141,32 +148,29 @@ public class OnDiskIndex implements Iterable<OnDiskIndex.DataTerm>, Closeable
             mode = OnDiskIndexBuilder.Mode.mode(backingFile.readUTF());
             hasMarkedPartials = backingFile.readBoolean();
 
-            indexSize = backingFile.length();
-            indexFile = new MappedBuffer(new ChannelProxy(indexPath, backingFile.getChannel()));
-
-            // start of the levels
-            indexFile.position(indexFile.getLong(indexSize - 8));
-
-            int numLevels = indexFile.getInt();
-            levels = new PointerLevel[numLevels];
-            for (int i = 0; i < levels.length; i++)
-            {
-                int blockCount = indexFile.getInt();
-                levels[i] = new PointerLevel(indexFile.position(), blockCount);
-                indexFile.position(indexFile.position() + blockCount * 8);
-            }
-
-            int blockCount = indexFile.getInt();
-            dataLevel = new DataLevel(indexFile.position(), blockCount);
+            FileChannel channel = index.newReadChannel();
+            indexSize = channel.size();
+            indexFile = new MappedBuffer(new ChannelProxy(index, channel));
         }
         catch (IOException e)
         {
             throw new FSReadError(e, index);
         }
-        finally
+
+        // start of the levels
+        indexFile.position(indexFile.getLong(indexSize - 8));
+
+        int numLevels = indexFile.getInt();
+        levels = new PointerLevel[numLevels];
+        for (int i = 0; i < levels.length; i++)
         {
-            FileUtils.closeQuietly(backingFile);
+            int blockCount = indexFile.getInt();
+            levels[i] = new PointerLevel(indexFile.position(), blockCount);
+            indexFile.position(indexFile.position() + blockCount * 8);
         }
+
+        int blockCount = indexFile.getInt();
+        dataLevel = new DataLevel(indexFile.position(), blockCount);
     }
 
     public boolean hasMarkedPartials()
@@ -272,7 +276,6 @@ public class OnDiskIndex implements Iterable<OnDiskIndex.DataTerm>, Closeable
         RangeUnionIterator.Builder<Long, Token> builder = RangeUnionIterator.builder();
         for (Expression e : ranges)
         {
-            @SuppressWarnings("resource")
             RangeIterator<Long, Token> range = searchRange(e);
             if (range != null)
                 builder.add(range);
@@ -726,7 +729,7 @@ public class OnDiskIndex implements Iterable<OnDiskIndex.DataTerm>, Closeable
         return indexPath;
     }
 
-    private class TermIterator extends AbstractIterator<DataTerm>
+    private class TermIterator extends AbstractGuavaIterator<DataTerm>
     {
         private final Expression e;
         private final IteratorOrder order;

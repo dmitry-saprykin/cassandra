@@ -18,9 +18,7 @@
  */
 package org.apache.cassandra.io.util;
 
-import java.io.File;
 import java.io.IOException;
-import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -30,6 +28,7 @@ import java.util.Arrays;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import org.apache.cassandra.Util;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.assertj.core.api.Assertions;
 
@@ -53,27 +52,56 @@ public class FileUtilsTest
         // test straightforward conversions for each unit
         assertEquals("FileUtils.parseFileSize() failed to parse a whole number of bytes",
             256L, FileUtils.parseFileSize("256 bytes"));
-        assertEquals("FileUtils.parseFileSize() failed to parse a whole number of kilobytes",
+        assertEquals("FileUtils.parseFileSize() failed to parse a whole number of kibibytes",
             2048L, FileUtils.parseFileSize("2 KiB"));
-        assertEquals("FileUtils.parseFileSize() failed to parse a whole number of megabytes",
+        assertEquals("FileUtils.parseFileSize() failed to parse a whole number of mebibytes",
             4194304L, FileUtils.parseFileSize("4 MiB"));
-        assertEquals("FileUtils.parseFileSize() failed to parse a whole number of gigabytes",
+        assertEquals("FileUtils.parseFileSize() failed to parse a whole number of gibibytes",
             3221225472L, FileUtils.parseFileSize("3 GiB"));
-        assertEquals("FileUtils.parseFileSize() failed to parse a whole number of terabytes",
+        assertEquals("FileUtils.parseFileSize() failed to parse a whole number of tebibytes",
             5497558138880L, FileUtils.parseFileSize("5 TiB"));
         // test conversions of fractional units
-        assertEquals("FileUtils.parseFileSize() failed to parse a rational number of kilobytes",
+        assertEquals("FileUtils.parseFileSize() failed to parse a rational number of kibibytes",
             1536L, FileUtils.parseFileSize("1.5 KiB"));
-        assertEquals("FileUtils.parseFileSize() failed to parse a rational number of kilobytes",
+        assertEquals("FileUtils.parseFileSize() failed to parse a rational number of kibibytes",
             4434L, FileUtils.parseFileSize("4.33 KiB"));
-        assertEquals("FileUtils.parseFileSize() failed to parse a rational number of megabytes",
+        assertEquals("FileUtils.parseFileSize() failed to parse a rational number of mebibytes",
             2359296L, FileUtils.parseFileSize("2.25 MiB"));
-        assertEquals("FileUtils.parseFileSize() failed to parse a rational number of megabytes",
+        assertEquals("FileUtils.parseFileSize() failed to parse a rational number of mebibytes",
             3292529L, FileUtils.parseFileSize("3.14 MiB"));
-        assertEquals("FileUtils.parseFileSize() failed to parse a rational number of gigabytes",
+        assertEquals("FileUtils.parseFileSize() failed to parse a rational number of gibibytes",
             1299227607L, FileUtils.parseFileSize("1.21 GiB"));
-        assertEquals("FileUtils.parseFileSize() failed to parse a rational number of terabytes",
+        assertEquals("FileUtils.parseFileSize() failed to parse a rational number of tebibytes",
             6621259022467L, FileUtils.parseFileSize("6.022 TiB"));
+    }
+
+    @Test
+    public void testStringifyFileSize() throws Exception
+    {
+        // test straightforward conversions for each unit
+        assertEquals("FileUtils.stringifyFileSize() failed to stringify a whole number of bytes",
+                     "256 bytes", FileUtils.stringifyFileSize(256L));
+        assertEquals("FileUtils.stringifyFileSize() failed to stringify a whole number of kibibytes",
+                     "2 KiB", FileUtils.stringifyFileSize(2048L));
+        assertEquals("FileUtils.stringifyFileSize() failed to stringify a whole number of mebibytes",
+                     "4 MiB", FileUtils.stringifyFileSize(4194304L));
+        assertEquals("FileUtils.stringifyFileSize() failed to stringify a whole number of gibibytes",
+                     "3 GiB", FileUtils.stringifyFileSize(3221225472L));
+        assertEquals("FileUtils.stringifyFileSize() failed to stringify a whole number of tebibytes",
+                     "5 TiB", FileUtils.stringifyFileSize(5497558138880L));
+        // test conversions of fractional units
+        assertEquals("FileUtils.stringifyFileSize() failed to stringify a rational number of kibibytes",
+                     "1.5 KiB", FileUtils.stringifyFileSize(1536L));
+        assertEquals("FileUtils.stringifyFileSize() failed to stringify a rational number of kibibytes",
+                     "4.33 KiB", FileUtils.stringifyFileSize(4434L));
+        assertEquals("FileUtils.stringifyFileSize() failed to stringify a rational number of mebibytes",
+                     "2.25 MiB", FileUtils.stringifyFileSize(2359296L));
+        assertEquals("FileUtils.stringifyFileSize() failed to stringify a rational number of mebibytes",
+                     "3.14 MiB", FileUtils.stringifyFileSize(3292529L));
+        assertEquals("FileUtils.stringifyFileSize() failed to stringify a rational number of gibibytes",
+                     "1.21 GiB", FileUtils.stringifyFileSize(1299227607L));
+        assertEquals("FileUtils.stringifyFileSize() failed to stringify a rational number of tebibytes",
+                     "6.02 TiB", FileUtils.stringifyFileSize(6621259022467L));
     }
 
     @Test
@@ -88,11 +116,11 @@ public class FileUtilsTest
         byte[] b = Files.readAllBytes(file.toPath());
         assertEquals(expected, new String(b, StandardCharsets.UTF_8));
 
-        FileUtils.truncate(file.getAbsolutePath(), 10);
+        FileUtils.truncate(file.absolutePath(), 10);
         b = Files.readAllBytes(file.toPath());
         assertEquals("The quick ", new String(b, StandardCharsets.UTF_8));
 
-        FileUtils.truncate(file.getAbsolutePath(), 0);
+        FileUtils.truncate(file.absolutePath(), 0);
         b = Files.readAllBytes(file.toPath());
         assertEquals(0, b.length);
     }
@@ -103,7 +131,7 @@ public class FileUtilsTest
         File folder = createFolder(Paths.get(DatabaseDescriptor.getAllDataFileLocations()[0], "testFolderSize"));
         folder.deleteOnExit();
 
-        File childFolder = createFolder(Paths.get(folder.getPath(), "child"));
+        File childFolder = createFolder(Paths.get(folder.path(), "child"));
 
         File[] files = {
                        createFile(new File(folder, "001"), 10000),
@@ -123,11 +151,11 @@ public class FileUtilsTest
     @Test
     public void testIsContained()
     {
-        assertTrue(FileUtils.isContained(new File("/tmp/abc"), new File("/tmp/abc")));
-        assertFalse(FileUtils.isContained(new File("/tmp/abc"), new File("/tmp/abcd")));
-        assertTrue(FileUtils.isContained(new File("/tmp/abc"), new File("/tmp/abc/d")));
-        assertTrue(FileUtils.isContained(new File("/tmp/abc/../abc"), new File("/tmp/abc/d")));
-        assertFalse(FileUtils.isContained(new File("/tmp/abc/../abc"), new File("/tmp/abcc")));
+        assertTrue(FileUtils.isContained(new File("/testroot/abc"), new File("/testroot/abc")));
+        assertFalse(FileUtils.isContained(new File("/testroot/abc"), new File("/testroot/abcd")));
+        assertTrue(FileUtils.isContained(new File("/testroot/abc"), new File("/testroot/abc/d")));
+        assertTrue(FileUtils.isContained(new File("/testroot/abc/../abc"), new File("/testroot/abc/d")));
+        assertFalse(FileUtils.isContained(new File("/testroot/abc/../abc"), new File("/testroot/abcc")));
     }
 
     @Test
@@ -222,16 +250,16 @@ public class FileUtilsTest
 
     private File createFolder(Path path)
     {
-        File folder = path.toFile();
+        File folder = new File(path);
         FileUtils.createDirectory(folder);
         return folder;
     }
 
     private File createFile(File file, long size)
     {
-        try (RandomAccessFile f = new RandomAccessFile(file, "rw"))
+        try
         {
-            f.setLength(size);
+            Util.setFileLength(file, size);
         }
         catch (Exception e)
         {

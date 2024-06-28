@@ -23,24 +23,22 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.io.Files;
 
 import org.junit.Assert;
-import org.junit.Before;
 import org.junit.Test;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import org.apache.cassandra.*;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.*;
 import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.db.marshal.*;
-import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.index.internal.CassandraIndex;
 import org.apache.cassandra.index.sasi.SASIIndex;
 import org.apache.cassandra.schema.*;
 import org.apache.cassandra.service.reads.SpeculativeRetryPolicy;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
-import org.json.simple.JSONArray;
-import org.json.simple.JSONObject;
-import org.json.simple.parser.JSONParser;
+import org.apache.cassandra.utils.JsonUtils;
 
-import java.io.FileReader;
 import java.nio.ByteBuffer;
 import java.nio.charset.Charset;
 import java.util.Arrays;
@@ -55,12 +53,6 @@ import static org.junit.Assert.assertThat;
 
 public class SchemaCQLHelperTest extends CQLTester
 {
-    @Before
-    public void defineSchema() throws ConfigurationException
-    {
-        SchemaLoader.prepareServer();
-    }
-
     @Test
     public void testUserTypesCQL()
     {
@@ -167,7 +159,7 @@ public class SchemaCQLHelperTest extends CQLTester
                           "    reg2 varint,\n" +
                           "    st1 varint static,\n" +
                           "    PRIMARY KEY (pk1, ck1)\n) WITH ID =";
-        String actual = SchemaCQLHelper.getTableMetadataAsCQL(cfs.metadata(), true, true, true);
+        String actual = SchemaCQLHelper.getTableMetadataAsCQL(cfs.metadata(), cfs.keyspace.getMetadata());
 
         assertThat(actual,
                    allOf(startsWith(expected),
@@ -208,7 +200,7 @@ public class SchemaCQLHelperTest extends CQLTester
         ColumnFamilyStore cfs = Keyspace.open(keyspace).getColumnFamilyStore(table);
 
         // when re-adding, column is present as both column and as dropped column record.
-        String actual = SchemaCQLHelper.getTableMetadataAsCQL(cfs.metadata(), true, true, true);
+        String actual = SchemaCQLHelper.getTableMetadataAsCQL(cfs.metadata(), cfs.keyspace.getMetadata());
         String expected = "CREATE TABLE IF NOT EXISTS cql_test_keyspace_readded_columns.test_table_readded_columns (\n" +
                           "    pk1 varint,\n" +
                           "    ck1 varint,\n" +
@@ -247,7 +239,7 @@ public class SchemaCQLHelperTest extends CQLTester
 
         ColumnFamilyStore cfs = Keyspace.open(keyspace).getColumnFamilyStore(table);
 
-        assertThat(SchemaCQLHelper.getTableMetadataAsCQL(cfs.metadata(), true, true, true),
+        assertThat(SchemaCQLHelper.getTableMetadataAsCQL(cfs.metadata(), cfs.keyspace.getMetadata()),
                    startsWith(
                    "CREATE TABLE IF NOT EXISTS cql_test_keyspace_create_table.test_table_create_table (\n" +
                    "    pk1 varint,\n" +
@@ -294,19 +286,22 @@ public class SchemaCQLHelperTest extends CQLTester
 
         ColumnFamilyStore cfs = Keyspace.open(keyspace).getColumnFamilyStore(table);
 
-        assertThat(SchemaCQLHelper.getTableMetadataAsCQL(cfs.metadata(), true, true, true),
+        assertThat(SchemaCQLHelper.getTableMetadataAsCQL(cfs.metadata(), cfs.keyspace.getMetadata()),
                    containsString("CLUSTERING ORDER BY (cl1 ASC)\n" +
                             "    AND additional_write_policy = 'ALWAYS'\n" +
+                            "    AND allow_auto_snapshot = true\n" +
                             "    AND bloom_filter_fp_chance = 1.0\n" +
                             "    AND caching = {'keys': 'ALL', 'rows_per_partition': 'NONE'}\n" +
                             "    AND cdc = false\n" +
                             "    AND comment = 'comment'\n" +
                             "    AND compaction = {'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy', 'max_threshold': '32', 'min_threshold': '4', 'sstable_size_in_mb': '1'}\n" +
                             "    AND compression = {'chunk_length_in_kb': '64', 'class': 'org.apache.cassandra.io.compress.LZ4Compressor', 'min_compress_ratio': '2.0'}\n" +
+                            "    AND memtable = 'default'\n" +
                             "    AND crc_check_chance = 0.3\n" +
                             "    AND default_time_to_live = 4\n" +
                             "    AND extensions = {'ext1': 0x76616c31}\n" +
                             "    AND gc_grace_seconds = 5\n" +
+                            "    AND incremental_backups = true\n" +
                             "    AND max_index_interval = 7\n" +
                             "    AND memtable_flush_period_in_ms = 8\n" +
                             "    AND min_index_interval = 6\n" +
@@ -363,9 +358,9 @@ public class SchemaCQLHelperTest extends CQLTester
 
         ColumnFamilyStore cfs = Keyspace.open(keyspace).getColumnFamilyStore(table);
 
-        assertEquals(ImmutableList.of("CREATE INDEX \"indexName\" ON cql_test_keyspace_3.test_table_3 (values(reg1));",
-                                      "CREATE INDEX \"indexName2\" ON cql_test_keyspace_3.test_table_3 (keys(reg1));",
-                                      "CREATE INDEX \"indexName3\" ON cql_test_keyspace_3.test_table_3 (entries(reg1));",
+        assertEquals(ImmutableList.of("CREATE INDEX \"indexName\" ON cql_test_keyspace_3.test_table_3 (values(reg1)) USING 'legacy_local_table';",
+                                      "CREATE INDEX \"indexName2\" ON cql_test_keyspace_3.test_table_3 (keys(reg1)) USING 'legacy_local_table';",
+                                      "CREATE INDEX \"indexName3\" ON cql_test_keyspace_3.test_table_3 (entries(reg1)) USING 'legacy_local_table';",
                                       "CREATE CUSTOM INDEX \"indexName4\" ON cql_test_keyspace_3.test_table_3 (entries(reg1)) USING 'org.apache.cassandra.index.sasi.SASIIndex';",
                                       "CREATE CUSTOM INDEX \"indexName5\" ON cql_test_keyspace_3.test_table_3 (entries(reg1)) USING 'org.apache.cassandra.index.sasi.SASIIndex' WITH OPTIONS = {'is_literal': 'false'};"),
                      SchemaCQLHelper.getIndexesAsCQL(cfs.metadata(), false).collect(Collectors.toList()));
@@ -402,7 +397,7 @@ public class SchemaCQLHelperTest extends CQLTester
         ColumnFamilyStore cfs = Keyspace.open(keyspace()).getColumnFamilyStore(tableName);
         cfs.snapshot(SNAPSHOT);
 
-        String schema = Files.toString(cfs.getDirectories().getSnapshotSchemaFile(SNAPSHOT), Charset.defaultCharset());
+        String schema = Files.toString(cfs.getDirectories().getSnapshotSchemaFile(SNAPSHOT).toJavaIOFile(), Charset.defaultCharset());
         assertThat(schema,
                    allOf(containsString(String.format("CREATE TYPE IF NOT EXISTS %s.%s (\n" +
                                                       "    a1 varint,\n" +
@@ -443,12 +438,17 @@ public class SchemaCQLHelperTest extends CQLTester
                          containsString("ALTER TABLE " + keyspace() + "." + tableName + " DROP reg3 USING TIMESTAMP 10000;"),
                          containsString("ALTER TABLE " + keyspace() + "." + tableName + " ADD reg3 int;")));
 
-        assertThat(schema, containsString("CREATE INDEX IF NOT EXISTS " + tableName + "_reg2_idx ON " + keyspace() + '.' + tableName + " (reg2);"));
+        final boolean isIndexLegacy = DatabaseDescriptor.getDefaultSecondaryIndex().equals(CassandraIndex.NAME);
+        assertThat(schema, containsString(
+            "CREATE " + (isIndexLegacy ? "" : "CUSTOM ") +
+            "INDEX IF NOT EXISTS " + tableName + "_reg2_idx ON " + keyspace() + '.' + tableName + " (reg2)" +
+            (" USING '" + (isIndexLegacy ? CassandraIndex.NAME : DatabaseDescriptor.getDefaultSecondaryIndex()) + "'") + ";"));
 
-        JSONObject manifest = (JSONObject) new JSONParser().parse(new FileReader(cfs.getDirectories().getSnapshotManifestFile(SNAPSHOT)));
-        JSONArray files = (JSONArray) manifest.get("files");
+        JsonNode manifest = JsonUtils.JSON_OBJECT_MAPPER.readTree(cfs.getDirectories().getSnapshotManifestFile(SNAPSHOT).toJavaIOFile());
+        JsonNode files = manifest.get("files");
         // two files, the second is index
-        Assert.assertEquals(2, files.size());
+        Assert.assertTrue(files.isArray());
+        Assert.assertEquals(isIndexLegacy ? 2 : 1, files.size());
     }
 
     @Test
@@ -476,6 +476,6 @@ public class SchemaCQLHelperTest extends CQLTester
         cfs.getSSTablesForKey("false:true");
 
         execute("insert into %s (t_id, id, ck, nk) VALUES (true, true, false, true)");
-        assertRows(execute("select t_id, id, ck, nk from %s"), row(true, false, false, true), row(true, true, false, true));
+        assertRows(execute("select t_id, id, ck, nk from %s"), row(true, true, false, true), row(true, false, false, true));
     }
 }

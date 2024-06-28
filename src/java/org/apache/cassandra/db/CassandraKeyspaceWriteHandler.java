@@ -18,9 +18,14 @@
 
 package org.apache.cassandra.db;
 
+import java.util.HashSet;
+import java.util.Set;
+
 import org.apache.cassandra.db.commitlog.CommitLog;
 import org.apache.cassandra.db.commitlog.CommitLogPosition;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.exceptions.RequestExecutionException;
+import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 
@@ -34,7 +39,6 @@ public class CassandraKeyspaceWriteHandler implements KeyspaceWriteHandler
     }
 
     @Override
-    @SuppressWarnings("resource") // group is closed when CassandraWriteContext is closed
     public WriteContext beginWrite(Mutation mutation, boolean makeDurable) throws RequestExecutionException
     {
         OpOrder.Group group = null;
@@ -46,8 +50,7 @@ public class CassandraKeyspaceWriteHandler implements KeyspaceWriteHandler
             CommitLogPosition position = null;
             if (makeDurable)
             {
-                Tracing.trace("Appending to commitlog");
-                position = CommitLog.instance.add(mutation);
+                position = addToCommitLog(mutation);
             }
             return new CassandraWriteContext(group, position);
         }
@@ -61,7 +64,41 @@ public class CassandraKeyspaceWriteHandler implements KeyspaceWriteHandler
         }
     }
 
-    @SuppressWarnings("resource") // group is closed when CassandraWriteContext is closed
+    private CommitLogPosition addToCommitLog(Mutation mutation)
+    {
+        // Usually one of these will be true, so first check if that's the case.
+        boolean allSkipCommitlog = true;
+        boolean noneSkipCommitlog = true;
+        for (PartitionUpdate update : mutation.getPartitionUpdates())
+        {
+            if (update.metadata().params.memtable.factory().writesShouldSkipCommitLog())
+                noneSkipCommitlog = false;
+            else
+                allSkipCommitlog = false;
+        }
+
+        if (!noneSkipCommitlog)
+        {
+            if (allSkipCommitlog)
+                return null;
+            else
+            {
+                Set<TableId> ids = new HashSet<>();
+                for (PartitionUpdate update : mutation.getPartitionUpdates())
+                {
+                    if (update.metadata().params.memtable.factory().writesShouldSkipCommitLog())
+                        ids.add(update.metadata().id);
+                }
+                mutation = mutation.without(ids);
+            }
+        }
+        // Note: It may be a good idea to precalculate none/all for the set of all tables in the keyspace,
+        // or memoize the mutation.getTableIds()->ids map (needs invalidation on schema version change).
+
+        Tracing.trace("Appending to commitlog");
+        return CommitLog.instance.add(mutation);
+    }
+
     private WriteContext createEmptyContext()
     {
         OpOrder.Group group = null;

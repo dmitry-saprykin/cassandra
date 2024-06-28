@@ -18,8 +18,6 @@
 
 package org.apache.cassandra.db.commitlog;
 
-import java.io.File;
-
 import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.io.util.FileUtils;
 
@@ -61,8 +59,11 @@ public class CommitLogSegmentManagerStandard extends AbstractCommitLogSegmentMan
         return alloc;
     }
 
-   public CommitLogSegment createSegment()
+    @Override
+    public CommitLogSegment createSegment()
     {
-        return CommitLogSegment.createSegment(commitLog, this);
+        CommitLogSegment segment = super.createSegment();
+        segment.writeLogHeader();
+        return segment;
     }
 }

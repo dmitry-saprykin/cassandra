@@ -24,20 +24,16 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.Directories;
-import org.apache.cassandra.db.RowIndexEntry;
-import org.apache.cassandra.db.SerializationHeader;
-import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
-import org.apache.cassandra.io.sstable.format.SSTableWriter;
-import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
 
 /**
  * CompactionAwareWriter that splits input in differently sized sstables
  *
  * Biggest sstable will be total_compaction_size / 2, second biggest total_compaction_size / 4 etc until
- * the result would be sub 50MB, all those are put in the same
+ * the result would be sub 50MiB, all those are put in the same
  */
 public class SplittingSizeTieredCompactionWriter extends CompactionAwareWriter
 {
@@ -49,7 +45,6 @@ public class SplittingSizeTieredCompactionWriter extends CompactionAwareWriter
     private final Set<SSTableReader> allSSTables;
     private long currentBytesToWrite;
     private int currentRatioIndex = 0;
-    private Directories.DataDirectory location;
 
     public SplittingSizeTieredCompactionWriter(ColumnFamilyStore cfs, Directories directories, LifecycleTransaction txn, Set<SSTableReader> nonExpiredSSTables)
     {
@@ -70,7 +65,7 @@ public class SplittingSizeTieredCompactionWriter extends CompactionAwareWriter
         }
 
         int noPointIndex = 0;
-        // find how many sstables we should create - 50MB min sstable size
+        // find how many sstables we should create - 50MiB min sstable size
         for (double ratio : potentialRatios)
         {
             noPointIndex++;
@@ -84,36 +79,33 @@ public class SplittingSizeTieredCompactionWriter extends CompactionAwareWriter
     }
 
     @Override
-    public boolean realAppend(UnfilteredRowIterator partition)
+    protected boolean shouldSwitchWriterInCurrentLocation(DecoratedKey key)
     {
-        RowIndexEntry rie = sstableWriter.append(partition);
         if (sstableWriter.currentWriter().getEstimatedOnDiskBytesWritten() > currentBytesToWrite && currentRatioIndex < ratios.length - 1) // if we underestimate how many keys we have, the last sstable might get more than we expect
         {
             currentRatioIndex++;
-            currentBytesToWrite = Math.round(totalSize * ratios[currentRatioIndex]);
-            switchCompactionLocation(location);
+            currentBytesToWrite = getExpectedWriteSize();
             logger.debug("Switching writer, currentBytesToWrite = {}", currentBytesToWrite);
+            return true;
         }
-        return rie != null;
+        return false;
+    }
+
+    protected int sstableLevel()
+    {
+        return 0;
+    }
+
+    protected long sstableKeyCount()
+    {
+        long currentPartitionsToWrite = Math.round(ratios[currentRatioIndex] * estimatedTotalKeys);
+        logger.trace("Switching writer, currentPartitionsToWrite = {}", currentPartitionsToWrite);
+        return currentPartitionsToWrite;
     }
 
     @Override
-    public void switchCompactionLocation(Directories.DataDirectory location)
+    protected long getExpectedWriteSize()
     {
-        this.location = location;
-        long currentPartitionsToWrite = Math.round(ratios[currentRatioIndex] * estimatedTotalKeys);
-        @SuppressWarnings("resource")
-        SSTableWriter writer = SSTableWriter.create(cfs.newSSTableDescriptor(getDirectories().getLocationForDisk(location)),
-                                                    currentPartitionsToWrite,
-                                                    minRepairedAt,
-                                                    pendingRepair,
-                                                    isTransient,
-                                                    cfs.metadata,
-                                                    new MetadataCollector(allSSTables, cfs.metadata().comparator, 0),
-                                                    SerializationHeader.make(cfs.metadata(), nonExpiredSSTables),
-                                                    cfs.indexManager.listIndexes(),
-                                                    txn);
-        logger.trace("Switching writer, currentPartitionsToWrite = {}", currentPartitionsToWrite);
-        sstableWriter.switchWriter(writer);
+        return Math.round(totalSize * ratios[currentRatioIndex]);
     }
 }

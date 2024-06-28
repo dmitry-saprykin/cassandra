@@ -34,8 +34,11 @@ public class PermissionsCache extends AuthCache<Pair<AuthenticatedUser, IResourc
               DatabaseDescriptor::getPermissionsUpdateInterval,
               DatabaseDescriptor::setPermissionsCacheMaxEntries,
               DatabaseDescriptor::getPermissionsCacheMaxEntries,
+              DatabaseDescriptor::setPermissionsCacheActiveUpdate,
+              DatabaseDescriptor::getPermissionsCacheActiveUpdate,
               (p) -> authorizer.authorize(p.left, p.right),
-              () -> DatabaseDescriptor.getAuthorizer().requireAuthorization());
+              authorizer.bulkLoader(),
+              authorizer::requireAuthorization);
     }
 
     public Set<Permission> getPermissions(AuthenticatedUser user, IResource resource)
@@ -43,8 +46,8 @@ public class PermissionsCache extends AuthCache<Pair<AuthenticatedUser, IResourc
         return get(Pair.create(user, resource));
     }
 
-    public void invalidatePermissions(String userName, String resourceName)
+    public void invalidatePermissions(String roleName, String resourceName)
     {
-        invalidate(Pair.create(new AuthenticatedUser(userName), Resources.fromName(resourceName)));
+        invalidate(Pair.create(new AuthenticatedUser(roleName), Resources.fromName(resourceName)));
     }
 }

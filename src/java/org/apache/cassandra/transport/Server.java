@@ -22,7 +22,11 @@ import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.LockSupport;
+import java.util.function.BooleanSupplier;
+import java.util.function.Predicate;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -41,13 +45,20 @@ import io.netty.util.internal.logging.Slf4JLoggerFactory;
 import org.apache.cassandra.auth.AuthenticatedUser;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.EncryptionOptions;
+import org.apache.cassandra.cql3.functions.UDAggregate;
+import org.apache.cassandra.cql3.functions.UDFunction;
 import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.UserType;
 import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.SchemaChangeListener;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.*;
 import org.apache.cassandra.transport.messages.EventMessage;
 import org.apache.cassandra.utils.FBUtilities;
+
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 
 public class Server implements CassandraDaemon.Server
 {
@@ -59,7 +70,7 @@ public class Server implements CassandraDaemon.Server
     private static final Logger logger = LoggerFactory.getLogger(Server.class);
     private static final boolean useEpoll = NativeTransportService.useEpoll();
 
-    private final ConnectionTracker connectionTracker = new ConnectionTracker();
+    private final ConnectionTracker connectionTracker;
 
     private final Connection.Factory connectionFactory = new Connection.Factory()
     {
@@ -74,7 +85,7 @@ public class Server implements CassandraDaemon.Server
     private final AtomicBoolean isRunning = new AtomicBoolean(false);
     private final PipelineConfigurator pipelineConfigurator;
     private final EventLoopGroup workerGroup;
-
+    private final Dispatcher dispatcher;
     private Server (Builder builder)
     {
         this.socket = builder.getSocket();
@@ -91,14 +102,16 @@ public class Server implements CassandraDaemon.Server
                 workerGroup = new NioEventLoopGroup();
         }
 
+        dispatcher = new Dispatcher(DatabaseDescriptor.useNativeTransportLegacyFlusher());
         pipelineConfigurator = builder.pipelineConfigurator != null
                                ? builder.pipelineConfigurator
                                : new PipelineConfigurator(useEpoll,
                                                           DatabaseDescriptor.getRpcKeepAlive(),
-                                                          DatabaseDescriptor.useNativeTransportLegacyFlusher(),
-                                                          builder.tlsEncryptionPolicy);
+                                                          builder.tlsEncryptionPolicy,
+                                                          dispatcher);
 
         EventNotifier notifier = builder.eventNotifier != null ? builder.eventNotifier : new EventNotifier();
+        connectionTracker = new ConnectionTracker(isRunning::get);
         notifier.registerConnectionTracker(connectionTracker);
         StorageService.instance.register(notifier);
         Schema.instance.registerListener(notifier);
@@ -106,8 +119,13 @@ public class Server implements CassandraDaemon.Server
 
     public void stop()
     {
-        if (isRunning.compareAndSet(true, false))
-            close();
+        stop(false);
+    }
+
+    public void stop(boolean force)
+    {
+         if (isRunning.compareAndSet(true, false))
+             close(force);
     }
 
     public boolean isRunning()
@@ -140,6 +158,14 @@ public class Server implements CassandraDaemon.Server
         return connectionTracker.countConnectedClientsByUser();
     }
 
+    /**
+     * @return A count of the number of clients matching the given predicate.
+     */
+    public int countConnectedClients(Predicate<ServerConnection> predicate)
+    {
+        return connectionTracker.countConnectedClients(predicate);
+    }
+
     public List<ConnectedClient> getConnectedClients()
     {
         List<ConnectedClient> result = new ArrayList<>();
@@ -163,8 +189,22 @@ public class Server implements CassandraDaemon.Server
         connectionTracker.protocolVersionTracker.clear();
     }
 
-    private void close()
+    private void close(boolean force)
     {
+        if (!force)
+        {
+            long deadline = nanoTime() + DatabaseDescriptor.getNativeTransportTimeout(TimeUnit.NANOSECONDS);
+            while (!dispatcher.isDone())
+            {
+                if (nanoTime() > deadline)
+                {
+                    logger.warn("Some connections took longer than the native transport timeout to complete");
+                    break;
+                }
+                LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(100));
+            }
+        }
+
         // Close opened connections
         connectionTracker.closeAll();
 
@@ -252,11 +292,13 @@ public class Server implements CassandraDaemon.Server
         public final ChannelGroup allChannels = new DefaultChannelGroup(GlobalEventExecutor.INSTANCE);
         private final EnumMap<Event.Type, ChannelGroup> groups = new EnumMap<>(Event.Type.class);
         private final ProtocolVersionTracker protocolVersionTracker = new ProtocolVersionTracker();
+        private final BooleanSupplier isRunning;
 
-        public ConnectionTracker()
+        public ConnectionTracker(BooleanSupplier isRunning)
         {
             for (Event.Type type : Event.Type.values())
                 groups.put(type, new DefaultChannelGroup(type.toString(), GlobalEventExecutor.INSTANCE));
+            this.isRunning = isRunning;
         }
 
         public void addConnection(Channel ch, Connection connection)
@@ -265,6 +307,11 @@ public class Server implements CassandraDaemon.Server
 
             if (ch.remoteAddress() instanceof InetSocketAddress)
                 protocolVersionTracker.addConnection(((InetSocketAddress) ch.remoteAddress()).getAddress(), connection.getVersion());
+        }
+
+        public boolean isRunning()
+        {
+            return isRunning.getAsBoolean();
         }
 
         public void register(Event.Type type, Channel ch)
@@ -288,7 +335,7 @@ public class Server implements CassandraDaemon.Server
 
         void closeAll()
         {
-            allChannels.close().awaitUninterruptibly();
+            allChannels.flush().close().awaitUninterruptibly();
         }
 
         int countConnectedClients()
@@ -299,6 +346,24 @@ public class Server implements CassandraDaemon.Server
                - When server is stopped: the size is 0
             */
             return allChannels.size() != 0 ? allChannels.size() - 1 : 0;
+        }
+
+        int countConnectedClients(Predicate<ServerConnection> predicate)
+        {
+            int count = 0;
+            for (Channel c : allChannels)
+            {
+                Connection connection = c.attr(Connection.attributeKey).get();
+                if (connection instanceof ServerConnection)
+                {
+                    ServerConnection conn = (ServerConnection) connection;
+                    if (predicate.test(conn))
+                    {
+                        count++;
+                    }
+                }
+            }
+            return count;
         }
 
         Map<String, Integer> countConnectedClientsByUser()
@@ -354,7 +419,7 @@ public class Server implements CassandraDaemon.Server
         }
     }
 
-    public static class EventNotifier extends SchemaChangeListener implements IEndpointLifecycleSubscriber
+    public static class EventNotifier implements SchemaChangeListener, IEndpointLifecycleSubscriber
     {
         private ConnectionTracker connectionTracker;
 
@@ -381,7 +446,7 @@ public class Server implements CassandraDaemon.Server
                 // That should not happen, so log an error, but return the
                 // endpoint address since there's a good change this is right
                 logger.error("Problem retrieving RPC address for {}", endpoint, e);
-                return InetAddressAndPort.getByAddressOverrideDefaults(endpoint.address, DatabaseDescriptor.getNativeTransportPort());
+                return InetAddressAndPort.getByAddressOverrideDefaults(endpoint.getAddress(), DatabaseDescriptor.getNativeTransportPort());
             }
         }
 
@@ -407,6 +472,7 @@ public class Server implements CassandraDaemon.Server
             connectionTracker.send(event);
         }
 
+        @Override
         public void onJoinCluster(InetAddressAndPort endpoint)
         {
             if (!StorageService.instance.isRpcReady(endpoint))
@@ -415,16 +481,19 @@ public class Server implements CassandraDaemon.Server
                 onTopologyChange(endpoint, Event.TopologyChange.newNode(getNativeAddress(endpoint)));
         }
 
+        @Override
         public void onLeaveCluster(InetAddressAndPort endpoint)
         {
             onTopologyChange(endpoint, Event.TopologyChange.removedNode(getNativeAddress(endpoint)));
         }
 
+        @Override
         public void onMove(InetAddressAndPort endpoint)
         {
             onTopologyChange(endpoint, Event.TopologyChange.movedNode(getNativeAddress(endpoint)));
         }
 
+        @Override
         public void onUp(InetAddressAndPort endpoint)
         {
             if (endpointsPendingJoinedNotification.remove(endpoint))
@@ -433,6 +502,7 @@ public class Server implements CassandraDaemon.Server
             onStatusChange(endpoint, Event.StatusChange.nodeUp(getNativeAddress(endpoint)));
         }
 
+        @Override
         public void onDown(InetAddressAndPort endpoint)
         {
             onStatusChange(endpoint, Event.StatusChange.nodeDown(getNativeAddress(endpoint)));
@@ -466,85 +536,100 @@ public class Server implements CassandraDaemon.Server
             }
         }
 
-        public void onCreateKeyspace(String ksName)
+        @Override
+        public void onCreateKeyspace(KeyspaceMetadata keyspace)
         {
-            send(new Event.SchemaChange(Event.SchemaChange.Change.CREATED, ksName));
+            send(new Event.SchemaChange(Event.SchemaChange.Change.CREATED, keyspace.name));
         }
 
-        public void onCreateTable(String ksName, String cfName)
+        @Override
+        public void onCreateTable(TableMetadata table)
         {
-            send(new Event.SchemaChange(Event.SchemaChange.Change.CREATED, Event.SchemaChange.Target.TABLE, ksName, cfName));
+            send(new Event.SchemaChange(Event.SchemaChange.Change.CREATED, Event.SchemaChange.Target.TABLE, table.keyspace, table.name));
         }
 
-        public void onCreateType(String ksName, String typeName)
+        @Override
+        public void onCreateType(UserType type)
         {
-            send(new Event.SchemaChange(Event.SchemaChange.Change.CREATED, Event.SchemaChange.Target.TYPE, ksName, typeName));
+            send(new Event.SchemaChange(Event.SchemaChange.Change.CREATED, Event.SchemaChange.Target.TYPE, type.keyspace, type.getNameAsString()));
         }
 
-        public void onCreateFunction(String ksName, String functionName, List<AbstractType<?>> argTypes)
+        @Override
+        public void onCreateFunction(UDFunction function)
         {
             send(new Event.SchemaChange(Event.SchemaChange.Change.CREATED, Event.SchemaChange.Target.FUNCTION,
-                                        ksName, functionName, AbstractType.asCQLTypeStringList(argTypes)));
+                                        function.name().keyspace, function.name().name, AbstractType.asCQLTypeStringList(function.argTypes())));
         }
 
-        public void onCreateAggregate(String ksName, String aggregateName, List<AbstractType<?>> argTypes)
+        @Override
+        public void onCreateAggregate(UDAggregate aggregate)
         {
             send(new Event.SchemaChange(Event.SchemaChange.Change.CREATED, Event.SchemaChange.Target.AGGREGATE,
-                                        ksName, aggregateName, AbstractType.asCQLTypeStringList(argTypes)));
+                                        aggregate.name().keyspace, aggregate.name().name, AbstractType.asCQLTypeStringList(aggregate.argTypes())));
         }
 
-        public void onAlterKeyspace(String ksName)
+        @Override
+        public void onAlterKeyspace(KeyspaceMetadata before, KeyspaceMetadata after)
         {
-            send(new Event.SchemaChange(Event.SchemaChange.Change.UPDATED, ksName));
+            send(new Event.SchemaChange(Event.SchemaChange.Change.UPDATED, after.name));
         }
 
-        public void onAlterTable(String ksName, String cfName, boolean affectsStatements)
+        @Override
+        public void onAlterTable(TableMetadata before, TableMetadata after, boolean affectsStatements)
         {
-            send(new Event.SchemaChange(Event.SchemaChange.Change.UPDATED, Event.SchemaChange.Target.TABLE, ksName, cfName));
+            send(new Event.SchemaChange(Event.SchemaChange.Change.UPDATED, Event.SchemaChange.Target.TABLE, after.keyspace, after.name));
         }
 
-        public void onAlterType(String ksName, String typeName)
+        @Override
+        public void onAlterType(UserType before, UserType after)
         {
-            send(new Event.SchemaChange(Event.SchemaChange.Change.UPDATED, Event.SchemaChange.Target.TYPE, ksName, typeName));
+            send(new Event.SchemaChange(Event.SchemaChange.Change.UPDATED, Event.SchemaChange.Target.TYPE, after.keyspace, after.getNameAsString()));
         }
 
-        public void onAlterFunction(String ksName, String functionName, List<AbstractType<?>> argTypes)
+        @Override
+        public void onAlterFunction(UDFunction before, UDFunction after)
         {
             send(new Event.SchemaChange(Event.SchemaChange.Change.UPDATED, Event.SchemaChange.Target.FUNCTION,
-                                        ksName, functionName, AbstractType.asCQLTypeStringList(argTypes)));
+                                        after.name().keyspace, after.name().name, AbstractType.asCQLTypeStringList(after.argTypes())));
         }
 
-        public void onAlterAggregate(String ksName, String aggregateName, List<AbstractType<?>> argTypes)
+        @Override
+        public void onAlterAggregate(UDAggregate before, UDAggregate after)
         {
             send(new Event.SchemaChange(Event.SchemaChange.Change.UPDATED, Event.SchemaChange.Target.AGGREGATE,
-                                        ksName, aggregateName, AbstractType.asCQLTypeStringList(argTypes)));
+                                        after.name().keyspace, after.name().name, AbstractType.asCQLTypeStringList(after.argTypes())));
         }
 
-        public void onDropKeyspace(String ksName)
+        @Override
+        public void onDropKeyspace(KeyspaceMetadata keyspace, boolean dropData)
         {
-            send(new Event.SchemaChange(Event.SchemaChange.Change.DROPPED, ksName));
+            send(new Event.SchemaChange(Event.SchemaChange.Change.DROPPED, keyspace.name));
         }
 
-        public void onDropTable(String ksName, String cfName)
+        @Override
+        public void onDropTable(TableMetadata table, boolean dropData)
         {
-            send(new Event.SchemaChange(Event.SchemaChange.Change.DROPPED, Event.SchemaChange.Target.TABLE, ksName, cfName));
+            send(new Event.SchemaChange(Event.SchemaChange.Change.DROPPED, Event.SchemaChange.Target.TABLE, table.keyspace, table.name));
         }
 
-        public void onDropType(String ksName, String typeName)
+        @Override
+        public void onDropType(UserType type)
         {
-            send(new Event.SchemaChange(Event.SchemaChange.Change.DROPPED, Event.SchemaChange.Target.TYPE, ksName, typeName));
+            send(new Event.SchemaChange(Event.SchemaChange.Change.DROPPED, Event.SchemaChange.Target.TYPE, type.keyspace, type.getNameAsString()));
         }
 
-        public void onDropFunction(String ksName, String functionName, List<AbstractType<?>> argTypes)
+        @Override
+        public void onDropFunction(UDFunction function)
         {
             send(new Event.SchemaChange(Event.SchemaChange.Change.DROPPED, Event.SchemaChange.Target.FUNCTION,
-                                        ksName, functionName, AbstractType.asCQLTypeStringList(argTypes)));
+                                        function.name().keyspace, function.name().name, AbstractType.asCQLTypeStringList(function.argTypes())));
         }
 
-        public void onDropAggregate(String ksName, String aggregateName, List<AbstractType<?>> argTypes)
+        @Override
+        public void onDropAggregate(UDAggregate aggregate)
         {
             send(new Event.SchemaChange(Event.SchemaChange.Change.DROPPED, Event.SchemaChange.Target.AGGREGATE,
-                                        ksName, aggregateName, AbstractType.asCQLTypeStringList(argTypes)));
+                                        aggregate.name().keyspace, aggregate.name().name, AbstractType.asCQLTypeStringList(aggregate.argTypes())));
         }
     }
 }

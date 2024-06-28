@@ -92,23 +92,13 @@ if [ "x$CASSANDRA_LOG_DIR" = "x" ] ; then
 fi
 
 #GC log path has to be defined here because it needs to access CASSANDRA_HOME
-if [ $JAVA_VERSION -ge 11 ] ; then
-    # See description of https://bugs.openjdk.java.net/browse/JDK-8046148 for details about the syntax
-    # The following is the equivalent to -XX:+PrintGCDetails -XX:+UseGCLogFileRotation -XX:NumberOfGCLogFiles=10 -XX:GCLogFileSize=10M
-    echo "$JVM_OPTS" | grep -qe "-[X]log:gc"
-    if [ "$?" = "1" ] ; then # [X] to prevent ccm from replacing this line
-        # only add -Xlog:gc if it's not mentioned in jvm-server.options file
-        mkdir -p ${CASSANDRA_LOG_DIR}
-        JVM_OPTS="$JVM_OPTS -Xlog:gc=info,heap*=trace,age*=debug,safepoint=info,promotion*=trace:file=${CASSANDRA_LOG_DIR}/gc.log:time,uptime,pid,tid,level:filecount=10,filesize=10485760"
-    fi
-else
-    # Java 8
-    echo "$JVM_OPTS" | grep -qe "-[X]loggc"
-    if [ "$?" = "1" ] ; then # [X] to prevent ccm from replacing this line
-        # only add -Xlog:gc if it's not mentioned in jvm-server.options file
-        mkdir -p ${CASSANDRA_LOG_DIR}
-        JVM_OPTS="$JVM_OPTS -Xloggc:${CASSANDRA_LOG_DIR}/gc.log"
-    fi
+# See description of https://bugs.openjdk.java.net/browse/JDK-8046148 for details about the syntax
+# The following is the equivalent to -XX:+PrintGCDetails -XX:+UseGCLogFileRotation -XX:NumberOfGCLogFiles=10 -XX:GCLogFileSize=10M
+echo "$JVM_OPTS" | grep -qe "-[X]log:gc"
+if [ "$?" = "1" ] ; then # [X] to prevent ccm from replacing this line
+    # only add -Xlog:gc if it's not mentioned in jvm-server.options file
+    mkdir -p ${CASSANDRA_LOG_DIR}
+    JVM_OPTS="$JVM_OPTS -Xlog:gc=info,heap*=trace,age*=debug,safepoint=info,promotion*=trace:file=${CASSANDRA_LOG_DIR}/gc.log:time,uptime,pid,tid,level:filecount=10,filesize=10485760"
 fi
 
 # Check what parameters were defined on jvm-server.options file to avoid conflicts
@@ -191,7 +181,7 @@ fi
 JVM_OPTS="$JVM_OPTS -XX:CompileCommandFile=$CASSANDRA_CONF/hotspot_compiler"
 
 # add the jamm javaagent
-JVM_OPTS="$JVM_OPTS -javaagent:$CASSANDRA_HOME/lib/jamm-0.3.2.jar"
+JVM_OPTS="$JVM_OPTS -javaagent:$CASSANDRA_HOME/lib/jamm-0.4.0.jar"
 
 # set jvm HeapDumpPath with CASSANDRA_HEAPDUMP_DIR
 if [ "x$CASSANDRA_HEAPDUMP_DIR" != "x" ]; then
@@ -281,13 +271,8 @@ JVM_OPTS="$JVM_OPTS -Dcom.sun.management.jmxremote.password.file=/etc/cassandra/
 #MX4J_ADDRESS="127.0.0.1"
 #MX4J_PORT="8081"
 
-# Cassandra uses SIGAR to capture OS metrics CASSANDRA-7838
-# for SIGAR we have to set the java.library.path
-# to the location of the native libraries.
-JVM_OPTS="$JVM_OPTS -Djava.library.path=$CASSANDRA_HOME/lib/sigar-bin"
-
 if [ "x$MX4J_ADDRESS" != "x" ]; then
-    if [[ "$MX4J_ADDRESS" == \-Dmx4jaddress* ]]; then
+    if [ "$(echo "$MX4J_ADDRESS" | grep -c "\-Dmx4jaddress")" = "1" ]; then
         # Backward compatible with the older style #13578
         JVM_OPTS="$JVM_OPTS $MX4J_ADDRESS"
     else
@@ -295,7 +280,7 @@ if [ "x$MX4J_ADDRESS" != "x" ]; then
     fi
 fi
 if [ "x$MX4J_PORT" != "x" ]; then
-    if [[ "$MX4J_PORT" == \-Dmx4jport* ]]; then
+    if [ "$(echo "$MX4J_PORT" | grep -c "\-Dmx4jport")" = "1" ]; then
         # Backward compatible with the older style #13578
         JVM_OPTS="$JVM_OPTS $MX4J_PORT"
     else

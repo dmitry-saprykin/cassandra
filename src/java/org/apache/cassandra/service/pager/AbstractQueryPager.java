@@ -24,6 +24,7 @@ import org.apache.cassandra.db.filter.DataLimits;
 import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.transport.ProtocolVersion;
 
 abstract class AbstractQueryPager<T extends ReadQuery> implements QueryPager
@@ -59,7 +60,7 @@ abstract class AbstractQueryPager<T extends ReadQuery> implements QueryPager
         return query.executionController();
     }
 
-    public PartitionIterator fetchPage(int pageSize, ConsistencyLevel consistency, ClientState clientState, long queryStartNanoTime)
+    public PartitionIterator fetchPage(int pageSize, ConsistencyLevel consistency, ClientState clientState, Dispatcher.RequestTime requestTime)
     {
         if (isExhausted())
             return EmptyIterators.partition();
@@ -72,7 +73,7 @@ abstract class AbstractQueryPager<T extends ReadQuery> implements QueryPager
             exhausted = true;
             return EmptyIterators.partition();
         }
-        return Transformation.apply(readQuery.execute(consistency, clientState, queryStartNanoTime), pager);
+        return Transformation.apply(readQuery.execute(consistency, clientState, requestTime), pager);
     }
 
     public PartitionIterator fetchPageInternal(int pageSize, ReadExecutionController executionController)
@@ -110,7 +111,7 @@ abstract class AbstractQueryPager<T extends ReadQuery> implements QueryPager
     private class UnfilteredPager extends Pager<Unfiltered>
     {
 
-        private UnfilteredPager(DataLimits pageLimits, int nowInSec)
+        private UnfilteredPager(DataLimits pageLimits, long nowInSec)
         {
             super(pageLimits, nowInSec);
         }
@@ -124,7 +125,7 @@ abstract class AbstractQueryPager<T extends ReadQuery> implements QueryPager
     private class RowPager extends Pager<Row>
     {
 
-        private RowPager(DataLimits pageLimits, int nowInSec)
+        private RowPager(DataLimits pageLimits, long nowInSec)
         {
             super(pageLimits, nowInSec);
         }
@@ -143,7 +144,7 @@ abstract class AbstractQueryPager<T extends ReadQuery> implements QueryPager
         private Row lastRow;
         private boolean isFirstPartition = true;
 
-        private Pager(DataLimits pageLimits, int nowInSec)
+        private Pager(DataLimits pageLimits, long nowInSec)
         {
             this.counter = pageLimits.newCounter(nowInSec, true, query.selectsFullPartition(), enforceStrictLiveness);
             this.pageLimits = pageLimits;

@@ -40,11 +40,14 @@ import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.transport.CBUtil;
+import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.transport.Message;
 import org.apache.cassandra.transport.ProtocolException;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.MD5Digest;
+
+import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
 
 public class BatchMessage extends Message.Request
 {
@@ -161,7 +164,13 @@ public class BatchMessage extends Message.Request
     }
 
     @Override
-    protected Message.Response execute(QueryState state, long queryStartNanoTime, boolean traceRequest)
+    protected boolean isTrackable()
+    {
+        return true;
+    }
+
+    @Override
+    protected Message.Response execute(QueryState state, Dispatcher.RequestTime requestTime, boolean traceRequest)
     {
         List<QueryHandler.Prepared> prepared = null;
         try
@@ -174,12 +183,12 @@ public class BatchMessage extends Message.Request
             for (int i = 0; i < queryOrIdList.size(); i++)
             {
                 Object query = queryOrIdList.get(i);
-                CQLStatement statement;
                 QueryHandler.Prepared p;
                 if (query instanceof String)
                 {
-                    statement = QueryProcessor.parseStatement((String)query, state.getClientState().cloneWithKeyspaceIfSet(options.getKeyspace()));
-                    p = new QueryHandler.Prepared(statement, (String) query);
+                    p = QueryProcessor.parseAndPrepare((String) query,
+                                                       state.getClientState().cloneWithKeyspaceIfSet(options.getKeyspace()),
+                                                       false);
                 }
                 else
                 {
@@ -217,8 +226,8 @@ public class BatchMessage extends Message.Request
             // (and no value would be really correct, so we prefer passing a clearly wrong one).
             BatchStatement batch = new BatchStatement(batchType, VariableSpecifications.empty(), statements, Attributes.none());
 
-            long queryTime = System.currentTimeMillis();
-            Message.Response response = handler.processBatch(batch, state, batchOptions, getCustomPayload(), queryStartNanoTime);
+            long queryTime = currentTimeMillis();
+            Message.Response response = handler.processBatch(batch, state, batchOptions, getCustomPayload(), requestTime);
             if (queries != null)
                 QueryEvents.instance.notifyBatchSuccess(batchType, statements, queries, values, options, state, queryTime, response);
             return response;

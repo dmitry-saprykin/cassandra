@@ -33,6 +33,9 @@ import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.bytecomparable.ByteComparable;
+import org.apache.cassandra.utils.bytecomparable.ByteSource;
+import org.apache.cassandra.utils.bytecomparable.ByteSourceInverse;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.ObjectSizes;
 import org.apache.cassandra.utils.Pair;
@@ -42,6 +45,15 @@ public class OrderPreservingPartitioner implements IPartitioner
     private static final String rndchars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
     public static final StringToken MINIMUM = new StringToken("");
+    public static final StringToken MAXIMUM = new StringToken("") {
+        public int compareTo(Token o)
+        {
+            if (o == MAXIMUM)
+                return 0;
+
+            return 1;
+        }
+    };
 
     public static final BigInteger CHAR_MASK = new BigInteger("65535");
 
@@ -113,6 +125,11 @@ public class OrderPreservingPartitioner implements IPartitioner
         return MINIMUM;
     }
 
+    public StringToken getMaximumToken()
+    {
+        return MAXIMUM;
+    }
+
     public StringToken getRandomToken()
     {
         return getRandomToken(ThreadLocalRandom.current());
@@ -128,6 +145,11 @@ public class OrderPreservingPartitioner implements IPartitioner
 
     private final Token.TokenFactory tokenFactory = new Token.TokenFactory()
     {
+        public Token fromComparableBytes(ByteSource.Peekable comparableBytes, ByteComparable.Version version)
+        {
+            return new StringToken(ByteSourceInverse.getString(comparableBytes));
+        }
+
         public ByteBuffer toByteArray(Token token)
         {
             StringToken stringToken = (StringToken) token;
@@ -194,6 +216,22 @@ public class OrderPreservingPartitioner implements IPartitioner
         {
             return EMPTY_SIZE + ObjectSizes.sizeOf(token);
         }
+
+        @Override
+        public ByteSource asComparableBytes(ByteComparable.Version version)
+        {
+            return ByteSource.of(token, version);
+        }
+
+        @Override
+        public int compareTo(Token o)
+        {
+            // todo (rebase): I have no recollection of why this is needed - investigate
+            if (o == MAXIMUM)
+                    return -1;
+
+            return super.compareTo(o);
+        }
     }
 
     public StringToken getToken(ByteBuffer key)
@@ -220,7 +258,7 @@ public class OrderPreservingPartitioner implements IPartitioner
         Token lastToken = sortedTokens.get(sortedTokens.size() - 1);
         for (Token node : sortedTokens)
         {
-            allTokens.put(node, new Float(0.0));
+            allTokens.put(node, 0.0F);
             sortedRanges.add(new Range<Token>(lastToken, node));
             lastToken = node;
         }
@@ -229,6 +267,8 @@ public class OrderPreservingPartitioner implements IPartitioner
         {
             for (TableMetadata cfmd : Schema.instance.getTablesAndViews(ks))
             {
+                if (!(cfmd.partitioner instanceof OrderPreservingPartitioner))
+                    continue;
                 for (Range<Token> r : sortedRanges)
                 {
                     // Looping over every KS:CF:Range, get the splits size and add it to the count
@@ -238,7 +278,7 @@ public class OrderPreservingPartitioner implements IPartitioner
         }
 
         // Sum every count up and divide count/total for the fractional ownership.
-        Float total = new Float(0.0);
+        Float total = 0.0F;
         for (Float f : allTokens.values())
             total += f;
         for (Map.Entry<Token, Float> row : allTokens.entrySet())

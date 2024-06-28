@@ -25,12 +25,16 @@ import org.apache.cassandra.auth.Permission;
 import org.apache.cassandra.cql3.*;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.guardrails.Guardrails;
+import org.apache.cassandra.db.virtual.VirtualKeyspaceRegistry;
 import org.apache.cassandra.exceptions.*;
 import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.service.StorageProxy;
+import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.commons.lang3.builder.ToStringBuilder;
 import org.apache.commons.lang3.builder.ToStringStyle;
@@ -55,9 +59,11 @@ public class TruncateStatement extends QualifiedStatement implements CQLStatemen
     public void validate(ClientState state) throws InvalidRequestException
     {
         Schema.instance.validateTable(keyspace(), name());
+        Guardrails.dropTruncateTableEnabled.ensureEnabled(state);
     }
 
-    public ResultMessage execute(QueryState state, QueryOptions options, long queryStartNanoTime) throws InvalidRequestException, TruncateException
+    @Override
+    public ResultMessage execute(QueryState state, QueryOptions options, Dispatcher.RequestTime requestTime) throws InvalidRequestException, TruncateException
     {
         try
         {
@@ -66,9 +72,13 @@ public class TruncateStatement extends QualifiedStatement implements CQLStatemen
                 throw new InvalidRequestException("Cannot TRUNCATE materialized view directly; must truncate base table instead");
 
             if (metaData.isVirtual())
-                throw new InvalidRequestException("Cannot truncate virtual tables");
-
-            StorageProxy.truncateBlocking(keyspace(), name());
+            {
+                executeForVirtualTable(metaData.id);
+            }
+            else
+            {
+                StorageProxy.truncateBlocking(keyspace(), name());
+            }
         }
         catch (UnavailableException | TimeoutException e)
         {
@@ -86,10 +96,14 @@ public class TruncateStatement extends QualifiedStatement implements CQLStatemen
                 throw new InvalidRequestException("Cannot TRUNCATE materialized view directly; must truncate base table instead");
 
             if (metaData.isVirtual())
-                throw new InvalidRequestException("Cannot truncate virtual tables");
-
-            ColumnFamilyStore cfs = Keyspace.open(keyspace()).getColumnFamilyStore(name());
-            cfs.truncateBlocking();
+            {
+                executeForVirtualTable(metaData.id);
+            }
+            else
+            {
+                ColumnFamilyStore cfs = Keyspace.open(keyspace()).getColumnFamilyStore(name());
+                cfs.truncateBlocking();
+            }
         }
         catch (Exception e)
         {
@@ -97,7 +111,12 @@ public class TruncateStatement extends QualifiedStatement implements CQLStatemen
         }
         return null;
     }
-    
+
+    private void executeForVirtualTable(TableId id)
+    {
+        VirtualKeyspaceRegistry.instance.getTableNullable(id).truncate();
+    }
+
     @Override
     public String toString()
     {

@@ -17,7 +17,9 @@
  */
 package org.apache.cassandra.schema;
 
+import java.util.Collection;
 import java.util.Iterator;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Predicate;
@@ -28,23 +30,21 @@ import javax.annotation.Nullable;
 import com.google.common.collect.*;
 
 import org.apache.cassandra.schema.KeyspaceMetadata.KeyspaceDiff;
+import org.apache.cassandra.tcm.ClusterMetadata;
+import org.apache.cassandra.utils.btree.BTreeMap;
 
 public final class Keyspaces implements Iterable<KeyspaceMetadata>
 {
-    private static final Keyspaces NONE = builder().build();
+    public static final Keyspaces NONE = new Keyspaces(BTreeMap.empty(), BTreeMap.empty());
 
-    private final ImmutableMap<String, KeyspaceMetadata> keyspaces;
-    private final ImmutableMap<TableId, TableMetadata> tables;
+    private final BTreeMap<String, KeyspaceMetadata> keyspaces;
+    private final BTreeMap<TableId, TableMetadata> tables;
 
-    private Keyspaces(Builder builder)
+    private Keyspaces(BTreeMap<String, KeyspaceMetadata> keyspaces,
+                      BTreeMap<TableId, TableMetadata> tables)
     {
-        keyspaces = builder.keyspaces.build();
-        tables = builder.tables.build();
-    }
-
-    public static Builder builder()
-    {
-        return new Builder();
+        this.keyspaces = keyspaces;
+        this.tables = tables;
     }
 
     public static Keyspaces none()
@@ -54,7 +54,28 @@ public final class Keyspaces implements Iterable<KeyspaceMetadata>
 
     public static Keyspaces of(KeyspaceMetadata... keyspaces)
     {
-        return builder().add(keyspaces).build();
+        BTreeMap<String, KeyspaceMetadata> newKeyspaces = BTreeMap.empty();
+        BTreeMap<TableId, TableMetadata> newTables = BTreeMap.empty();
+        for (KeyspaceMetadata ks : keyspaces)
+        {
+            newKeyspaces = newKeyspaces.with(ks.name, ks);
+            newTables = withTablesViews(newTables, ks);
+        }
+        return new Keyspaces(newKeyspaces, newTables);
+    }
+
+    public Keyspaces with(KeyspaceMetadata ks)
+    {
+        assert !keyspaces.containsKey(ks.name) : "Keyspace already exists: "+ks.name;
+        return new Keyspaces(keyspaces.with(ks.name, ks), withTablesViews(tables, ks));
+    }
+
+    public Keyspaces with(Iterable<KeyspaceMetadata> kss)
+    {
+        Keyspaces k = this;
+        for (KeyspaceMetadata ks : kss)
+            k = k.with(ks);
+        return k;
     }
 
     public Iterator<KeyspaceMetadata> iterator()
@@ -100,6 +121,15 @@ public final class Keyspaces implements Iterable<KeyspaceMetadata>
         return tables.get(id);
     }
 
+    public KeyspaceMetadata getContainingKeyspaceMetadata(TableId tableId)
+    {
+        TableMetadata tableMetadata = getTableOrViewNullable(tableId);
+        if (tableMetadata == null)
+            throw new IllegalStateException("Can't find table " + tableId);
+
+        return keyspaces.get(tableMetadata.keyspace);
+    }
+
     public boolean isEmpty()
     {
         return keyspaces.isEmpty();
@@ -107,9 +137,19 @@ public final class Keyspaces implements Iterable<KeyspaceMetadata>
 
     public Keyspaces filter(Predicate<KeyspaceMetadata> predicate)
     {
-        Builder builder = builder();
-        stream().filter(predicate).forEach(builder::add);
-        return builder.build();
+        BTreeMap<String, KeyspaceMetadata> kss = keyspaces;
+        BTreeMap<TableId, TableMetadata> tbls = tables;
+        // todo: bulk removals from BTreeMap
+        for (Map.Entry<String, KeyspaceMetadata> entry : keyspaces.entrySet())
+        {
+            if (!predicate.test(entry.getValue()))
+            {
+                kss = kss.without(entry.getKey());
+                tbls = withoutKsTablesViews(tbls, entry.getValue());
+            }
+        }
+
+        return new Keyspaces(kss, tbls);
     }
 
     /**
@@ -124,16 +164,73 @@ public final class Keyspaces implements Iterable<KeyspaceMetadata>
         return filter(k -> k != keyspace);
     }
 
+    public Keyspaces without(Collection<String> names)
+    {
+        return filter(k -> !names.contains(k.name));
+    }
+
     public Keyspaces withAddedOrUpdated(KeyspaceMetadata keyspace)
     {
-        return builder().add(Iterables.filter(this, k -> !k.name.equals(keyspace.name)))
-                        .add(keyspace)
-                        .build();
+        Keyspaces updated = keyspaces.containsKey(keyspace.name) ? without(keyspace.name) : this;
+        return updated.with(keyspace);
+    }
+
+    private static BTreeMap<TableId, TableMetadata> withoutKsTablesViews(BTreeMap<TableId, TableMetadata> tables, KeyspaceMetadata ks)
+    {
+        // todo: bulk ops
+        BTreeMap<TableId, TableMetadata> tbls = tables;
+        for (TableMetadata table : ks.tables)
+            tbls = tbls.without(table.id);
+        for (ViewMetadata view : ks.views)
+            tbls = tbls.without(view.metadata.id);
+        return tbls;
+    }
+
+    private static BTreeMap<TableId, TableMetadata> withTablesViews(BTreeMap<TableId, TableMetadata> tables, KeyspaceMetadata ks)
+    {
+        BTreeMap<TableId, TableMetadata> tbls = tables;
+        for (TableMetadata table : ks.tables)
+            tbls = tbls.with(table.id, table);
+        for (ViewMetadata view : ks.views)
+            tbls = tbls.with(view.metadata.id, view.metadata);
+        return tbls;
+    }
+
+    /**
+     * Returns a new {@link Keyspaces} equivalent to this one, but with the provided keyspace metadata either added (if
+     * this {@link Keyspaces} does not have that keyspace), or replaced by the provided definition.
+     *
+     * <p>Note that if this contains the provided keyspace, its pre-existing definition is discarded and completely
+     * replaced with the newly provided one. See {@link #withAddedOrUpdated(KeyspaceMetadata)} if you wish the provided
+     * definition to be "merged" with the existing one instead.
+     *
+     * @param keyspace the keyspace metadata to add, or replace the existing definition with.
+     * @return the newly created object.
+     */
+    public Keyspaces withAddedOrReplaced(KeyspaceMetadata keyspace)
+    {
+        return filter(ksm -> !ksm.name.equals(keyspace.name)).with(keyspace);
+    }
+
+    /**
+     * Calls {@link #withAddedOrReplaced(KeyspaceMetadata)} on all the keyspaces of the provided {@link Keyspaces}.
+     *
+     * @param keyspaces the keyspaces to add, or replace if existing.
+     * @return the newly created object.
+     */
+    public Keyspaces withAddedOrReplaced(Keyspaces keyspaces)
+    {
+        Keyspaces kss = this;
+
+        for (KeyspaceMetadata ksm : keyspaces)
+            kss = kss.withAddedOrReplaced(ksm);
+        return kss;
     }
 
     public void validate()
     {
-        keyspaces.values().forEach(KeyspaceMetadata::validate);
+        ClusterMetadata metadata = ClusterMetadata.current();
+        keyspaces.values().forEach((ksm) -> ksm.validate(metadata));
     }
 
     @Override
@@ -154,52 +251,19 @@ public final class Keyspaces implements Iterable<KeyspaceMetadata>
         return keyspaces.values().toString();
     }
 
-    public static final class Builder
+    public int size()
     {
-        private final ImmutableMap.Builder<String, KeyspaceMetadata> keyspaces = new ImmutableMap.Builder<>();
-        private final ImmutableMap.Builder<TableId, TableMetadata> tables = new ImmutableMap.Builder<>();
-
-        private Builder()
-        {
-        }
-
-        public Keyspaces build()
-        {
-            return new Keyspaces(this);
-        }
-
-        public Builder add(KeyspaceMetadata keyspace)
-        {
-            keyspaces.put(keyspace.name, keyspace);
-
-            keyspace.tables.forEach(t -> tables.put(t.id, t));
-            keyspace.views.forEach(v -> tables.put(v.metadata.id, v.metadata));
-
-            return this;
-        }
-
-        public Builder add(KeyspaceMetadata... keyspaces)
-        {
-            for (KeyspaceMetadata keyspace : keyspaces)
-                add(keyspace);
-            return this;
-        }
-
-        public Builder add(Iterable<KeyspaceMetadata> keyspaces)
-        {
-            keyspaces.forEach(this::add);
-            return this;
-        }
+        return keyspaces.size();
     }
 
-    static KeyspacesDiff diff(Keyspaces before, Keyspaces after)
+    public static KeyspacesDiff diff(Keyspaces before, Keyspaces after)
     {
         return KeyspacesDiff.diff(before, after);
     }
 
     public static final class KeyspacesDiff
     {
-        static final KeyspacesDiff NONE = new KeyspacesDiff(Keyspaces.none(), Keyspaces.none(), ImmutableList.of());
+        public static final KeyspacesDiff NONE = new KeyspacesDiff(Keyspaces.none(), Keyspaces.none(), ImmutableList.of());
 
         public final Keyspaces created;
         public final Keyspaces dropped;
@@ -234,6 +298,16 @@ public final class Keyspaces implements Iterable<KeyspaceMetadata>
         public boolean isEmpty()
         {
             return created.isEmpty() && dropped.isEmpty() && altered.isEmpty();
+        }
+
+        @Override
+        public String toString()
+        {
+            return "KeyspacesDiff{" +
+                   "created=" + created +
+                   ", dropped=" + dropped +
+                   ", altered=" + altered +
+                   '}';
         }
     }
 }
