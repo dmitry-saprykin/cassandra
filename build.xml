@@ -338,7 +338,7 @@
     <!-- needed to compile org.apache.cassandra.utils.JMXServerUtils -->
     <!-- needed to compile org.apache.cassandra.distributed.impl.Instance-->
     <!-- needed to compile org.apache.cassandra.utils.memory.BufferPool -->
-    <property name="jdk11plus-javac-exports" value="--add-exports java.rmi/sun.rmi.registry=ALL-UNNAMED --add-exports java.rmi/sun.rmi.transport.tcp=ALL-UNNAMED --add-exports java.base/jdk.internal.ref=ALL-UNNAMED --add-exports java.base/sun.nio.ch=ALL-UNNAMED" />
+    <property name="jdk11plus-javac-exports" value="--add-exports java.rmi/sun.rmi.registry=ALL-UNNAMED --add-exports java.rmi/sun.rmi.transport.tcp=ALL-UNNAMED --add-exports java.base/jdk.internal.ref=ALL-UNNAMED --add-exports java.base/sun.nio.ch=ALL-UNNAMED --add-exports java.management/com.sun.jmx.remote.security=ALL-UNNAMED" />
 
     <!--
          Add all the dependencies.
@@ -979,6 +979,7 @@
           <exclude name="bin/*.in.sh" />
           <include name="tools/bin/*"/>
           <exclude name="tools/bin/*.in.sh" />
+          <include name=".build/**/*.sh"/>
         </tarfileset>
       </tar>
 
@@ -1797,6 +1798,8 @@
       <jvmarg line="-XX:Tier4CompileThreshold=1000"/>
       <jvmarg line="-XX:ReservedCodeCacheSize=256M"/>
       <jvmarg line="-Xmx8G"/>
+      <!-- Harry tests kept failing due to direct memory failures and looks like its undersized... so upping to allow more stable runs -->
+      <jvmarg line="-XX:MaxDirectMemorySize=8G"/>
     </testmacro>
   </target>
 

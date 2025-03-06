@@ -45,8 +45,6 @@ import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.distributed.test.log.ClusterMetadataTestHelper;
 import org.apache.cassandra.exceptions.ConfigurationException;
-import org.apache.cassandra.locator.AbstractNetworkTopologySnitch;
-import org.apache.cassandra.locator.IEndpointSnitch;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.WithPartitioner;
 import org.apache.cassandra.schema.KeyspaceMetadata;
@@ -55,9 +53,9 @@ import org.apache.cassandra.schema.ReplicationParams;
 import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.schema.SchemaKeyspaceTables;
 import org.apache.cassandra.schema.SchemaTestUtil;
+import org.apache.cassandra.service.snapshot.SnapshotManager;
 import org.apache.cassandra.tcm.ClusterMetadata;
 import org.apache.cassandra.tcm.ClusterMetadataService;
-import org.apache.cassandra.tcm.membership.Location;
 import org.apache.cassandra.tcm.membership.NodeAddresses;
 import org.apache.cassandra.tcm.membership.NodeId;
 import org.apache.cassandra.tcm.membership.NodeVersion;
@@ -86,32 +84,7 @@ public class StorageServiceServerTest
         GOSSIP_DISABLE_THREAD_VALIDATION.setBoolean(true);
         ServerTestUtils.daemonInitialization();
         DatabaseDescriptor.setPartitionerUnsafe(OrderPreservingPartitioner.instance);
-        IEndpointSnitch snitch = new AbstractNetworkTopologySnitch()
-        {
-             @Override
-             public String getRack(InetAddressAndPort endpoint)
-             {
-                 return location(endpoint).rack;
-             }
-
-             @Override
-             public String getDatacenter(InetAddressAndPort endpoint)
-             {
-                 return location(endpoint).datacenter;
-             }
-
-             private Location location(InetAddressAndPort endpoint)
-             {
-                 ClusterMetadata metadata = ClusterMetadata.current();
-                 NodeId id = metadata.directory.peerId(endpoint);
-                 if (id == null)
-                     throw new IllegalArgumentException("Unknown endpoint " + endpoint);
-                 return metadata.directory.location(id);
-             }
-        };
         ServerTestUtils.prepareServerNoRegister();
-        DatabaseDescriptor.setEndpointSnitch(snitch);
-
         id1 = InetAddressAndPort.getByName("127.0.0.1");
         id2 = InetAddressAndPort.getByName("127.0.0.2");
         id3 = InetAddressAndPort.getByName("127.0.0.3");
@@ -144,6 +117,7 @@ public class StorageServiceServerTest
     @Before
     public void resetCMS()
     {
+        SnapshotManager.instance.clearAllSnapshots();
         ServerTestUtils.resetCMS();
     }
 
@@ -158,21 +132,27 @@ public class StorageServiceServerTest
     public void testSnapshotWithFlush() throws IOException
     {
         // no need to insert extra data, even an "empty" database will have a little information in the system keyspace
-        StorageService.instance.takeSnapshot(UUID.randomUUID().toString());
+        String snapshotName = UUID.randomUUID().toString();
+        StorageService.instance.takeSnapshot(snapshotName);
+        Assert.assertTrue(SnapshotManager.instance.exists(p -> p.getTag().equals(snapshotName)));
     }
 
     @Test
     public void testTableSnapshot() throws IOException
     {
         // no need to insert extra data, even an "empty" database will have a little information in the system keyspace
-        StorageService.instance.takeTableSnapshot(SchemaConstants.SCHEMA_KEYSPACE_NAME, SchemaKeyspaceTables.KEYSPACES, UUID.randomUUID().toString());
+        String snapshotName = UUID.randomUUID().toString();
+        StorageService.instance.takeTableSnapshot(SchemaConstants.SCHEMA_KEYSPACE_NAME, SchemaKeyspaceTables.KEYSPACES, snapshotName);
+        Assert.assertTrue(SnapshotManager.instance.exists(SchemaConstants.SCHEMA_KEYSPACE_NAME, SchemaKeyspaceTables.KEYSPACES, snapshotName));
     }
 
     @Test
     public void testSnapshot() throws IOException
     {
         // no need to insert extra data, even an "empty" database will have a little information in the system keyspace
-        StorageService.instance.takeSnapshot(UUID.randomUUID().toString(), SchemaConstants.SCHEMA_KEYSPACE_NAME);
+        String snapshotName = UUID.randomUUID().toString();
+        StorageService.instance.takeSnapshot(snapshotName, SchemaConstants.SCHEMA_KEYSPACE_NAME);
+        Assert.assertTrue(SnapshotManager.instance.exists(p -> p.getTag().equals(snapshotName) && p.getKeyspaceName().equals(SchemaConstants.SCHEMA_KEYSPACE_NAME)));
     }
 
     @Test

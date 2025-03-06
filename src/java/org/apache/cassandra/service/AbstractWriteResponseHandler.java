@@ -17,6 +17,7 @@
  */
 package org.apache.cassandra.service;
 
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -77,7 +78,7 @@ public abstract class AbstractWriteResponseHandler<T> implements RequestCallback
     private static final AtomicIntegerFieldUpdater<AbstractWriteResponseHandler> failuresUpdater =
         AtomicIntegerFieldUpdater.newUpdater(AbstractWriteResponseHandler.class, "failures");
     private volatile int failures = 0;
-    private final Map<InetAddressAndPort, RequestFailureReason> failureReasonByEndpoint;
+    private volatile Map<InetAddressAndPort, RequestFailureReason> failureReasonByEndpoint;
     private final Dispatcher.RequestTime requestTime;
     private @Nullable final Supplier<Mutation> hintOnFailure;
 
@@ -106,7 +107,6 @@ public abstract class AbstractWriteResponseHandler<T> implements RequestCallback
         this.callback = callback;
         this.writeType = writeType;
         this.hintOnFailure = hintOnFailure;
-        this.failureReasonByEndpoint = new ConcurrentHashMap<>();
         this.requestTime = requestTime;
     }
 
@@ -129,12 +129,12 @@ public abstract class AbstractWriteResponseHandler<T> implements RequestCallback
 
         if (blockFor() + failures > candidateReplicaCount())
         {
-            if (RequestCallback.isTimeout(this.failureReasonByEndpoint.keySet().stream()
+            if (RequestCallback.isTimeout(this.getFailureReasonByEndpointMap().keySet().stream()
                                                                       .filter(this::waitingFor) // DatacenterWriteResponseHandler filters errors from remote DCs
-                                                                      .collect(Collectors.toMap(Function.identity(), this.failureReasonByEndpoint::get))))
+                                                                      .collect(Collectors.toMap(Function.identity(), this.getFailureReasonByEndpointMap()::get))))
                 throwTimeout();
 
-            throw new WriteFailureException(replicaPlan.consistencyLevel(), ackCount(), blockFor(), writeType, this.failureReasonByEndpoint);
+            throw new WriteFailureException(replicaPlan.consistencyLevel(), ackCount(), blockFor(), writeType, this.getFailureReasonByEndpointMap());
         }
 
         if (replicaPlan.stillAppliesTo(ClusterMetadata.current()))
@@ -200,7 +200,7 @@ public abstract class AbstractWriteResponseHandler<T> implements RequestCallback
         }
     }
 
-    public final void expired()
+    protected final void logFailureOrTimeoutToIdealCLDelegate()
     {
         //Tracking ideal CL was not configured
         if (idealCLDelegate == null)
@@ -218,6 +218,11 @@ public abstract class AbstractWriteResponseHandler<T> implements RequestCallback
             //Have the delegate track the expired response
             idealCLDelegate.decrementResponseOrExpired();
         }
+    }
+
+    public final void expired()
+    {
+        logFailureOrTimeoutToIdealCLDelegate();
     }
 
     /**
@@ -261,6 +266,11 @@ public abstract class AbstractWriteResponseHandler<T> implements RequestCallback
      */
     protected abstract int ackCount();
 
+    public Dispatcher.RequestTime getRequestTime()
+    {
+        return requestTime;
+    }
+
     /**
      * null message means "response from local write"
      */
@@ -270,9 +280,13 @@ public abstract class AbstractWriteResponseHandler<T> implements RequestCallback
     {
         //The ideal CL should only count as a strike if the requested CL was achieved.
         //If the requested CL is not achieved it's fine for the ideal CL to also not be achieved.
-        if (idealCLDelegate != null)
+        if (idealCLDelegate != null && blockFor() + failures <= candidateReplicaCount())
         {
             idealCLDelegate.requestedCLAchieved = true;
+            if (idealCLDelegate == this)
+            {
+                replicaPlan.keyspace().metric.idealCLWriteLatency.addNano(nanoTime() - requestTime.startedAtNanos());
+            }
         }
 
         condition.signalAll();
@@ -289,7 +303,15 @@ public abstract class AbstractWriteResponseHandler<T> implements RequestCallback
                 ? failuresUpdater.incrementAndGet(this)
                 : failures;
 
+        if (failureReasonByEndpoint == null)
+            synchronized (this)
+            {
+                if (failureReasonByEndpoint == null)
+                    failureReasonByEndpoint = new ConcurrentHashMap<>();
+            }
         failureReasonByEndpoint.put(from, failureReason);
+
+        logFailureOrTimeoutToIdealCLDelegate();
 
         if (blockFor() + n > candidateReplicaCount())
             signal();
@@ -319,10 +341,6 @@ public abstract class AbstractWriteResponseHandler<T> implements RequestCallback
             if (!condition.isSignalled() && requestedCLAchieved)
             {
                 replicaPlan.keyspace().metric.writeFailedIdealCL.inc();
-            }
-            else
-            {
-                replicaPlan.keyspace().metric.idealCLWriteLatency.addNano(nanoTime() - requestTime.startedAtNanos());
             }
         }
     }
@@ -364,5 +382,10 @@ public abstract class AbstractWriteResponseHandler<T> implements RequestCallback
         {
             throw new UncheckedInterruptedException(e);
         }
+    }
+
+    private Map<InetAddressAndPort, RequestFailureReason> getFailureReasonByEndpointMap()
+    {
+        return failureReasonByEndpoint != null ? failureReasonByEndpoint : Collections.emptyMap();
     }
 }

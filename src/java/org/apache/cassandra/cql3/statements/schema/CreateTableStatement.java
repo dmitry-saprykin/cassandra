@@ -31,8 +31,8 @@ import org.apache.cassandra.audit.AuditLogEntryType;
 import org.apache.cassandra.auth.DataResource;
 import org.apache.cassandra.auth.IResource;
 import org.apache.cassandra.auth.Permission;
-import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.*;
+import org.apache.cassandra.cql3.constraints.ColumnConstraints;
 import org.apache.cassandra.cql3.functions.masking.ColumnMask;
 import org.apache.cassandra.db.guardrails.Guardrails;
 import org.apache.cassandra.db.marshal.*;
@@ -57,6 +57,7 @@ public final class CreateTableStatement extends AlterSchemaStatement
     private final Map<ColumnIdentifier, ColumnProperties.Raw> rawColumns;
     private final Set<ColumnIdentifier> staticColumns;
     private final List<ColumnIdentifier> partitionKeyColumns;
+    private final Map<ColumnIdentifier, ColumnConstraints> columnConstraints;
     private final List<ColumnIdentifier> clusteringColumns;
 
     private final LinkedHashMap<ColumnIdentifier, Boolean> clusteringOrder;
@@ -73,6 +74,7 @@ public final class CreateTableStatement extends AlterSchemaStatement
                                 Set<ColumnIdentifier> staticColumns,
                                 List<ColumnIdentifier> partitionKeyColumns,
                                 List<ColumnIdentifier> clusteringColumns,
+                                Map<ColumnIdentifier, ColumnConstraints> columnConstraints,
                                 LinkedHashMap<ColumnIdentifier, Boolean> clusteringOrder,
                                 TableAttributes attrs,
                                 boolean ifNotExists,
@@ -85,6 +87,7 @@ public final class CreateTableStatement extends AlterSchemaStatement
         this.staticColumns = staticColumns;
         this.partitionKeyColumns = partitionKeyColumns;
         this.clusteringColumns = clusteringColumns;
+        this.columnConstraints = columnConstraints;
 
         this.clusteringOrder = clusteringOrder;
         this.attrs = attrs;
@@ -125,9 +128,10 @@ public final class CreateTableStatement extends AlterSchemaStatement
         TableMetadata.Builder builder = builder(keyspace.types, ufBuilder.build()).epoch(metadata.nextEpoch());
 
         // We do not want to set table ID here just yet, since we are using CQL for serialising a fully expanded CREATE TABLE statement.
-        this.expandedCql = builder.build().toCqlString(false, attrs.hasProperty(TableAttributes.ID), ifNotExists);
+        expandedCql = builder.build().toCqlString(false, attrs.hasProperty(TableAttributes.ID), ifNotExists);
+        verifyExpandedCql(expandedCql);
 
-        if (!attrs.hasProperty(TableAttributes.ID) && !DatabaseDescriptor.useDeterministicTableID())
+        if (!attrs.hasProperty(TableAttributes.ID))
             builder.id(TableId.get(metadata));
         TableMetadata table = builder.build();
         table.validate();
@@ -343,13 +347,17 @@ public final class CreateTableStatement extends AlterSchemaStatement
         for (int i = 0; i < partitionKeyColumns.size(); i++)
         {
             ColumnProperties properties = partitionKeyColumnProperties.get(i);
-            builder.addPartitionKeyColumn(partitionKeyColumns.get(i), properties.type, properties.mask);
+            ColumnIdentifier columnIdentifier = partitionKeyColumns.get(i);
+            builder.addPartitionKeyColumn(columnIdentifier, properties.type, properties.mask);
+            builder.getColumn(columnIdentifier).setColumnConstraints(columnConstraints.get(columnIdentifier));
         }
 
         for (int i = 0; i < clusteringColumns.size(); i++)
         {
             ColumnProperties properties = clusteringColumnProperties.get(i);
-            builder.addClusteringColumn(clusteringColumns.get(i), properties.type, properties.mask);
+            ColumnIdentifier columnIdentifier = clusteringColumns.get(i);
+            builder.addClusteringColumn(columnIdentifier, properties.type, properties.mask);
+            builder.getColumn(columnIdentifier).setColumnConstraints(columnConstraints.get(columnIdentifier));
         }
 
         if (useCompactStorage)
@@ -365,6 +373,9 @@ public final class CreateTableStatement extends AlterSchemaStatement
                     builder.addRegularColumn(column, properties.type, properties.mask);
             });
         }
+
+        columns.keySet().forEach(id -> builder.getColumn(id).setColumnConstraints(columnConstraints.get(id)));
+
         return builder;
     }
 
@@ -480,12 +491,21 @@ public final class CreateTableStatement extends AlterSchemaStatement
         }
     }
 
+    public static TableMetadata.Builder parse(String cql, String keyspace, String table, Types types, UserFunctions userFunctions)
+    {
+        Raw createTable = CQLFragmentParser.parseAny(CqlParser::createTableStatement, cql, "CREATE TABLE")
+                                           .keyspace(keyspace);
+
+        if (table != null)
+            createTable.table(table);
+
+        return createTable.prepare(null) // works around a messy ClientState/QueryProcessor class init deadlock
+                .builder(types, userFunctions);
+    }
+
     public static TableMetadata.Builder parse(String cql, String keyspace)
     {
-        return CQLFragmentParser.parseAny(CqlParser::createTableStatement, cql, "CREATE TABLE")
-                                .keyspace(keyspace)
-                                .prepare(null) // works around a messy ClientState/QueryProcessor class init deadlock
-                                .builder(Types.none(), UserFunctions.none());
+        return parse(cql, keyspace, null, Types.none(), UserFunctions.none());
     }
 
     public final static class Raw extends CQLStatement.Raw
@@ -497,6 +517,7 @@ public final class CreateTableStatement extends AlterSchemaStatement
         private final Map<ColumnIdentifier, ColumnProperties.Raw> rawColumns = new HashMap<>();
         private final Set<ColumnIdentifier> staticColumns = new HashSet<>();
         private final List<ColumnIdentifier> clusteringColumns = new ArrayList<>();
+        private final Map<ColumnIdentifier, ColumnConstraints> columnConstraints = new HashMap<>();
 
         private List<ColumnIdentifier> partitionKeyColumns;
 
@@ -522,6 +543,7 @@ public final class CreateTableStatement extends AlterSchemaStatement
                                             staticColumns,
                                             partitionKeyColumns,
                                             clusteringColumns,
+                                            columnConstraints,
                                             clusteringOrder,
                                             attrs,
                                             ifNotExists,
@@ -539,19 +561,28 @@ public final class CreateTableStatement extends AlterSchemaStatement
             return this;
         }
 
+        public Raw table(String table)
+        {
+            name.setName(table, true);
+            return this;
+        }
+
         public String table()
         {
             return name.getName();
         }
 
-        public void addColumn(ColumnIdentifier column, CQL3Type.Raw type, boolean isStatic, ColumnMask.Raw mask)
+        public void addColumn(ColumnIdentifier column, CQL3Type.Raw type, boolean isStatic, ColumnMask.Raw mask, ColumnConstraints.Raw constraints)
         {
-
             if (null != rawColumns.put(column, new ColumnProperties.Raw(type, mask)))
                 throw ire("Duplicate column '%s' declaration for table '%s'", column, name);
 
             if (isStatic)
                 staticColumns.add(column);
+            if (null == constraints)
+                columnConstraints.put(column, ColumnConstraints.NO_OP);
+            else
+                columnConstraints.put(column, constraints.prepare());
         }
 
         public void setCompactStorage()

@@ -64,6 +64,7 @@ import org.apache.cassandra.utils.concurrent.UncheckedInterruptedException;
 
 import static org.apache.cassandra.db.commitlog.CommitLogSegment.Allocation;
 import static org.apache.cassandra.db.commitlog.CommitLogSegment.ENTRY_OVERHEAD_SIZE;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 import static org.apache.cassandra.utils.FBUtilities.updateChecksum;
 import static org.apache.cassandra.utils.FBUtilities.updateChecksumInt;
 
@@ -164,7 +165,7 @@ public class CommitLog implements CommitLogMBean
         return getUnmanagedFiles().length > 0;
     }
 
-    private File[] getUnmanagedFiles()
+    public File[] getUnmanagedFiles()
     {
         File[] files = new File(segmentManager.storageDirectory).tryList(unmanagedFilesFilter);
         if (files == null)
@@ -203,8 +204,11 @@ public class CommitLog implements CommitLogMBean
         {
             Arrays.sort(files, new CommitLogSegment.CommitLogSegmentFileComparator());
             logger.info("Replaying {}", StringUtils.join(files, ", "));
+            long startTime = nanoTime();
             replayed = recoverFiles(files);
-            logger.info("Log replay complete, {} replayed mutations", replayed);
+            long endTime = nanoTime();
+            logger.info("Log replay complete, {} replayed mutations in {} ms", replayed,
+                        TimeUnit.NANOSECONDS.toMillis(endTime - startTime));
 
             for (File f : files)
                 segmentManager.handleReplayedSegment(f);
@@ -400,7 +404,7 @@ public class CommitLog implements CommitLogMBean
     @Override
     public long getRestorePointInTime()
     {
-        return archiver.restorePointInTime;
+        return archiver.restorePointInTimeInMicroseconds;
     }
 
     @Override

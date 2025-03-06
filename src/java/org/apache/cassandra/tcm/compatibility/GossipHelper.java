@@ -51,6 +51,8 @@ import org.apache.cassandra.gms.TokenSerializer;
 import org.apache.cassandra.gms.VersionedValue;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.schema.DistributedSchema;
+import org.apache.cassandra.schema.Keyspaces;
+import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.schema.SchemaKeyspace;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.tcm.ClusterMetadata;
@@ -105,10 +107,10 @@ public class GossipHelper
     }
 
     public static VersionedValue nodeStateToStatus(NodeId nodeId,
-                                                    ClusterMetadata metadata,
-                                                    Collection<Token> tokens,
-                                                    VersionedValue.VersionedValueFactory valueFactory,
-                                                    VersionedValue oldValue)
+                                                   ClusterMetadata metadata,
+                                                   Collection<Token> tokens,
+                                                   VersionedValue.VersionedValueFactory valueFactory,
+                                                   VersionedValue oldValue)
     {
         NodeState nodeState =  metadata.directory.peerState(nodeId);
         if ((tokens == null || tokens.isEmpty()) && !NodeState.isBootstrap(nodeState))
@@ -229,7 +231,7 @@ public class GossipHelper
         throw new IllegalStateException("Can't upgrade the first node when STATUS = " + status + " for node " + endpoint);
     }
 
-    private static NodeAddresses getAddressesFromEndpointState(InetAddressAndPort endpoint, EndpointState epState)
+    public static NodeAddresses getAddressesFromEndpointState(InetAddressAndPort endpoint, EndpointState epState)
     {
         if (endpoint.equals(getBroadcastAddressAndPort()))
             return NodeAddresses.current();
@@ -275,9 +277,15 @@ public class GossipHelper
 
     public static ClusterMetadata emptyWithSchemaFromSystemTables(Set<String> allKnownDatacenters)
     {
+        // If this instance was previously upgraded then subsequently downgraded, the metadata keyspace may have been
+        // added to system_schema tables. If so, don't include it in the initial schema as this will cause it to be
+        // incorrectly configured with the global partitioner. It will be created afresh from
+        // DistributedMetadataLogKeyspace.initialMetadata.
+        Keyspaces keyspaces = SchemaKeyspace.fetchNonSystemKeyspaces()
+                                            .filter(k -> !k.name.equals(SchemaConstants.METADATA_KEYSPACE_NAME));
         return new ClusterMetadata(Epoch.UPGRADE_STARTUP,
                                    DatabaseDescriptor.getPartitioner(),
-                                   DistributedSchema.fromSystemTables(SchemaKeyspace.fetchNonSystemKeyspaces(), allKnownDatacenters),
+                                   DistributedSchema.fromSystemTables(keyspaces, allKnownDatacenters),
                                    Directory.EMPTY,
                                    new TokenMap(DatabaseDescriptor.getPartitioner()),
                                    DataPlacements.empty(),
@@ -322,8 +330,8 @@ public class GossipHelper
     @VisibleForTesting
     public static ClusterMetadata fromEndpointStates(Map<InetAddressAndPort, EndpointState> epStates, IPartitioner partitioner, DistributedSchema schema)
     {
-        Directory directory = new Directory();
-        TokenMap tokenMap = new TokenMap(partitioner);
+        Directory directory = new Directory().withLastModified(Epoch.UPGRADE_GOSSIP);
+        TokenMap tokenMap = new TokenMap(partitioner).withLastModified(Epoch.UPGRADE_GOSSIP);
         List<InetAddressAndPort> sortedEps = Lists.newArrayList(epStates.keySet());
         Collections.sort(sortedEps);
         Map<ExtensionKey<?, ?>, ExtensionValue<?>> extensions = new HashMap<>();
@@ -336,13 +344,18 @@ public class GossipHelper
             NodeAddresses nodeAddresses = getAddressesFromEndpointState(endpoint, epState);
             NodeVersion nodeVersion = getVersionFromEndpointState(endpoint, epState);
             assert hostIdString != null;
+            NodeState nodeState = toNodeState(endpoint, epState);
+
             directory = directory.withNonUpgradedNode(nodeAddresses,
                                                       new Location(dc, rack),
                                                       nodeVersion,
-                                                      toNodeState(endpoint, epState),
+                                                      nodeState,
                                                       UUID.fromString(hostIdString));
-            NodeId nodeId = directory.peerId(endpoint);
-            tokenMap = tokenMap.assignTokens(nodeId, getTokensIn(partitioner, epState));
+            if (nodeState != NodeState.LEFT)
+            {
+                NodeId nodeId = directory.peerId(endpoint);
+                tokenMap = tokenMap.assignTokens(nodeId, getTokensIn(partitioner, epState));
+            }
         }
 
         ClusterMetadata forPlacementCalculation = new ClusterMetadata(Epoch.UPGRADE_GOSSIP,
@@ -354,12 +367,15 @@ public class GossipHelper
                                                                       LockedRanges.EMPTY,
                                                                       InProgressSequences.EMPTY,
                                                                       extensions);
+        DataPlacements placements = new UniformRangePlacement().calculatePlacements(Epoch.UPGRADE_GOSSIP,
+                                                                                    forPlacementCalculation,
+                                                                                    schema.getKeyspaces());
         return new ClusterMetadata(Epoch.UPGRADE_GOSSIP,
                                    partitioner,
                                    schema,
                                    directory,
                                    tokenMap,
-                                   new UniformRangePlacement().calculatePlacements(Epoch.UPGRADE_GOSSIP, forPlacementCalculation, schema.getKeyspaces()),
+                                   placements,
                                    LockedRanges.EMPTY,
                                    InProgressSequences.EMPTY,
                                    extensions);

@@ -58,16 +58,19 @@ public class TlsTestUtils
     public static String SERVER_KEYSTORE_PATH_PEM = "test/conf/cassandra_ssl_test.keystore.pem";
     public static String SERVER_KEYSTORE_PATH_UNENCRYPTED_PEM = "test/conf/cassandra_ssl_test.unencrypted_keystore.pem";
     public static String SERVER_KEYSTORE_PASSWORD = "cassandra";
+    public static String SERVER_KEYSTORE_PASSWORD_FILE = "test/conf/cassandra_ssl_test_keystore_passwordfile.txt";
 
     public static String SERVER_KEYSTORE_ENDPOINT_VERIFY_PATH = "test/conf/cassandra_ssl_test_endpoint_verify.keystore";
     public static String SERVER_KEYSTORE_ENDPOINT_VERIFY_PASSWORD = "cassandra";
 
     public static String SERVER_OUTBOUND_KEYSTORE_PATH = "test/conf/cassandra_ssl_test_outbound.keystore";
     public static String SERVER_OUTBOUND_KEYSTORE_PASSWORD = "cassandra";
+    public static String SERVER_OUTBOUND_KEYSTORE_PASSWORD_FILE = "test/conf/cassandra_ssl_test_outbound_keystore_password.txt";
 
     public static String SERVER_TRUSTSTORE_PATH = "test/conf/cassandra_ssl_test.truststore";
     public static String SERVER_TRUSTSTORE_PEM_PATH = "test/conf/cassandra_ssl_test.truststore.pem";
     public static String SERVER_TRUSTSTORE_PASSWORD = "cassandra";
+    public static String SERVER_TRUSTSTORE_PASSWORD_FILE = "test/conf/cassandra_ssl_test_truststore_passwordfile.txt";
 
     // To regenerate:
     // 1. generate keystore
@@ -103,8 +106,8 @@ public class TlsTestUtils
         config.authenticator = new ParameterizedClass("MutualTlsWithPasswordFallbackAuthenticator", parameters);
         // Configure client encryption such that we can optionally connect with SSL.
         config.client_encryption_options = TlsTestUtils.getClientEncryptionOptions();
-        config.role_manager = "CassandraRoleManager";
-        config.authorizer = "CassandraAuthorizer";
+        config.role_manager = new ParameterizedClass("CassandraRoleManager");
+        config.authorizer = new ParameterizedClass("CassandraAuthorizer");
     }
 
     public static ISslContextFactory getClientSslContextFactory(boolean provideClientCert)
@@ -166,7 +169,7 @@ public class TlsTestUtils
             session.execute("CREATE ROLE cassandra_ssl_test WITH LOGIN = true");
             session.execute(String.format("ADD IDENTITY '%s' TO ROLE 'cassandra_ssl_test'", CLIENT_SPIFFE_IDENTITY));
             // GRANT select to cassandra_ssl_test to be able to query the system_views.clients virtual table
-            session.execute("GRANT SELECT ON ALL KEYSPACES to cassandra_ssl_test");
+            session.execute("GRANT SELECT ON system_views.clients to cassandra_ssl_test");
         }, sslOptions);
     }
 

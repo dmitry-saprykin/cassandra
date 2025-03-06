@@ -301,6 +301,8 @@ public abstract class ReplicaLayout<E extends Endpoints<E>>
      */
     static <E extends Endpoints<E>> boolean haveWriteConflicts(E natural, E pending)
     {
+        if (pending.isEmpty())
+            return false;
         Set<InetAddressAndPort> naturalEndpoints = natural.endpoints();
         for (InetAddressAndPort pendingEndpoint : pending.endpoints())
         {
@@ -360,7 +362,7 @@ public abstract class ReplicaLayout<E extends Endpoints<E>>
         EndpointsForToken replicas = keyspace.getMetadata().params.replication.isLocal()
                                      ? forLocalStrategyToken(metadata, replicationStrategy, token)
                                      : forNonLocalStrategyTokenRead(metadata, keyspace.getMetadata(), token);
-        replicas = DatabaseDescriptor.getEndpointSnitch().sortedByProximity(FBUtilities.getBroadcastAddressAndPort(), replicas);
+        replicas = DatabaseDescriptor.getNodeProximity().sortedByProximity(FBUtilities.getBroadcastAddressAndPort(), replicas);
         replicas = replicas.filter(FailureDetector.isReplicaAlive);
         return new ReplicaLayout.ForTokenRead(replicationStrategy, replicas);
     }
@@ -376,7 +378,7 @@ public abstract class ReplicaLayout<E extends Endpoints<E>>
                                      ? forLocalStrategyRange(metadata, replicationStrategy, range)
                                      : forNonLocalStategyRangeRead(metadata, keyspace.getMetadata(), range);
 
-        replicas = DatabaseDescriptor.getEndpointSnitch().sortedByProximity(FBUtilities.getBroadcastAddressAndPort(), replicas);
+        replicas = DatabaseDescriptor.getNodeProximity().sortedByProximity(FBUtilities.getBroadcastAddressAndPort(), replicas);
         replicas = replicas.filter(FailureDetector.isReplicaAlive);
         return new ReplicaLayout.ForRangeRead(replicationStrategy, range, replicas);
     }

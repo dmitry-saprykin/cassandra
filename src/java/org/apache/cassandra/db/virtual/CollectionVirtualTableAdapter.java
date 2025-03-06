@@ -51,6 +51,7 @@ import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.EmptyIterators;
 import org.apache.cassandra.db.filter.ClusteringIndexFilter;
 import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.BooleanType;
 import org.apache.cassandra.db.marshal.ByteType;
@@ -85,6 +86,7 @@ import org.apache.cassandra.utils.Pair;
 
 import static org.apache.cassandra.db.rows.Cell.NO_DELETION_TIME;
 import static org.apache.cassandra.utils.FBUtilities.camelToSnake;
+import static org.apache.cassandra.utils.LocalizeString.toLowerCaseLocalized;
 
 /**
  * This is a virtual table that iteratively builds rows using a data set provided by internal collection.
@@ -255,7 +257,7 @@ public class CollectionVirtualTableAdapter<R> implements VirtualTable
         Pattern pattern = Pattern.compile("^[A-Z1-9_]+$");
         // Contains only uppercase letters, numbers and underscores, so it's already snake case.
         if (pattern.matcher(camel).matches())
-            return camel.toLowerCase();
+            return toLowerCaseLocalized(camel);
 
         // Some special cases must be handled manually.
         String modifiedCamel = camel;
@@ -306,7 +308,8 @@ public class CollectionVirtualTableAdapter<R> implements VirtualTable
     @Override
     public UnfilteredPartitionIterator select(DecoratedKey partitionKey,
                                               ClusteringIndexFilter clusteringFilter,
-                                              ColumnFilter columnFilter)
+                                              ColumnFilter columnFilter,
+                                              RowFilter rowFilter)
     {
         if (!data.iterator().hasNext())
             return EmptyIterators.unfilteredPartition(metadata);
@@ -347,7 +350,7 @@ public class CollectionVirtualTableAdapter<R> implements VirtualTable
     }
 
     @Override
-    public UnfilteredPartitionIterator select(DataRange dataRange, ColumnFilter columnFilter)
+    public UnfilteredPartitionIterator select(DataRange dataRange, ColumnFilter columnFilter, RowFilter rowFilter)
     {
         return createPartitionIterator(metadata, new AbstractIterator<>()
         {

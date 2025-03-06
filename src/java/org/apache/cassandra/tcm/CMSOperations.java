@@ -44,9 +44,20 @@ import org.apache.cassandra.tcm.transformations.cms.AdvanceCMSReconfiguration;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.MBeanWrapper;
 
+import static org.apache.cassandra.tcm.transformations.cms.PrepareCMSReconfiguration.needsReconfiguration;
+
 public class CMSOperations implements CMSOperationsMBean
 {
     public static final String MBEAN_OBJECT_NAME = "org.apache.cassandra.tcm:type=CMSOperations";
+    public static final String MEMBERS = "MEMBERS";
+    public static final String NEEDS_RECONFIGURATION = "NEEDS_RECONFIGURATION";
+    public static final String IS_MEMBER = "IS_MEMBER";
+    public static final String SERVICE_STATE = "SERVICE_STATE";
+    public static final String IS_MIGRATING = "IS_MIGRATING";
+    public static final String EPOCH = "EPOCH";
+    public static final String LOCAL_PENDING = "LOCAL_PENDING";
+    public static final String COMMITS_PAUSED = "COMMITS_PAUSED";
+    public static final String REPLICATION_FACTOR = "REPLICATION_FACTOR";
 
     private static final Logger logger = LoggerFactory.getLogger(ClusterMetadataService.class);
     public static CMSOperations instance = new CMSOperations(ClusterMetadataService.instance());
@@ -131,14 +142,15 @@ public class CMSOperations implements CMSOperationsMBean
         Map<String, String> info = new HashMap<>();
         ClusterMetadata metadata = ClusterMetadata.current();
         String members = metadata.fullCMSMembers().stream().sorted().map(Object::toString).collect(Collectors.joining(","));
-        info.put("MEMBERS", members);
-        info.put("IS_MEMBER", Boolean.toString(cms.isCurrentMember(FBUtilities.getBroadcastAddressAndPort())));
-        info.put("SERVICE_STATE", ClusterMetadataService.state(metadata).toString());
-        info.put("IS_MIGRATING", Boolean.toString(cms.isMigrating()));
-        info.put("EPOCH", Long.toString(metadata.epoch.getEpoch()));
-        info.put("LOCAL_PENDING", Integer.toString(cms.log().pendingBufferSize()));
-        info.put("COMMITS_PAUSED", Boolean.toString(cms.commitsPaused()));
-        info.put("REPLICATION_FACTOR", ReplicationParams.meta(metadata).toString());
+        info.put(MEMBERS, members);
+        info.put(NEEDS_RECONFIGURATION, Boolean.toString(needsReconfiguration(metadata)));
+        info.put(IS_MEMBER, Boolean.toString(cms.isCurrentMember(FBUtilities.getBroadcastAddressAndPort())));
+        info.put(SERVICE_STATE, ClusterMetadataService.state(metadata).toString());
+        info.put(IS_MIGRATING, Boolean.toString(cms.isMigrating()));
+        info.put(EPOCH, Long.toString(metadata.epoch.getEpoch()));
+        info.put(LOCAL_PENDING, Integer.toString(cms.log().pendingBufferSize()));
+        info.put(COMMITS_PAUSED, Boolean.toString(cms.commitsPaused()));
+        info.put(REPLICATION_FACTOR, ReplicationParams.meta(metadata).toString());
         return info;
     }
 
@@ -240,7 +252,7 @@ public class CMSOperations implements CMSOperationsMBean
         for (NodeId nodeId : nodeIds)
         {
             logger.info("Unregistering " + nodeId);
-            cms.commit(new Unregister(nodeId, EnumSet.of(NodeState.LEFT)));
+            cms.commit(new Unregister(nodeId, EnumSet.of(NodeState.LEFT), ClusterMetadataService.instance().placementProvider()));
         }
     }
 }

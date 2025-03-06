@@ -135,14 +135,17 @@ public final class SimpleRestriction implements SingleRestriction
     }
 
     /**
-     * Checks if this restriction operator is a CONTAINS, CONTAINS_KEY or is an equality on a map element.
+     * Checks if this restriction operator is a CONTAINS, CONTAINS_KEY, NOT_CONTAINS, NOT_CONTAINS_KEY or is an equality on a map element.
      * @return {@code true} if the restriction operator is one of the contains operations, {@code false} otherwise.
      */
     public boolean isContains()
     {
         return operator == Operator.CONTAINS
-               || operator == Operator.CONTAINS_KEY
-               || columnsExpression.kind() == ColumnsExpression.Kind.MAP_ELEMENT;
+                || operator == Operator.CONTAINS_KEY
+                || operator == Operator.NOT_CONTAINS
+                || operator == Operator.NOT_CONTAINS_KEY
+                // TODO only map elements supported for now in restrictions
+                || columnsExpression.isMapElementExpression();
     }
 
     @Override
@@ -150,14 +153,16 @@ public final class SimpleRestriction implements SingleRestriction
     {
         // The need for filtering or indexing is a combination of columns expression type and operator
         // Therefore, we have to take both into account.
-        return columnsExpression.kind() == ColumnsExpression.Kind.MAP_ELEMENT
+        // TODO only map elements supported for now in restrictions
+        return (columnsExpression.isMapElementExpression())
                || operator.requiresFilteringOrIndexingFor(columnsExpression.columnsKind());
     }
 
     @Override
     public void addFunctionsTo(List<Function> functions)
     {
-        columnsExpression.addFunctionsTo(functions);
+        if (columnsExpression.isMapElementExpression())
+            columnsExpression.addFunctionsTo(functions);
         values.addFunctionsTo(functions);
     }
 
@@ -214,7 +219,9 @@ public final class SimpleRestriction implements SingleRestriction
     @Override
     public List<ClusteringElements> values(QueryOptions options)
     {
-        assert operator == Operator.EQ || operator == Operator.IN || operator == Operator.ANN;
+        assert operator == Operator.EQ ||
+               operator == Operator.IN ||
+               operator == Operator.ANN;
         return bindAndGetClusteringElements(options);
     }
 
@@ -319,14 +326,16 @@ public final class SimpleRestriction implements SingleRestriction
         if (isOnToken())
             throw new UnsupportedOperationException();
 
+        ColumnMetadata column = firstColumn();
         switch (columnsExpression.kind())
         {
             case SINGLE_COLUMN:
                 List<ByteBuffer> buffers = bindAndGet(options);
-
-                ColumnMetadata column = firstColumn();
-                if (operator == Operator.IN || operator == Operator.BETWEEN)
+                if (operator.kind() != Operator.Kind.BINARY)
                 {
+                    // For BETWEEN we support like in SQL reversed bounds
+                    if (operator.kind() == Operator.Kind.TERNARY)
+                        buffers.sort(column.type);
                     filter.add(column, operator, multiInputOperatorValues(column, buffers));
                 }
                 else if (operator == Operator.LIKE)
@@ -374,10 +383,18 @@ public final class SimpleRestriction implements SingleRestriction
                     }
                 }
                 break;
-            case MAP_ELEMENT:
-                ByteBuffer key = columnsExpression.mapKey(options);
-                List<ByteBuffer> values = bindAndGet(options);
-                filter.addMapEquality(firstColumn(), key, operator, values.get(0));
+            case ELEMENT:
+                // TODO only map elements supported for now
+                if (columnsExpression.isMapElementExpression())
+                {
+                    ByteBuffer key = columnsExpression.element(options);
+                    if (key == null)
+                        throw invalidRequest("Invalid null map key for column %s", firstColumn().name.toCQLString());
+                    if (key == ByteBufferUtil.UNSET_BYTE_BUFFER)
+                        throw invalidRequest("Invalid unset map key for column %s", firstColumn().name.toCQLString());
+                    List<ByteBuffer> values = bindAndGet(options);
+                    filter.addMapEquality(firstColumn(), key, operator, values.get(0));
+                }
                 break;
             default: throw new UnsupportedOperationException();
         }
@@ -385,18 +402,12 @@ public final class SimpleRestriction implements SingleRestriction
 
     private static ByteBuffer multiInputOperatorValues(ColumnMetadata column, List<ByteBuffer> values)
     {
-
         return ListType.getInstance(column.type, false).pack(values);
     }
 
     @Override
     public String toString()
     {
-        if (operator.isTernary())
-        {
-            List<? extends Term> terms = values.asList();
-            return String.format("%s %s %s AND %s", columnsExpression.toCQLString(), operator, terms.get(0), terms.get(1));
-        }
-        return String.format("%s %s %s", columnsExpression.toCQLString(), operator, values);
+        return operator.buildCQLString(columnsExpression, values);
     }
 }

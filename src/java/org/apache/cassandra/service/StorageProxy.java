@@ -177,6 +177,8 @@ import static org.apache.cassandra.service.paxos.v1.PrepareVerbHandler.doPrepare
 import static org.apache.cassandra.service.paxos.v1.ProposeVerbHandler.doPropose;
 import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
 import static org.apache.cassandra.utils.Clock.Global.nanoTime;
+import static org.apache.cassandra.utils.LocalizeString.toUpperCaseLocalized;
+import static org.apache.cassandra.utils.MonotonicClock.Global.approxTime;
 import static org.apache.cassandra.utils.TimeUUID.Generator.nextTimeUUID;
 import static org.apache.cassandra.utils.concurrent.CountDownLatch.newCountDownLatch;
 import static org.apache.commons.lang3.StringUtils.join;
@@ -876,26 +878,27 @@ public class StorageProxy implements StorageProxyMBean
     throws UnavailableException, OverloadedException, WriteTimeoutException, WriteFailureException
     {
         Tracing.trace("Determining replicas for mutation");
-        final String localDataCenter = DatabaseDescriptor.getEndpointSnitch().getLocalDatacenter();
+        final String localDataCenter = DatabaseDescriptor.getLocator().local().datacenter;
 
-        List<AbstractWriteResponseHandler<IMutation>> responseHandlers = new ArrayList<>(mutations.size());
+        AbstractWriteResponseHandler<IMutation>[] responseHandlers = new AbstractWriteResponseHandler[mutations.size()];
         WriteType plainWriteType = mutations.size() <= 1 ? WriteType.SIMPLE : WriteType.UNLOGGED_BATCH;
 
         try
         {
+            int j = 0;
             for (IMutation mutation : mutations)
             {
                 if (mutation instanceof CounterMutation)
-                    responseHandlers.add(mutateCounter((CounterMutation)mutation, localDataCenter, requestTime));
+                    responseHandlers[j++] = mutateCounter((CounterMutation)mutation, localDataCenter, requestTime);
                 else
-                    responseHandlers.add(performWrite(mutation, consistencyLevel, localDataCenter, standardWritePerformer, null, plainWriteType, requestTime));
+                    responseHandlers[j++] = performWrite(mutation, consistencyLevel, localDataCenter, standardWritePerformer, null, plainWriteType, requestTime);
             }
 
             // upgrade to full quorum any failed cheap quorums
             for (int i = 0 ; i < mutations.size() ; ++i)
             {
                 if (!(mutations.get(i) instanceof CounterMutation)) // at the moment, only non-counter writes support cheap quorums
-                    responseHandlers.get(i).maybeTryAdditionalReplicas(mutations.get(i), standardWritePerformer, localDataCenter);
+                    responseHandlers[i].maybeTryAdditionalReplicas(mutations.get(i), standardWritePerformer, localDataCenter);
             }
 
             // wait for writes.  throws TimeoutException if necessary
@@ -1010,7 +1013,7 @@ public class StorageProxy implements StorageProxyMBean
     throws UnavailableException, OverloadedException, WriteTimeoutException
     {
         Tracing.trace("Determining replicas for mutation");
-        final String localDataCenter = DatabaseDescriptor.getEndpointSnitch().getLocalDatacenter();
+        final String localDataCenter = DatabaseDescriptor.getLocator().local().datacenter;
 
         long startTime = nanoTime();
 
@@ -1273,14 +1276,28 @@ public class StorageProxy implements StorageProxyMBean
         {
             //We could potentially pass a callback into performWrite. And add callback provision for mutateCounter or mutateAtomically (sendToHintedEndPoints)
             //However, Trade off between write metric per CF accuracy vs performance hit due to callbacks. Similar issue exists with CoordinatorReadLatency metric.
-            Set<ColumnFamilyStore> uniqueColumnFamilyStores = new HashSet<>();
+            Set<ColumnFamilyStore> uniqueColumnFamilyStores = null;
+            // very frequently we update just a single table
+            // so an allocation of uniqueColumnFamilyStores set can be avoided
+            ColumnFamilyStore firstColumnFamilyStore = null;
             for (IMutation mutation : mutations)
             {
+                Keyspace keyspace = Keyspace.open(mutation.getKeyspaceName());
                 for (TableId tableId : mutation.getTableIds())
                 {
-                    ColumnFamilyStore store = Keyspace.open(mutation.getKeyspaceName()).getColumnFamilyStore(tableId);
-                    if (uniqueColumnFamilyStores.add(store))
+                    ColumnFamilyStore store = keyspace.getColumnFamilyStore(tableId);
+                    if (firstColumnFamilyStore == null)
+                    {
                         store.metric.coordinatorWriteLatency.update(latency, NANOSECONDS);
+                        firstColumnFamilyStore = store;
+                    }
+                    else if (!firstColumnFamilyStore.equals(store))
+                    {
+                        if (uniqueColumnFamilyStores == null)
+                            uniqueColumnFamilyStores = new HashSet<>();
+                        if (uniqueColumnFamilyStores.add(store))
+                            store.metric.coordinatorWriteLatency.update(latency, NANOSECONDS);
+                    }
                 }
             }
         }
@@ -1349,7 +1366,7 @@ public class StorageProxy implements StorageProxyMBean
     private static void syncWriteBatchedMutations(List<WriteResponseHandlerWrapper> wrappers, Stage stage, Dispatcher.RequestTime requestTime)
     throws WriteTimeoutException, OverloadedException
     {
-        String localDataCenter = DatabaseDescriptor.getEndpointSnitch().getLocalDatacenter();
+        String localDataCenter = DatabaseDescriptor.getLocator().local().datacenter;
 
         for (WriteResponseHandlerWrapper wrapper : wrappers)
         {
@@ -1527,7 +1544,7 @@ public class StorageProxy implements StorageProxyMBean
                                                        Collections.singletonList(MessageFlag.CALL_BACK_ON_FAILURE));
                     }
 
-                    String dc = DatabaseDescriptor.getEndpointSnitch().getDatacenter(destination);
+                    String dc = DatabaseDescriptor.getLocator().location(destination.endpoint()).datacenter;
 
                     // direct writes to local DC or old Cassandra versions
                     // (1.1 knows how to forward old-style String message IDs; updated to int in 2.0)
@@ -1860,6 +1877,7 @@ public class StorageProxy implements StorageProxyMBean
     private static PartitionIterator legacyReadWithPaxos(SinglePartitionReadCommand.Group group, ConsistencyLevel consistencyLevel, Dispatcher.RequestTime requestTime)
     throws InvalidRequestException, UnavailableException, ReadFailureException, ReadTimeoutException
     {
+        long start = nanoTime();
         if (group.queries.size() > 1)
             throw new InvalidRequestException("SERIAL/LOCAL_SERIAL consistency may only be requested for one partition at a time");
 
@@ -1940,9 +1958,11 @@ public class StorageProxy implements StorageProxyMBean
         }
         finally
         {
-            // We track latency based on request processing time, since the amount of time that request spends in the queue
-            // is not a representative metric of replica performance.
-            long latency = nanoTime() - requestTime.startedAtNanos();
+            // We don't base latency tracking on the startedAtNanos of the RequestTime because queries which involve
+            // internal paging may be composed of multiple distinct reads, whereas RequestTime relates to the single
+            // client request. This is a measure of how long this specific individual read took, not total time since
+            // processing of the client began.
+            long latency = nanoTime() - start;
             readMetrics.addNano(latency);
             casReadMetrics.addNano(latency);
             readMetricsForLevel(consistencyLevel).addNano(latency);
@@ -1956,6 +1976,7 @@ public class StorageProxy implements StorageProxyMBean
     private static PartitionIterator readRegular(SinglePartitionReadCommand.Group group, ConsistencyLevel consistencyLevel, Dispatcher.RequestTime requestTime)
     throws UnavailableException, ReadFailureException, ReadTimeoutException
     {
+        long start = nanoTime();
         try
         {
             PartitionIterator result = fetchRows(group.queries, consistencyLevel, requestTime);
@@ -1995,9 +2016,11 @@ public class StorageProxy implements StorageProxyMBean
         }
         finally
         {
-            // We track latency based on request processing time, since the amount of time that request spends in the queue
-            // is not a representative metric of replica performance.
-            long latency = nanoTime() - requestTime.startedAtNanos();
+            // We don't base latency tracking on the startedAtNanos of the RequestTime because queries which involve
+            // internal paging may be composed of multiple distinct reads, whereas RequestTime relates to the single
+            // client request. This is a measure of how long this specific individual read took, not total time since
+            // processing of the client began.
+            long latency = nanoTime() - start;
             readMetrics.addNano(latency);
             readMetricsForLevel(consistencyLevel).addNano(latency);
             // TODO avoid giving every command the same latency number.  Can fix this in CASSADRA-5329
@@ -2396,7 +2419,7 @@ public class StorageProxy implements StorageProxyMBean
         Set<String> disabledDCs = DatabaseDescriptor.hintedHandoffDisabledDCs();
         if (!disabledDCs.isEmpty())
         {
-            final String dc = DatabaseDescriptor.getEndpointSnitch().getDatacenter(replica);
+            final String dc = DatabaseDescriptor.getLocator().location(replica.endpoint()).datacenter;
             if (disabledDCs.contains(dc))
             {
                 Tracing.trace("Not hinting {} since its data center {} has been disabled {}", replica, dc, disabledDCs);
@@ -2747,8 +2770,15 @@ public class StorageProxy implements StorageProxyMBean
                     else
                         logger.debug("Discarding hint for endpoint not part of ring: {}", target);
                 }
-                logger.trace("Adding hints for {}", validTargets);
-                HintsService.instance.write(hostIds, Hint.create(mutation, currentTimeMillis()));
+
+                long creationTime = currentTimeMillis();
+                if (DatabaseDescriptor.isUseCreationTimeForHintTtl())
+                {
+                    long mutationCreationTimeNanos = responseHandler != null ? responseHandler.getRequestTime().startedAtNanos() : mutation.getApproxCreatedAtNanos();
+                    creationTime -= TimeUnit.MILLISECONDS.convert(Math.max(0, approxTime.now() - mutationCreationTimeNanos), NANOSECONDS);
+                }
+                logger.trace("Adding hints for {} with creation time {} ms", validTargets, creationTime);
+                HintsService.instance.write(hostIds, Hint.create(mutation,  creationTime));
                 validTargets.forEach(HintsService.instance.metrics::incrCreatedHints);
                 // Notify the handler only for CL == ANY
                 if (responseHandler != null && responseHandler.replicaPlan.consistencyLevel() == ConsistencyLevel.ANY)
@@ -2829,7 +2859,7 @@ public class StorageProxy implements StorageProxyMBean
     public String setIdealConsistencyLevel(String cl)
     {
         ConsistencyLevel original = DatabaseDescriptor.getIdealConsistencyLevel();
-        ConsistencyLevel newCL = ConsistencyLevel.valueOf(cl.trim().toUpperCase());
+        ConsistencyLevel newCL = ConsistencyLevel.valueOf(toUpperCaseLocalized(cl.trim()));
         DatabaseDescriptor.setIdealConsistencyLevel(newCL);
         return String.format("Updating ideal consistency level new value: %s old value %s", newCL, original.toString());
     }

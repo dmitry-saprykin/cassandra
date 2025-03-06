@@ -27,7 +27,6 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
-
 import javax.annotation.Nullable;
 
 import com.google.common.base.Splitter;
@@ -44,9 +43,11 @@ import org.apache.cassandra.cql3.CQL3Type;
 import org.apache.cassandra.cql3.CQLStatement;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.QualifiedName;
+import org.apache.cassandra.cql3.constraints.ColumnConstraints;
 import org.apache.cassandra.cql3.functions.masking.ColumnMask;
 import org.apache.cassandra.db.guardrails.Guardrails;
 import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.UserType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.gms.ApplicationState;
 import org.apache.cassandra.gms.Gossiper;
@@ -323,6 +324,16 @@ public abstract class AlterTableStatement extends AlterSchemaStatement
             if (isStatic && table.clusteringColumns().isEmpty())
                 throw ire("Static columns are only useful (and thus allowed) if the table has at least one clustering column");
 
+            // check for nested non-frozen UDTs or collections in a non-frozen UDT
+            if (type.isUDT() && type.isMultiCell())
+            {
+                for (AbstractType<?> fieldType : ((UserType) type).fieldTypes())
+                {
+                    if (fieldType.isMultiCell())
+                        throw ire("Non-frozen UDTs with nested non-frozen collections are not supported for column " + column.name);
+                }
+            }
+
             ColumnMetadata droppedColumn = table.getDroppedColumn(name.bytes);
             if (null != droppedColumn)
             {
@@ -463,7 +474,14 @@ public abstract class AlterTableStatement extends AlterSchemaStatement
          */
         private long getTimestamp()
         {
-            return timestamp == null ? ClientState.getTimestamp() : timestamp;
+            // Prior to Metadata serialization V5, the execution timestamp was not included in AlterSchema
+            // serializations. Instead, the current time (from ClientState::getTimestamp) was used, making
+            // DROP COLUMN non-idempotent and causing potenial data loss as described in CASSANDRA-18961.
+            // This was fixed before release by serialization V5, but we include a dangerous backwards
+            // compatibility option here or so that we can still apply pre-V5 serialized transformations
+            // (which would only exist in clusters running pre-release versions of Cassandra). Once all peers
+            // are running a V5 compatible version, ClientState::getTimestamp will never be used.
+            return timestamp == null ? fixedTimestampMicros().orElseGet(ClientState::getTimestamp) : timestamp;
         }
     }
 
@@ -692,6 +710,68 @@ public abstract class AlterTableStatement extends AlterSchemaStatement
         }
     }
 
+    public static class DropConstraints extends AlterTableStatement
+    {
+        final ColumnIdentifier columnName;
+
+        DropConstraints(String keyspaceName, String tableName, boolean ifTableExists, ColumnIdentifier columnName)
+        {
+            super(keyspaceName, tableName, ifTableExists);
+            this.columnName = columnName;
+        }
+
+        @Override
+        public KeyspaceMetadata apply(Epoch epoch, KeyspaceMetadata keyspace, TableMetadata table, ClusterMetadata metadata)
+        {
+            ColumnMetadata columnMetadata = table.getColumn(columnName);
+            columnMetadata.removeColumnConstraints();
+
+            TableMetadata.Builder tableBuilder = table.unbuild().epoch(epoch);
+            Views.Builder viewsBuilder = keyspace.views.unbuild();
+            TableMetadata tableMetadata = tableBuilder.build();
+            tableMetadata.validate();
+
+            return keyspace.withSwapped(keyspace.tables.withSwapped(tableMetadata))
+                           .withSwapped(viewsBuilder.build());
+        }
+    }
+
+    public static class AlterConstraints extends AlterTableStatement
+    {
+        final ColumnIdentifier columnName;
+        final ColumnConstraints constraints;
+
+        AlterConstraints(String keyspaceName, String tableName, boolean ifTableExists, ColumnIdentifier columnName, ColumnConstraints constraints)
+        {
+            super(keyspaceName, tableName, ifTableExists);
+            this.columnName = columnName;
+            this.constraints = constraints;
+        }
+
+        @Override
+        public KeyspaceMetadata apply(Epoch epoch, KeyspaceMetadata keyspace, TableMetadata table, ClusterMetadata metadata)
+        {
+            TableMetadata.Builder tableBuilder = table.unbuild().epoch(epoch);
+
+            for (ColumnMetadata column : tableBuilder.columns())
+            {
+                if (column.name == columnName)
+                {
+                    constraints.validate(column);
+                    column.setColumnConstraints(constraints);
+                    break;
+                }
+            }
+
+            Views.Builder viewsBuilder = keyspace.views.unbuild();
+            TableMetadata tableMetadata = tableBuilder.build();
+            tableMetadata.validate();
+
+            return keyspace.withSwapped(keyspace.tables.withSwapped(tableMetadata))
+                           .withSwapped(viewsBuilder.build());
+        }
+    }
+
     public static final class Raw extends CQLStatement.Raw
     {
         private enum Kind
@@ -702,13 +782,17 @@ public abstract class AlterTableStatement extends AlterSchemaStatement
             DROP_COLUMNS,
             RENAME_COLUMNS,
             ALTER_OPTIONS,
-            DROP_COMPACT_STORAGE
+            DROP_COMPACT_STORAGE,
+            DROP_CONSTRAINTS,
+            ALTER_CONSTRAINTS
         }
 
         private final QualifiedName name;
         private final boolean ifTableExists;
         private boolean ifColumnExists;
         private boolean ifColumnNotExists;
+        private ColumnIdentifier constraintName;
+        private ColumnConstraints constraints;
 
         private Kind kind;
 
@@ -731,8 +815,14 @@ public abstract class AlterTableStatement extends AlterSchemaStatement
 
         public Raw(QualifiedName name, boolean ifTableExists)
         {
+            this(name, ifTableExists, null);
+        }
+
+        public Raw(QualifiedName name, boolean ifTableExists, ColumnIdentifier constraintName)
+        {
             this.name = name;
             this.ifTableExists = ifTableExists;
+            this.constraintName = constraintName;
         }
 
         public AlterTableStatement prepare(ClientState state)
@@ -749,6 +839,8 @@ public abstract class AlterTableStatement extends AlterSchemaStatement
                 case        RENAME_COLUMNS: return new RenameColumns(keyspaceName, tableName, renamedColumns, ifTableExists, ifColumnExists);
                 case         ALTER_OPTIONS: return new AlterOptions(keyspaceName, tableName, attrs, ifTableExists);
                 case  DROP_COMPACT_STORAGE: return new DropCompactStorage(keyspaceName, tableName, ifTableExists);
+                case      DROP_CONSTRAINTS: return new DropConstraints(keyspaceName, tableName, ifTableExists, constraintName);
+                case     ALTER_CONSTRAINTS: return new AlterConstraints(keyspaceName, tableName, ifTableExists, constraintName, constraints);
             }
 
             throw new AssertionError();
@@ -791,6 +883,19 @@ public abstract class AlterTableStatement extends AlterSchemaStatement
         public void dropCompactStorage()
         {
             kind = Kind.DROP_COMPACT_STORAGE;
+        }
+
+        public void dropConstraints(ColumnIdentifier name)
+        {
+            kind = Kind.DROP_CONSTRAINTS;
+            this.constraintName = name;
+        }
+
+        public void alterConstraints(ColumnIdentifier name, ColumnConstraints.Raw rawConstraints)
+        {
+            kind = Kind.ALTER_CONSTRAINTS;
+            this.constraintName = name;
+            this.constraints = rawConstraints.prepare();
         }
 
         public void timestamp(long timestamp)

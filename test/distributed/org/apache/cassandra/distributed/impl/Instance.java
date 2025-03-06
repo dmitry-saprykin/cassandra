@@ -140,6 +140,7 @@ import org.apache.cassandra.streaming.async.NettyStreamingChannel;
 import org.apache.cassandra.tcm.ClusterMetadata;
 import org.apache.cassandra.tcm.ClusterMetadataService;
 import org.apache.cassandra.tcm.EpochAwareDebounce;
+import org.apache.cassandra.tcm.RegistrationStatus;
 import org.apache.cassandra.tcm.Startup;
 import org.apache.cassandra.tcm.membership.NodeId;
 import org.apache.cassandra.tcm.membership.NodeState;
@@ -178,8 +179,8 @@ import static org.apache.cassandra.distributed.api.Feature.GOSSIP;
 import static org.apache.cassandra.distributed.api.Feature.JMX;
 import static org.apache.cassandra.distributed.api.Feature.NATIVE_PROTOCOL;
 import static org.apache.cassandra.distributed.api.Feature.NETWORK;
-import static org.apache.cassandra.distributed.impl.DistributedTestSnitch.fromCassandraInetAddressAndPort;
-import static org.apache.cassandra.distributed.impl.DistributedTestSnitch.toCassandraInetAddressAndPort;
+import static org.apache.cassandra.distributed.impl.TestEndpointCache.fromCassandraInetAddressAndPort;
+import static org.apache.cassandra.distributed.impl.TestEndpointCache.toCassandraInetAddressAndPort;
 import static org.apache.cassandra.net.Verb.BATCH_STORE_REQ;
 import static org.apache.cassandra.service.CassandraDaemon.logSystemInfo;
 
@@ -622,7 +623,7 @@ public class Instance extends IsolatedExecutor implements IInvokableInstance
                 {
                     assert config.networkTopology().contains(config.broadcastAddress()) : String.format("Network topology %s doesn't contain the address %s",
                                                                                                         config.networkTopology(), config.broadcastAddress());
-                    DistributedTestSnitch.assign(config.networkTopology());
+                    DistributedTestInitialLocationProvider.assign(config.networkTopology());
                     CassandraDaemon.getInstanceForTesting().activate(false);
                     // TODO: filters won't work for the messages dispatched during startup
                     registerInboundFilter(cluster);
@@ -632,10 +633,10 @@ public class Instance extends IsolatedExecutor implements IInvokableInstance
                 {
                     partialStartup(cluster);
                 }
-                StorageService.instance.startSnapshotManager();
             }
             catch (Throwable t)
             {
+                startedAt.set(0);
                 if (t instanceof RuntimeException)
                     throw (RuntimeException) t;
                 throw new RuntimeException(t);
@@ -706,18 +707,25 @@ public class Instance extends IsolatedExecutor implements IInvokableInstance
 
         assert config.networkTopology().contains(config.broadcastAddress()) : String.format("Network topology %s doesn't contain the address %s",
                                                                                             config.networkTopology(), config.broadcastAddress());
-        DistributedTestSnitch.assign(config.networkTopology());
+        DistributedTestInitialLocationProvider.assign(config.networkTopology());
+        DatabaseDescriptor.daemonInitialization();
         if (config.has(JMX))
             startJmx();
-        DatabaseDescriptor.daemonInitialization();
         LoggingSupportFactory.getLoggingSupport().onStartup();
         logSystemInfo(inInstancelogger);
+        Config.log(DatabaseDescriptor.getRawConfig());
 
         FileUtils.setFSErrorHandler(new DefaultFSErrorHandler());
         DatabaseDescriptor.createAllDirectories();
         CassandraDaemon.getInstanceForTesting().migrateSystemDataIfNeeded();
 
         CommitLog.instance.start();
+
+        SnapshotManager.instance.start(false);
+        SnapshotManager.instance.clearExpiredSnapshots();
+        SnapshotManager.instance.clearEphemeralSnapshots();
+        SnapshotManager.instance.resumeSnapshotCleanup();
+
         CassandraDaemon.getInstanceForTesting().runStartupChecks();
 
         Keyspace.setInitialized(); // TODO: this seems to be superfluous by now
@@ -805,6 +813,7 @@ public class Instance extends IsolatedExecutor implements IInvokableInstance
             Schema.instance.saveSystemKeyspace();
             ClusterMetadataService.instance().processor().fetchLogAndWait();
             NodeId self = Register.maybeRegister();
+            RegistrationStatus.instance.onRegistration();
             boolean joinRing = config.get(Constants.KEY_DTEST_JOIN_RING) == null || (boolean) config.get(Constants.KEY_DTEST_JOIN_RING);
             if (ClusterMetadata.current().directory.peerState(self) != NodeState.JOINED && joinRing)
             {
@@ -890,10 +899,13 @@ public class Instance extends IsolatedExecutor implements IInvokableInstance
         Future<?> future = async((ExecutorService executor) -> {
             Throwable error = null;
 
+            error = parallelRun(error, executor, SnapshotManager.instance::close);
+
             CompactionManager.instance.forceShutdown();
 
             error = parallelRun(error, executor,
                     () -> StorageService.instance.setRpcReady(false),
+                    () -> StorageService.instance.setIsShutdownUnsafeForTests(true),
                     CassandraDaemon.getInstanceForTesting()::destroyClientTransports);
 
             if (config.has(GOSSIP) || config.has(NETWORK))
@@ -944,7 +956,7 @@ public class Instance extends IsolatedExecutor implements IInvokableInstance
                                 () -> shutdownAndWait(Collections.singletonList(ActiveRepairService.repairCommandExecutor())),
                                 () -> ActiveRepairService.instance().shutdownNowAndWait(1L, MINUTES),
                                 () -> EpochAwareDebounce.instance.close(),
-                                () -> SnapshotManager.shutdownAndWait(1L, MINUTES)
+                                SnapshotManager.instance::close
             );
 
             internodeMessagingStarted = false;

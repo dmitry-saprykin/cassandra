@@ -23,6 +23,7 @@ import java.util.*;
 import java.util.function.BiFunction;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import java.util.stream.StreamSupport;
 
 import com.google.common.collect.ImmutableList;
 
@@ -41,6 +42,8 @@ import org.apache.cassandra.exceptions.RequestExecutionException;
 import org.apache.cassandra.exceptions.RequestValidationException;
 import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.DataOutputBuffer;
+import org.apache.cassandra.locator.NodeProximity;
+import org.apache.cassandra.locator.SnitchAdapter;
 import org.apache.cassandra.schema.*;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.QueryState;
@@ -104,9 +107,9 @@ public abstract class DescribeStatement<T> extends CQLStatement.Raw implements C
         return this;
     }
 
-    public final List<ColumnSpecification> getBindVariables()
+    public final ImmutableList<ColumnSpecification> getBindVariables()
     {
-        return Collections.emptyList();
+        return ImmutableList.of();
     }
 
     @Override
@@ -470,9 +473,16 @@ public abstract class DescribeStatement<T> extends CQLStatement.Raw implements C
             TableMetadata table = checkNotNull(ks.getTableNullable(t),
                                                "Table '%s' not found in keyspace '%s'", t, ks.name);
 
-            return Stream.concat(Stream.of(table), table.indexes.stream()
-                                                                .map(index -> toDescribable(table, index))
-                                                                .sorted(SchemaElement.NAME_COMPARATOR));
+
+            Stream<SchemaElement> withIndexes = Stream.concat(Stream.of(table), table.indexes.stream()
+                                                                                             .map(index -> toDescribable(table, index))
+                                                                                             .sorted(SchemaElement.NAME_COMPARATOR));
+
+            Stream<SchemaElement> views = StreamSupport.stream(ks.views.forTable(table.id).spliterator(), false)
+                                                       .map(viewMetadata -> toDescribable(table, viewMetadata))
+                                                       .sorted(SchemaElement.NAME_COMPARATOR);
+
+            return Stream.concat(withIndexes, views);
         });
     }
 
@@ -578,6 +588,36 @@ public abstract class DescribeStatement<T> extends CQLStatement.Raw implements C
                 };
     }
 
+    private static SchemaElement toDescribable(TableMetadata table, ViewMetadata viewMetadata)
+    {
+        return new SchemaElement()
+        {
+            @Override
+            public SchemaElementType elementType()
+            {
+                return SchemaElementType.MATERIALIZED_VIEW;
+            }
+
+            @Override
+            public String elementKeyspace()
+            {
+                return table.keyspace;
+            }
+
+            @Override
+            public String elementName()
+            {
+                return viewMetadata.name();
+            }
+
+            @Override
+            public String toCqlString(boolean withWarnings, boolean withInternals, boolean ifNotExists)
+            {
+                return viewMetadata.toCqlString(withWarnings, withInternals, ifNotExists);
+            }
+        };
+    }
+
     /**
      * Creates a {@link DescribeStatement} for the generic {@code DESCRIBE ...}.
      */
@@ -674,8 +714,11 @@ public abstract class DescribeStatement<T> extends CQLStatement.Raw implements C
                 List<Object> list = new ArrayList<Object>();
                 list.add(DatabaseDescriptor.getClusterName());
                 list.add(trimIfPresent(DatabaseDescriptor.getPartitionerName(), "org.apache.cassandra.dht."));
-                list.add(trimIfPresent(DatabaseDescriptor.getEndpointSnitch().getClass().getName(),
-                                            "org.apache.cassandra.locator."));
+                NodeProximity proximity = DatabaseDescriptor.getNodeProximity();
+                String nodeProximityClassName = proximity instanceof SnitchAdapter ? ((SnitchAdapter) proximity).snitch.getClass().getName()
+                                                                             : proximity.getClass().getName();
+                list.add(trimIfPresent(nodeProximityClassName,
+                                       "org.apache.cassandra.locator."));
 
                 String useKs = state.getRawKeyspace();
                 if (mustReturnsRangeOwnerships(useKs))

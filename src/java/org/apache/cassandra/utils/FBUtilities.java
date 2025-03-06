@@ -71,11 +71,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.audit.IAuditLogger;
-import org.apache.cassandra.auth.AllowAllNetworkAuthorizer;
-import org.apache.cassandra.auth.IAuthenticator;
-import org.apache.cassandra.auth.IAuthorizer;
-import org.apache.cassandra.auth.INetworkAuthorizer;
-import org.apache.cassandra.auth.IRoleManager;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.marshal.AbstractType;
@@ -108,6 +103,7 @@ import static org.apache.cassandra.config.CassandraRelevantProperties.TRIGGERS_D
 import static org.apache.cassandra.config.CassandraRelevantProperties.USER_HOME;
 import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
 import static org.apache.cassandra.utils.Clock.Global.nanoTime;
+import static org.apache.cassandra.utils.LocalizeString.toLowerCaseLocalized;
 
 public class FBUtilities
 {
@@ -123,7 +119,7 @@ public class FBUtilities
     public static final BigInteger TWO = new BigInteger("2");
     private static final String DEFAULT_TRIGGER_DIR = "triggers";
 
-    private static final String OPERATING_SYSTEM = OS_NAME.getString().toLowerCase();
+    private static final String OPERATING_SYSTEM = toLowerCaseLocalized(OS_NAME.getString());
     public static final boolean isLinux = OPERATING_SYSTEM.contains("linux");
 
     private static volatile InetAddress localInetAddress;
@@ -226,6 +222,13 @@ public class FBUtilities
             }
         }
         return localInetAddressAndPort;
+    }
+
+    public static void setLocalAddress(InetAddress localAddress)
+    {
+        localInetAddress = localAddress;
+        // null out localInetAddressAndPort, it will be re-initalized next time it's accessed
+        localInetAddressAndPort = null;
     }
 
     /**
@@ -669,40 +672,6 @@ public class FBUtilities
             return new LocalPartitioner(comparator.get());
         }
         return FBUtilities.instanceOrConstruct(partitionerClassName, "partitioner");
-    }
-
-    public static IAuthorizer newAuthorizer(String className) throws ConfigurationException
-    {
-        if (!className.contains("."))
-            className = "org.apache.cassandra.auth." + className;
-        return FBUtilities.construct(className, "authorizer");
-    }
-
-    public static IAuthenticator newAuthenticator(String className) throws ConfigurationException
-    {
-        if (!className.contains("."))
-            className = "org.apache.cassandra.auth." + className;
-        return FBUtilities.construct(className, "authenticator");
-    }
-
-    public static IRoleManager newRoleManager(String className) throws ConfigurationException
-    {
-        if (!className.contains("."))
-            className = "org.apache.cassandra.auth." + className;
-        return FBUtilities.construct(className, "role manager");
-    }
-
-    public static INetworkAuthorizer newNetworkAuthorizer(String className)
-    {
-        if (className == null)
-        {
-            return new AllowAllNetworkAuthorizer();
-        }
-        if (!className.contains("."))
-        {
-            className = "org.apache.cassandra.auth." + className;
-        }
-        return FBUtilities.construct(className, "network authorizer");
     }
 
     public static IAuditLogger newAuditLogger(String className, Map<String, String> parameters) throws ConfigurationException
@@ -1403,7 +1372,7 @@ public class FBUtilities
     public static String camelToSnake(String camel)
     {
         if (camel.chars().allMatch(Character::isUpperCase))
-            return camel.toLowerCase();
+            return toLowerCaseLocalized(camel);
 
         StringBuilder sb = new StringBuilder();
         for (char c : camel.toCharArray())
@@ -1413,7 +1382,7 @@ public class FBUtilities
                 // if first char is uppercase, then avoid adding the _ prefix
                 if (sb.length() > 0)
                     sb.append('_');
-                sb.append(Character.toLowerCase(c));
+                sb.append(Character.toLowerCase(c)); // checkstyle: permit this invocation
             }
             else
             {

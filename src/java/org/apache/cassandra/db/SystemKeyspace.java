@@ -82,7 +82,6 @@ import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.RebufferingInputStream;
-import org.apache.cassandra.locator.IEndpointSnitch;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.MetaStrategy;
 import org.apache.cassandra.metrics.RestorableMeter;
@@ -109,9 +108,13 @@ import org.apache.cassandra.service.paxos.PaxosRepairHistory;
 import org.apache.cassandra.service.paxos.PaxosState;
 import org.apache.cassandra.service.paxos.uncommitted.PaxosRows;
 import org.apache.cassandra.service.paxos.uncommitted.PaxosUncommittedIndex;
+import org.apache.cassandra.service.snapshot.SnapshotOptions;
+import org.apache.cassandra.service.snapshot.SnapshotManager;
+import org.apache.cassandra.service.snapshot.SnapshotType;
 import org.apache.cassandra.streaming.StreamOperation;
 import org.apache.cassandra.tcm.ClusterMetadata;
 import org.apache.cassandra.tcm.Epoch;
+import org.apache.cassandra.tcm.membership.Location;
 import org.apache.cassandra.tcm.membership.NodeState;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
@@ -120,6 +123,7 @@ import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.MD5Digest;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.TimeUUID;
+import org.apache.cassandra.utils.TriFunction;
 import org.apache.cassandra.utils.concurrent.Future;
 
 import static java.lang.String.format;
@@ -140,10 +144,10 @@ import static org.apache.cassandra.gms.ApplicationState.RELEASE_VERSION;
 import static org.apache.cassandra.gms.ApplicationState.STATUS_WITH_PORT;
 import static org.apache.cassandra.gms.ApplicationState.TOKENS;
 import static org.apache.cassandra.service.paxos.Commit.latest;
+import static org.apache.cassandra.service.snapshot.SnapshotOptions.systemSnapshot;
 import static org.apache.cassandra.utils.CassandraVersion.NULL_VERSION;
 import static org.apache.cassandra.utils.CassandraVersion.UNREADABLE_VERSION;
 import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
-import static org.apache.cassandra.utils.FBUtilities.now;
 
 public final class SystemKeyspace
 {
@@ -649,15 +653,23 @@ public final class SystemKeyspace
                      "listen_address," +
                      "listen_port" +
                      ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-        IEndpointSnitch snitch = DatabaseDescriptor.getEndpointSnitch();
+
+        // If this node has not yet been registered in cluster metadata, record the initialization location provided
+        // by the configured Locator, this will also be used when registering an new node in cluster metadata during its
+        // intial startup.
+        // If the node is present in cluster metadata (i.e. has been registered already and we have replayed the
+        // metadata log), then get the location from there (via the Locator).
+        // We do this in case either the Locator config or location in metadata has been modified in any way, as cluster
+        // metadata is the ultimate source of truth.
+        Location location = DatabaseDescriptor.getLocator().local();
         executeOnceInternal(format(req, LOCAL),
                             LOCAL,
                             DatabaseDescriptor.getClusterName(),
                             FBUtilities.getReleaseVersionString(),
                             QueryProcessor.CQL_VERSION.toString(),
                             String.valueOf(ProtocolVersion.CURRENT.asInt()),
-                            snitch.getLocalDatacenter(),
-                            snitch.getLocalRack(),
+                            location.datacenter,
+                            location.rack,
                             DatabaseDescriptor.getPartitioner().getClass().getName(),
                             FBUtilities.getJustBroadcastNativeAddress(),
                             DatabaseDescriptor.getNativeTransportPort(),
@@ -944,6 +956,12 @@ public final class SystemKeyspace
     {
         String req = "INSERT INTO system.%s (key, schema_version) VALUES ('%s', ?)";
         executeInternal(format(req, LOCAL, LOCAL), version);
+    }
+
+    public static synchronized void updateRack(String rack)
+    {
+        String req = "INSERT INTO system.%s (key, rack) VALUES ('%s', ?)";
+        executeInternal(format(req, LOCAL, LOCAL), rack);
     }
 
     public static Set<String> tokensAsSet(Collection<Token> tokens)
@@ -1549,16 +1567,16 @@ public final class SystemKeyspace
     public static PaxosRepairHistory loadPaxosRepairHistory(String keyspace, String table)
     {
         if (SchemaConstants.LOCAL_SYSTEM_KEYSPACE_NAMES.contains(keyspace))
-            return PaxosRepairHistory.EMPTY;
+            return PaxosRepairHistory.empty(keyspace, table);
 
         UntypedResultSet results = executeInternal(String.format("SELECT * FROM system.%s WHERE keyspace_name=? AND table_name=?", PAXOS_REPAIR_HISTORY), keyspace, table);
         if (results.isEmpty())
-            return PaxosRepairHistory.EMPTY;
+            return PaxosRepairHistory.empty(keyspace, table);
 
         UntypedResultSet.Row row = Iterables.getOnlyElement(results);
         List<ByteBuffer> points = row.getList("points", BytesType.instance);
 
-        return PaxosRepairHistory.fromTupleBufferList(points);
+        return PaxosRepairHistory.fromTupleBufferList(keyspace, table, points);
     }
 
     /**
@@ -1807,10 +1825,8 @@ public final class SystemKeyspace
      * Compare the release version in the system.local table with the one included in the distro.
      * If they don't match, snapshot all tables in the system and schema keyspaces. This is intended
      * to be called at startup to create a backup of the system tables during an upgrade
-     *
-     * @throws IOException
      */
-    public static void snapshotOnVersionChange() throws IOException
+    public static void snapshotOnVersionChange()
     {
         String previous = getPreviousVersionString();
         String next = FBUtilities.getReleaseVersionString();
@@ -1819,16 +1835,18 @@ public final class SystemKeyspace
 
         // if we're restarting after an upgrade, snapshot the system and schema keyspaces
         if (!previous.equals(NULL_VERSION.toString()) && !previous.equals(next))
-
         {
-            logger.info("Detected version upgrade from {} to {}, snapshotting system keyspaces", previous, next);
-            String snapshotName = Keyspace.getTimestampedSnapshotName(format("upgrade-%s-%s",
-                                                                             previous,
-                                                                             next));
-
-            Instant creationTime = now();
+            List<String> entities = new ArrayList<>();
             for (String keyspace : SchemaConstants.LOCAL_SYSTEM_KEYSPACE_NAMES)
-                Keyspace.open(keyspace).snapshot(snapshotName, null, false, null, null, creationTime);
+            {
+                for (ColumnFamilyStore cfs : Keyspace.open(keyspace).getColumnFamilyStores())
+                    entities.add(cfs.getKeyspaceTableName());
+            }
+
+            logger.info("Detected version upgrade from {} to {}, snapshotting system keyspaces", previous, next);
+
+            SnapshotOptions options = systemSnapshot(format("%s-%s", previous, next), SnapshotType.UPGRADE, entities.toArray(new String[0])).build();
+            SnapshotManager.instance.takeSnapshot(options);
         }
     }
 
@@ -1938,8 +1956,8 @@ public final class SystemKeyspace
         int counter = 0;
         for (UntypedResultSet.Row row : resultSet)
         {
-            if (onLoaded.accept(MD5Digest.wrap(row.getByteArray("prepared_id")),
-                                row.getString("query_string"),
+            if (onLoaded.apply(MD5Digest.wrap(row.getByteArray("prepared_id")),
+                               row.getString("query_string"),
                                 row.has("logged_keyspace") ? row.getString("logged_keyspace") : null))
                 counter++;
         }
@@ -1953,16 +1971,12 @@ public final class SystemKeyspace
         int counter = 0;
         for (UntypedResultSet.Row row : resultSet)
         {
-            if (onLoaded.accept(MD5Digest.wrap(row.getByteArray("prepared_id")),
-                                row.getString("query_string"),
+            if (onLoaded.apply(MD5Digest.wrap(row.getByteArray("prepared_id")),
+                               row.getString("query_string"),
                                 row.has("logged_keyspace") ? row.getString("logged_keyspace") : null))
                 counter++;
         }
         return counter;
-    }
-
-    public static interface TriFunction<A, B, C, D> {
-        D accept(A var1, B var2, C var3);
     }
 
     public static void saveTopPartitions(TableMetadata metadata, String topType, Collection<TopPartitionTracker.TopPartition> topPartitions, long lastUpdate)

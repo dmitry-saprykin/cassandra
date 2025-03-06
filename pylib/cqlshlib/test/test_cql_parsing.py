@@ -568,6 +568,9 @@ class TestCqlParsing(TestCase):
     def test_parse_create_table(self):
         pass
 
+    def test_parse_create_table_like(self):
+        pass
+
     def test_parse_drop_table(self):
         pass
 
@@ -769,6 +772,31 @@ class TestCqlParsing(TestCase):
                                  [('SELECT', 'reserved_identifier'),
                                   ('FROM', 'reserved_identifier'),
                                   ('"/*MyTable*/"', 'quotedName'),
+                                  (';', 'endtoken')])
+
+        parsed = parse_cqlsh_statements('''
+                                        INSERT into a (key,c1,c2) VALUES ('aKey','v1*/','/v2/*/v3');
+                                        ''')
+
+        self.assertSequenceEqual(tokens_with_types(parsed),
+                                 [('INSERT', 'reserved_identifier'),
+                                  ('into', 'reserved_identifier'),
+                                  ('a', 'identifier'),
+                                  ('(', 'op'),
+                                  ('key', 'identifier'),
+                                  (',', 'op'),
+                                  ('c1', 'identifier'),
+                                  (',', 'op'),
+                                  ('c2', 'identifier'),
+                                  (')', 'op'),
+                                  ('VALUES', 'identifier'),
+                                  ('(', 'op'),
+                                  ("'aKey'", 'quotedStringLiteral'),
+                                  (',', 'op'),
+                                  ("'v1*/'", 'quotedStringLiteral'),
+                                  (',', 'op'),
+                                  ("'/v2/*/v3'", 'quotedStringLiteral'),
+                                  (')', 'op'),
                                   (';', 'endtoken')])
 
         parse_cqlsh_statements('''
